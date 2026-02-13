@@ -2,6 +2,8 @@
 Unofficial implementation of CreditDecoding: Accelerating Parallel Decoding in
 Diffusion Large Language Models with Trace Credits (https://arxiv.org/pdf/2510.06133)
 """
+
+import math
 from typing import Optional, Tuple, Union
 
 import numpy as np
@@ -14,13 +16,9 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.utils import is_npu
 
-import torch_npu
-import math
-
-experimental_config = torch_npu.profiler._ExperimentalConfig(profiler_level=torch_npu.profiler.ProfilerLevel.Level2)
-
-logger = logging.getLogger(__name__)
+_is_npu = is_npu()
 
 
 _TRITON_OK = False
@@ -32,18 +30,16 @@ except Exception:
     _TRITON_OK = False
 
 
+
 if _TRITON_OK:
 
-    # =========================================================
-    # Kernel 1) raw top1 + raw logp -> history bonus update
-    # =========================================================
     @triton.jit
     def k1_top1_and_update_bonus(
-        logits_ptr,              # [BT, V]
+        logits_ptr,         
         mask_ptr,
-        step_idx,            # [BT] int32
-        hist_ids_ptr,            # [BT, 32] int32, invalid=-1
-        hist_bonus_ptr,          # [BT, 32] fp32
+        step_idx,          
+        hist_ids_ptr,            
+        hist_bonus_ptr,        
         # intermediates
         fused_id_ptr, confidence_ptr, transfer_ptr,
         # const
@@ -52,9 +48,7 @@ if _TRITON_OK:
         alpha: tl.constexpr,
         gamma: tl.constexpr,
         log_eps: tl.constexpr,
-
         lam: tl.constexpr, log_thr: tl.constexpr,
-        
         K: tl.constexpr = 32,
     ):
         pid = tl.program_id(0)
@@ -174,13 +168,10 @@ if _TRITON_OK:
         tl.store(transfer_ptr + pid, transfer.to(tl.int32))
         
 
-
-    
-
 class CreditState32:
-    def __init__(self, BT: int, device: str = "cuda"):
-        self.hist_ids = torch.full((BT, 32), -1, dtype=torch.int32, device=device)
-        self.hist_bonus = torch.zeros((BT, 32), dtype=torch.float32, device=device)
+    def __init__(self, BT: int, block_size: int, device: str = "cuda"):
+        self.hist_ids = torch.full((BT, block_size), -1, dtype=torch.int32, device=device)
+        self.hist_bonus = torch.zeros((BT, block_size), dtype=torch.float32, device=device)
 
     def reset(self):
         self.hist_ids.fill_(-1)
@@ -196,9 +187,9 @@ class CreditDecoding(DllmAlgorithm):
         algo_cfg = config.algorithm_config
 
         self.threshold = float(algo_cfg.get("threshold", 0.95))
-        self.gamma = float(algo_cfg.get("credit_decay_gamma", 0.65))
-        self.lam = float(algo_cfg.get("credit_fusion_lambda", 0.70)) #0.70
-        self.alpha = float(algo_cfg.get("credit_prob_alpha", 0.90))
+        self.gamma = float(algo_cfg.get("credit_decay_gamma", 0.75))
+        self.lam = float(algo_cfg.get("credit_fusion_lambda", 0.50)) 
+        self.alpha = float(algo_cfg.get("credit_prob_alpha", 0.50))
         self.eps = float(algo_cfg.get("credit_eps", 1e-6))
 
         self.log_thr = math.log(self.threshold)
@@ -222,7 +213,7 @@ class CreditDecoding(DllmAlgorithm):
         need_alloc = (buf is None)
 
         if need_alloc:
-            self.state = CreditState32(BT)
+            self.state = CreditState32(BT, self.block_size)
 
             self._tmp_fused_id = torch.empty((BT,), device=logits.device, dtype=torch.int32)
             self._tmp_conf = torch.empty((BT,), device=logits.device, dtype=torch.float32)
@@ -239,7 +230,7 @@ class CreditDecoding(DllmAlgorithm):
             self._tmp_fused_id, self._tmp_conf, self._tmp_transfer,
             V=V, BLOCK_V=2048,
             alpha=self.alpha, gamma=self.gamma, log_eps=self.log_eps,
-            lam=self.lam, log_thr=self.log_thr,
+            lam=self.lam, log_thr=self.log_thr, K=self.block_size,
         )
 
 
@@ -268,27 +259,27 @@ class CreditDecoding(DllmAlgorithm):
         logits = logits_output.full_logits
         BT, V = logits.shape
 
-        raw_top1 = torch.argmax(logits, dim=-1).to(torch.int32)  # (BT,)
-        raw_top1_logit = logits.gather(1, raw_top1.view(BT, 1)).squeeze(1).to(torch.float32)  # (BT,)
-        logZ = torch.logsumexp(logits.to(torch.float32), dim=-1)  # (BT,)
+        raw_top1 = torch.argmax(logits, dim=-1).to(torch.int32) 
+        raw_top1_logit = logits.gather(1, raw_top1.view(BT, 1)).squeeze(1).to(torch.float32) 
+        logZ = torch.logsumexp(logits.to(torch.float32), dim=-1) 
 
         raw = raw_top1.to(torch.int32)
 
 
-        hit0 = (raw == self.prev0)          # (BT,) bool
-        hit1 = (raw == self.prev1)          # (BT,) bool
+        hit0 = (raw == self.prev0) 
+        hit1 = (raw == self.prev1) 
         hit = hit0 | hit1
 
         self.b0.mul_(self.gamma)
         self.b1.mul_(self.gamma)
 
         last = self.last_slot.to(torch.int32)
-        evict = 1 - last                    # (BT,) int32
+        evict = 1 - last
 
         
-        log_p = raw_top1_logit - logZ                 # (BT,)
+        log_p = raw_top1_logit - logZ
         log_p_clamped = torch.maximum(log_p, torch.full_like(log_p, self.log_eps))
-        inc = torch.exp(self.alpha * log_p_clamped)   # (BT,)  
+        inc = torch.exp(self.alpha * log_p_clamped)  
         
         use0 = hit0 | (~hit & (evict == 0))
         use1 = hit1 | (~hit & (evict == 1)) 
@@ -309,28 +300,28 @@ class CreditDecoding(DllmAlgorithm):
                 torch.where(hit1, torch.ones_like(last), evict))
         self.last_slot = new_last.to(torch.int8)
 
-        self.bonus = torch.where(hit0 | (~hit & (evict == 0)), self.b0, self.b1)  # (BT,)
+        self.bonus = torch.where(hit0 | (~hit & (evict == 0)), self.b0, self.b1)
         self.bonus.add_(inc)
 
-        self.bonus_non = torch.where(hit0 | (~hit & (evict == 0)), self.b1, self.b0)  # (BT,)
+        self.bonus_non = torch.where(hit0 | (~hit & (evict == 0)), self.b1, self.b0)
 
         raw_non_top1 = torch.where(hit0, self.prev1, torch.where(hit1, self.prev0, torch.full_like(self.prev0, -1)))
-        raw_non_top1_logit = logits.gather(1, raw_non_top1.view(BT, 1)).squeeze(1).to(torch.float32)  # (BT,)
+        raw_non_top1_logit = logits.gather(1, raw_non_top1.view(BT, 1)).squeeze(1).to(torch.float32)  
 
 
-        delta = self.lam * torch.log1p(self.bonus)     # (BT,)
-        p = torch.exp(log_p)              # (BT,)  BT exp only
-        pdel = p * delta             # (BT,)  BT exp only
+        delta = self.lam * torch.log1p(self.bonus)
+        p = torch.exp(log_p)  
+        pdel = p * delta 
 
         log_p_non = raw_non_top1_logit - logZ
-        delta_non = self.lam * torch.log1p(self.bonus_non)     # (BT,)
-        p_non = torch.exp(log_p_non)              # (BT,)  BT exp only
-        pdel_non = p_non * delta_non             # (BT,)  BT exp only
+        delta_non = self.lam * torch.log1p(self.bonus_non) 
+        p_non = torch.exp(log_p_non)           
+        pdel_non = p_non * delta_non           
 
 
         logZ_new = logZ + pdel + pdel_non
-        score = (raw_top1_logit + delta) - logZ_new   # log(p_boost)
-        score_non = (raw_non_top1_logit + delta_non) - logZ_new   # log(p_boost)
+        score = (raw_top1_logit + delta) - logZ_new
+        score_non = (raw_non_top1_logit + delta_non) - logZ_new  
 
         fused_id = torch.where(score>score_non, raw_top1, raw_non_top1)
         fused_score = torch.where(score>score_non, score, score_non)
@@ -340,10 +331,8 @@ class CreditDecoding(DllmAlgorithm):
         BT, V = logits32.shape
         rows = torch.arange(BT, device=logits32.device)
 
-        # delta_fused: fused_id가 raw면 delta, non이면 delta_non
         delta_fused = torch.where(fused_id == raw_top1, delta, delta_non).to(torch.float32)
 
-        # logits_boost: logits32 복사해서 fused_id 위치에만 delta 더함
         logits_boost = logits32.clone()
         logits_boost[rows, fused_id.to(torch.long)] += delta_fused
 
@@ -392,37 +381,116 @@ class CreditDecoding(DllmAlgorithm):
             model_runner, forward_batch, mask_index, skip_attn_backend_init
         )
 
+
     def run(
         self,
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
-    ) -> Tuple[
-        Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor], bool
-    ]:
+    ) -> Tuple[Union[LogitsProcessorOutput, torch.Tensor], List[torch.Tensor], bool]:
+        batch_size = forward_batch.batch_size
+        # Here, the forward_batch full logits contains all the blocks
+        # such as [dllm_block_size * batch_size, hidden_size]
+        start_list = []
         mask_index = forward_batch.input_ids == self.mask_id
-        start = len(forward_batch.input_ids) - torch.sum(mask_index).item()
 
-        skip_attn_backend_init = False
-        
-        
+        # Fast path: if there is no mask token, forward and save kv cache
+        if torch.sum(mask_index).item() == 0:
+            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+
+            next_token_ids = []
+            return logits_output, next_token_ids, can_run_cuda_graph
+
+        # Calculate start positions for each block
+        for block_id in range(batch_size):
+            block_start = block_id * self.block_size
+            block_end = block_start + self.block_size
+            block_input_ids = forward_batch.input_ids[block_start:block_end]
+            block_mask_index = block_input_ids == self.mask_id
+            start = self.block_size - torch.sum(block_mask_index).item()
+            start_list.append(start)
+
+        if _is_npu:
+            skip_attn_backend_init = False
+
         for _ in range(self.block_size):
-            self.step = _
             mask_index = forward_batch.input_ids == self.mask_id
-            if not torch.any(mask_index):
+            if torch.sum(mask_index).item() == 0:
                 break
-            self.parallel_decoding_dispatch(
-                model_runner, forward_batch, mask_index, skip_attn_backend_init
+
+            if _is_npu:
+                self.parallel_decoding_dispatch(
+                    model_runner, forward_batch, mask_index, skip_attn_backend_init
+                )
+                skip_attn_backend_init = True
+            else:
+                self.parallel_decoding_dispatch(
+                    model_runner, forward_batch, mask_index, skip_attn_backend_init
+                )
+            logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            assert batch_size == forward_batch.input_ids.shape[0] // self.block_size
+            if _is_npu:
+                parallel_decoding_update_input_ids_vectorized(
+                    input_ids_1d=forward_batch.input_ids,
+                    full_logits_2d=logits_output.full_logits,
+                    mask_id=self.mask_id,
+                    block_size=self.block_size,
+                    threshold=self.threshold,
+                    finished=None,
+                    force_at_least_one=True,
+                )
+                continue
+
+            for batch_id in range(batch_size):
+                curr_block_start = batch_id * self.block_size
+                curr_block_end = curr_block_start + self.block_size
+                block_input_ids = forward_batch.input_ids[
+                    curr_block_start:curr_block_end,
+                ]
+                block_mask_index = block_input_ids == self.mask_id
+                if torch.sum(block_mask_index).item() == 0:
+                    continue
+                curr_logits = logits_output.full_logits[
+                    curr_block_start:curr_block_end,
+                ]
+
+                x = torch.argmax(curr_logits, dim=-1)
+                p = torch.squeeze(
+                    torch.gather(
+                        F.softmax(curr_logits, dim=-1),
+                        dim=-1,
+                        index=torch.unsqueeze(x, -1),
+                    ),
+                    -1,
+                )
+                x = torch.where(block_mask_index, x, block_input_ids)
+                confidence = torch.where(block_mask_index, p, -np.inf)
+
+                transfer_index = confidence > self.threshold
+
+                if transfer_index.sum().item() == 0:
+                    _, select_index = torch.topk(confidence, k=1)
+                    transfer_index[select_index] = True
+
+                block_input_ids[transfer_index] = x[transfer_index]
+
+        if getattr(self, "state", None):
+            self.state.reset()
+
+        if _is_npu:
+            out = model_runner.forward(
+                forward_batch, skip_attn_backend_init, pp_proxy_tensors=None
             )
-            skip_attn_backend_init = True
-
-        CreditDecoding.step_total += self.step
-        self.state.reset()
-
-        logger.info(f"paralle decoding: forward times = {CreditDecoding.step_total}")
-        out = model_runner.forward(forward_batch, skip_attn_backend_init, pp_proxy_tensors=None)
+        else:
+            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
-        next_token_ids = forward_batch.input_ids[start:]
-        return logits_output, next_token_ids, can_run_cuda_graph
+        # Here next token ids is tricky to implement the dynamic lengths,
+        # so we return a list of tensors
+        next_token_ids = torch.reshape(forward_batch.input_ids, (batch_size, -1))
+        next_token_ids_list = [
+            next_token_ids[i, start_list[i] :] for i in range(batch_size)
+        ]
+
+        return logits_output, next_token_ids_list, can_run_cuda_graph
 
 Algorithm = CreditDecoding
-
