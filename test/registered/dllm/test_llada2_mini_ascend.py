@@ -34,6 +34,8 @@ class TestLLaDA2Mini(CustomTestCase):
             "ascend",
             "--dllm-algorithm",
             "LowConfidence",  # TODO: Add dLLM configurations
+            "--dllm-algorithm-config",
+            "low_confidence.yaml",
         ]
 
         cls.process = popen_launch_server(
