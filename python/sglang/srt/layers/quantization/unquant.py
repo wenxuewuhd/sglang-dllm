@@ -164,6 +164,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self.with_bias = False
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
         self._cache_permute_indices = dict({})
+        self._row_idx_cache = {}  # key: num_tokens -> [T, K] int32 on device
 
     def create_weights(
         self,
@@ -527,6 +528,25 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
             return self.runner.run(dispatch_output, quant_info)
 
+    def _build_row_idx(self, num_tokens: int, top_k: int, device):
+        row_idx = (
+            torch.arange(0, num_tokens * top_k, dtype=torch.int32, device=device)
+            .view(top_k, -1)
+            .permute(1, 0)
+            .contiguous()
+        )
+        return row_idx
+
+    @torch._dynamo.disable
+    def _ensure_row_idx_outside_compile(
+        self, num_tokens: int, top_k: int, device: torch.device
+    ) -> torch.Tensor:
+        """Build and cache row_idx on cache miss. Never compiled so the graph
+        only contains the cache-hit path; avoids double warmup and cache_compile issues."""
+        row_idx = self._build_row_idx(num_tokens, top_k, device)
+        self._row_idx_cache[num_tokens] = row_idx
+        return row_idx
+
     def forward_npu(
         self,
         layer: torch.nn.Module,
@@ -546,13 +566,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         topk_ids = topk_ids.to(torch.int32)
         num_experts = layer.num_experts
         top_k = layer.top_k
-        row_idx_len = num_tokens * top_k
-        row_idx = (
-            torch.arange(0, row_idx_len, dtype=torch.int32, device=topk_weights.device)
-            .view(top_k, -1)
-            .permute(1, 0)
-            .contiguous()
-        )
+        
+        device = x.device
+        row_idx = self._row_idx_cache.get(num_tokens)
+        if row_idx is None:
+            row_idx = self._ensure_row_idx_outside_compile(num_tokens, top_k, device)
 
         hidden_states, expanded_row_idx, expanded_expert_idx = (
             torch_npu.npu_moe_init_routing(
