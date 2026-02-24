@@ -146,13 +146,13 @@ class JointThreshold(DllmAlgorithm):
                 start_list.append(prompt_mask.sum().item())
 
         post_edit_steps = torch.zeros(batch_size, dtype=torch.int32, device=device)
-        
+
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
         # Controls whether to perform an additional forward pass for KV cache persistence.
         # For certain decoding rounds where the terminal step yields no state change,
         # this can be set to False to bypass the overhead of an idle forward pass.
-        any_changed_in_last_step = False  
-        
+        any_changed_in_last_step = False        
+
         max_iterations = self.block_size + self.max_post_edit_steps
         for _ in range(max_iterations):
             if finished.all():
@@ -219,7 +219,7 @@ class JointThreshold(DllmAlgorithm):
                 if has_mask:
                     confidence = torch.where(mask_index, p, -np.inf)
                     mask_transfer_index = confidence > self.threshold
-                    
+
                     if not mask_transfer_index.any():
                         _, select_index = torch.topk(confidence, k=1)
                         mask_transfer_index[select_index] = True
