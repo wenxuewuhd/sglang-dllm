@@ -81,6 +81,7 @@ class TestLLaDA2Mini(CustomTestCase):
                 f"### test_bs_1_speed (llada2-mini) with tp1\n"
                 f"{speed=:.2f} token/s\n"
             )
+            # if test speed lower than 130 tps, have to check the environ
             self.assertGreater(speed, 130)
 
 
