@@ -151,7 +151,7 @@ class JointThreshold(DllmAlgorithm):
         # Controls whether to perform an additional forward pass for KV cache persistence.
         # For certain decoding rounds where the terminal step yields no state change,
         # this can be set to False to bypass the overhead of an idle forward pass.
-        any_changed_in_last_step = False        
+        any_changed_in_last_step = False
 
         max_iterations = self.block_size + self.max_post_edit_steps
         for _ in range(max_iterations):
@@ -170,7 +170,7 @@ class JointThreshold(DllmAlgorithm):
                 changed_any = joint_threshold_update_step_vectorized(
                     forward_batch.input_ids,
                     logits_output.full_logits,
-                    prompt_mask_2d,
+                    prompt_masks,
                     finished,
                     post_edit_steps,
                     self.mask_id,
