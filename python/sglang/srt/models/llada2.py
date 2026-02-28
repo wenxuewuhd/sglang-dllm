@@ -221,10 +221,6 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         else:
             self.router_dtype = torch.bfloat16
 
-        # to accelerate MoEGate on NPU, and LLaDA2.0-mini precision on GSM8k increase from 0.930->0.935
-        if _is_npu:
-            self.router_dtype = torch.bfloat16
-
         # TODO global_server_args.ep_num_redundant_experts is used for eplb, not supported now
         assert get_global_server_args().ep_num_redundant_experts == 0
         # check group topk
