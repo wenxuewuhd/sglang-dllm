@@ -25,6 +25,12 @@ def joint_threshold_update_step_vectorized(
     max_post_edit_steps: int,
     penalty_lambda: float,
 ):
+    """
+    joint_threshold_update_step_vectorized: 
+    Equalized implementation of the joint_threshold_update algorithm, intended for efficient batched processing.
+    This algorithm provides a vectorized (batched) update step for joint threshold decoding, 
+    offering performance improvements compared to the step-by-step implementation which may be skipped by 'continue'.
+    """
     B = input_ids_1d.shape[0] // blk
     V = full_logits_2d.shape[1]
 
@@ -158,6 +164,8 @@ class JointThreshold(DllmAlgorithm):
             if finished.all():
                 break
             if _is_npu:
+                # skip attn backend init once has been performed in the loop to avoid unnecessary overhead.
+                # the optimization could benefit other hardware backends as well.
                 out = model_runner.forward(
                     forward_batch, skip_attn_backend_init, pp_proxy_tensors=None
                 )
@@ -167,6 +175,8 @@ class JointThreshold(DllmAlgorithm):
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 
             if _is_npu:
+                # Vectorized (batched) update step for joint threshold decoding.
+                # Notably, substantial speed benefit has been obtained on NPU by getting rid of the per-batch loop.
                 changed_any = joint_threshold_update_step_vectorized(
                     forward_batch.input_ids,
                     logits_output.full_logits,

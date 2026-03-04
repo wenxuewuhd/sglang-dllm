@@ -165,6 +165,8 @@ class LowConfidence(DllmAlgorithm):
                 break
 
             if _is_npu:
+                # skip attn backend init once has been performed in the loop to avoid unnecessary overhead.
+                # the optimization could benefit other hardware backends as well.
                 out = model_runner.forward(
                     forward_batch, skip_attn_backend_init, pp_proxy_tensors=None
                 )
@@ -174,6 +176,8 @@ class LowConfidence(DllmAlgorithm):
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             assert batch_size == forward_batch.input_ids.shape[0] // self.block_size
             if _is_npu:
+                # Vectorized (batched) update step for low confidence decoding.
+                # Notably, substantial speed benefit has been obtained on NPU by getting rid of the per-batch loop.
                 parallel_decoding_update_input_ids_vectorized(
                     input_ids_1d=forward_batch.input_ids,
                     full_logits_2d=logits_output.full_logits,

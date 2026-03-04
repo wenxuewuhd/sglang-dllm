@@ -408,7 +408,8 @@ class Scheduler(
             else None
         )
         if _is_npu and self.dllm_config:
-            # make sure the page size is not larger than block_size and chunked_prefill_size
+            # make sure the page size is not larger than block_size and chunked_prefill_size on NPU backend
+            # the npu backend request the defined page size to be no larger than block_size and chunked_prefill_size
             if self.dllm_config.block_size < self.page_size:
                 logger.warning(
                     "WARNING: "

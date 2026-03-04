@@ -445,7 +445,7 @@ class SchedulerOutputProcessorMixin:
             next_token_ids = result.next_token_ids[idx].tolist()
             self.num_generated_tokens += len(next_token_ids)
 
-            # to accelerate decoding by check in blockwise-manner
+            # to accelerate decoding by check in blockwise-manner, could benefit other hardware backends as well.
             if _is_npu:
                 self._append_block_and_finalize_req(req, next_token_ids)
                 continue
