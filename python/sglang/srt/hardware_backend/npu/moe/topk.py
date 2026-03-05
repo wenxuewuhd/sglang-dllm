@@ -8,6 +8,8 @@ from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physica
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.layers.moe.topk import StandardTopKOutput, select_experts
 
+from sglang.srt.hardware_backend.npu.moe.grouped_topk_routing import grouped_topk_routing_
+
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
     from sglang.srt.layers.moe.topk import TopKConfig, TopKOutput
@@ -42,11 +44,26 @@ def fused_topk_npu(
 
     elif use_grouped_topk and correction_bias is not None:
         # Force set routed_scaling_factor = 1 to optimize renormalize
-        topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
+        # topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
+        #     router_logits.to(torch.float32),
+        #     k=topk_config.top_k,
+        #     bias=correction_bias.to(torch.float32),
+        #     k_group=topk_config.topk_group,
+        #     group_count=topk_config.num_expert_group,
+        #     group_select_mode=1,
+        #     renorm=0,
+        #     norm_type=1,
+        #     routed_scaling_factor=(
+        #         1 if renormalize else topk_config.routed_scaling_factor
+        #     ),
+        #     eps=float(1e-20),
+        # )
+        topk_weights, topk_ids = grouped_topk_routing_(
             router_logits.to(torch.float32),
-            k=topk_config.top_k,
+            topk_config.top_k,
             bias=correction_bias.to(torch.float32),
-            k_group=topk_config.topk_group,
+            #k_group=topk_config.topk_group,
+            k_group=6,
             group_count=topk_config.num_expert_group,
             group_select_mode=1,
             renorm=0,
@@ -55,6 +72,7 @@ def fused_topk_npu(
                 1 if renormalize else topk_config.routed_scaling_factor
             ),
             eps=float(1e-20),
+            pool_delta=0.1,
         )
 
     else:
