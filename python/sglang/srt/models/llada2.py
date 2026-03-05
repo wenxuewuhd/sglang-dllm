@@ -89,11 +89,6 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 
-if _is_npu:
-    from sglang.srt.layers.rotary_embedding import (
-        split_qkv_rmsnorm_rope_pos_cache_half_npu,
-    )
-
 
 class LLaDA2MoeMLP(nn.Module):
     def __init__(
@@ -201,16 +196,16 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.score_function = getattr(config, "score_function", None)
 
+        # fused_topk_npu() conducting norm before scale with routed_scaling_factor by default
+        # norm_topk_prob=True will renorm the routed_scaling_factor thus need to keep norm_topk_prob=False
+        if _is_npu:
+            self.norm_topk_prob = False
+
         if config.hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {config.hidden_act}. "
                 "Only silu is supported for now."
             )
-
-        # fused_topk_npu() conducting norm before scale with routed_scaling_factor by default
-        # norm_topk_prob=True will renorm the routed_scaling_factor thus need to keep norm_topk_prob=False
-        if _is_npu:
-            self.norm_topk_prob = False
 
         # Gate always runs at half / full precision for now.
         router_dtype = getattr(config, "router_dtype", None)
@@ -519,47 +514,30 @@ class LLaDA2MoeAttention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
         qkv, _ = self.query_key_value(hidden_states)
-        if _is_npu:
-            q, k, v = split_qkv_rmsnorm_rope_pos_cache_half_npu(
-                qkv,
-                positions,
-                self.rotary_emb.cos_sin_cache,
-                self.q_size,
-                self.kv_size,
-                self.head_dim,
-                eps=self.query_layernorm.variance_epsilon,
-                q_weight=self.query_layernorm.weight,
-                k_weight=self.key_layernorm.weight,
-                q_bias=getattr(self.query_layernorm, "bias", None),
-                k_bias=getattr(self.key_layernorm, "bias", None),
-                rope_dim=self.rotary_dim,
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.use_qk_norm:
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=self.query_layernorm,
+                k_norm=self.key_layernorm,
+                head_dim=self.head_dim,
+                alt_stream=self.alt_stream,
             )
-        else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            if self.use_qk_norm:
-                q, k = apply_qk_norm(
-                    q=q,
-                    k=k,
-                    q_norm=self.query_layernorm,
-                    k_norm=self.key_layernorm,
-                    head_dim=self.head_dim,
-                    alt_stream=self.alt_stream,
+        q, k = self.rotary_emb(
+            positions,
+            q,
+            k,
+            fused_set_kv_buffer_arg=(
+                create_fused_set_kv_buffer_arg(
+                    value=v,
+                    layer=self.attn,
+                    forward_batch=forward_batch,
                 )
-            q, k = self.rotary_emb(
-                positions,
-                q,
-                k,
-                fused_set_kv_buffer_arg=(
-                    create_fused_set_kv_buffer_arg(
-                        value=v,
-                        layer=self.attn,
-                        forward_batch=forward_batch,
-                    )
-                    if enable_fused_set_kv_buffer(forward_batch)
-                    else None
-                ),
-            )
-
+                if enable_fused_set_kv_buffer(forward_batch)
+                else None
+            ),
+        )
         context_layer = self.attn(
             q,
             k,
