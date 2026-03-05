@@ -73,6 +73,7 @@ def fused_topk_npu(
             ),
             eps=float(1e-20),
             pool_delta=0.1,
+            N=16
         )
 
     else:

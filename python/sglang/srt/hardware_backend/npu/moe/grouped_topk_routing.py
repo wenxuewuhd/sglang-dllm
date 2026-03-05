@@ -306,9 +306,47 @@ def grouped_topk_routing_(
     # norm_out only when out_flag (avoid [T,E] copy when not needed)
 
     # ------------------------
-    # 3) group reshape, 4) group score and select k_group groups -> mask_e
+    # 2) [Optional] Soft block concentration *before* group selection:
+    #    Build block pool S from raw norm scores, apply pool_delta + load penalty,
+    #    so that group selection (and thus eligibility) is guided by block-level preference.
     # ------------------------
-    norm_g = norm_fp32.view(T, group_count, group_size)
+    mask_s_f = None  # for debug when S exists
+    if N is not None and (pool_delta != 0.0 or load_lambda != 0.0):
+        # m: how many top tokens per expert to aggregate for pool build
+        if block_top_m is None:
+            m = (T * k_val + N - 1) // N
+            m = max(1, min(m, T))
+        else:
+            m = int(block_top_m)
+            m = max(1, min(m, T))
+        # Build S from raw norm_fp32 (no per-token mask yet): top-m per expert -> sum -> top-N experts
+        topm_vals = _npu_topk_if_available(norm_fp32, m, dim=0)[0]   # [m, E]
+        A = topm_vals.sum(dim=0)                                      # [E]
+        S = _npu_topk_if_available(A, N, dim=-1)[1]                   # [N]
+        score_adj = norm_fp32.clone()
+        if pool_delta != 0.0:
+            score_adj[:, S] = score_adj[:, S] + float(pool_delta)
+        if load_lambda != 0.0 or return_debug:
+            mask_s_f = torch.zeros((E,), device=x.device, dtype=norm_fp32.dtype)
+            mask_s_f.scatter_(0, S, torch.ones(N, device=x.device, dtype=norm_fp32.dtype))
+        if load_lambda != 0.0:
+            s = score_adj if load_temp == 1.0 else score_adj / float(load_temp)
+            if load_from == "sigmoid":
+                p = _npu_sigmoid_if_available(s)
+            else:
+                p = torch.softmax(s, dim=-1)
+            load_e = p.sum(dim=0)
+            penalty = torch.log(1.0 + load_e) if load_log else load_e
+            score_adj = score_adj - float(load_lambda) * penalty.unsqueeze(0) * (1.0 - mask_s_f).unsqueeze(0)
+        scores_for_downstream = score_adj
+    else:
+        scores_for_downstream = norm_fp32
+
+    # ------------------------
+    # 3) group reshape, 4) group score and select k_group groups -> mask_e
+    #    (on scores_for_downstream so concentration-biased scores guide eligibility when applicable)
+    # ------------------------
+    norm_g = scores_for_downstream.view(T, group_count, group_size)
     if group_select_mode == 0:
         group_score = norm_g.max(dim=-1).values  # [T, G]
     elif group_select_mode == 1:
@@ -324,91 +362,19 @@ def grouped_topk_routing_(
     def _masked_scores(scores: torch.Tensor) -> torch.Tensor:
         return mask_e * scores + (1.0 - mask_e) * neg_large
 
-    # Baseline path if no soft concentration requested
-    if N is None or (pool_delta == 0.0 and load_lambda == 0.0):
-        masked_scores = _masked_scores(norm_fp32)
-        topk_w_fp32, topk_ids = _npu_topk_if_available(masked_scores, k_val, dim=-1)
-        topk_ids = topk_ids.to(torch.int64)  # downstream expects int64
-
-        denom = topk_w_fp32.sum(dim=-1, keepdim=True) + float(eps)
-        topk_w_fp32.div_(denom).mul_(float(routed_scaling_factor))
-        topk_w = topk_w_fp32.to(dtype=x.dtype)
-
-        if return_debug:
-            dbg = _routing_debug_stats(topk_ids, mask_e, None, k_val, N)
-            if out_flag:
-                return topk_w, topk_ids, norm_fp32.to(dtype=x.dtype), dbg
-            else:
-                return topk_w, topk_ids, dbg
-
-        if out_flag:
-            return topk_w, topk_ids, norm_fp32.to(dtype=x.dtype)
-        else:
-            return topk_w, topk_ids
-
-    # ------------------------
-    # Soft block concentration path (NPU-optimized: no transpose, float masks)
-    # ------------------------
-    eligible_score = _masked_scores(norm_fp32)
-
-    # NPU: avoid math.ceil (graph break); use integer arithmetic
-    if block_top_m is None:
-        m = (T * k_val + N - 1) // N
-        m = max(1, min(m, T))
-    else:
-        m = int(block_top_m)
-        m = max(1, min(m, T))
-
-    # NPU: pool build without transpose; topk(dim=0) on [T,E] gives top-m tokens per expert -> [m,E], then sum(0) -> [E]
-    # (avoids transpose + topk on [E,T] which often falls back to AICPU)
-    topm_vals = _npu_topk_if_available(eligible_score, m, dim=0)[0]   # [m, E]
-    A = topm_vals.sum(dim=0)                                          # [E]
-    S = _npu_topk_if_available(A, N, dim=-1)[1]                       # [N]
-
-    # 2) Adjust scores: pool bias + load penalty (in-place to reduce allocations)
-    # Pool bias: index-add only on S columns, no need to build full mask_s_f here.
-    score_adj = eligible_score.clone()
-    if pool_delta != 0.0:
-        score_adj[:, S] = score_adj[:, S] + float(pool_delta)
-
-    # Build mask_s_f only when needed (load penalty or debug); avoids E-sized scatter when only pool_delta.
-    if load_lambda != 0.0 or return_debug:
-        mask_s_f = torch.zeros((E,), device=x.device, dtype=norm_fp32.dtype)
-        mask_s_f.scatter_(0, S, torch.ones(N, device=x.device, dtype=norm_fp32.dtype))
-
-    if load_lambda != 0.0:
-        s = score_adj if load_temp == 1.0 else score_adj / float(load_temp)  # [T,E]
-        if load_from == "sigmoid":
-            p = _npu_sigmoid_if_available(s)
-            p = mask_e * p
-        else:
-            s_masked = mask_e * s + (1.0 - mask_e) * neg_large
-            p = torch.softmax(s_masked, dim=-1)
-
-        load_e = p.sum(dim=0)  # [E]
-        if load_log:
-            penalty = torch.log(1.0 + load_e)
-        else:
-            penalty = load_e
-
-        pen = penalty.unsqueeze(0)
-        outside_f = (1.0 - mask_s_f).unsqueeze(0)
-        score_adj.sub_(float(load_lambda) * pen * outside_f)
-
-    # score_adj is already masked; skip redundant _masked_scores
-    _, topk_ids = _npu_topk_if_available(score_adj, k_val, dim=-1)  # [T,k]
+    # Single downstream path: eligibility from scores_for_downstream (norm or concentration-adjusted)
+    eligible_score = _masked_scores(scores_for_downstream)
+    _, topk_ids = _npu_topk_if_available(eligible_score, k_val, dim=-1)
     topk_ids = topk_ids.to(torch.int64)  # downstream expects int64
 
-    # 4) Gather weights from baseline scores (NOT adjusted scores)
+    # Gather weights from baseline norm (w_base_fp32), then renorm + scale
     topk_w_fp32 = torch.gather(w_base_fp32, dim=1, index=topk_ids)  # [T,k]
-
-    # 5) Final renorm + scaling (same as baseline, in-place)
     denom = topk_w_fp32.sum(dim=-1, keepdim=True) + float(eps)
     topk_w_fp32.div_(denom).mul_(float(routed_scaling_factor))
     topk_w = topk_w_fp32.to(dtype=x.dtype)
 
     if return_debug:
-        mask_s = (mask_s_f > 0)  # bool only for debug dict
+        mask_s = (mask_s_f > 0) if mask_s_f is not None else None
         dbg = _routing_debug_stats(topk_ids, mask_e, mask_s, k_val, N)
         if out_flag:
             return topk_w, topk_ids, norm_fp32.to(dtype=x.dtype), dbg
