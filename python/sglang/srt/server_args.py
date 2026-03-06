@@ -2727,7 +2727,7 @@ class ServerArgs:
         elif is_npu():
             if self.attention_backend != "ascend":
                 logger.warning(
-                    "Attention backend is set to ascend with npu because of enabling cuda graph in diffusion LLM inference"
+                    "Attention backend is overridden to 'ascend' when running on NPU for diffusion LLM inference."
                 )
                 self.attention_backend = "ascend"
         elif not self.disable_cuda_graph:
