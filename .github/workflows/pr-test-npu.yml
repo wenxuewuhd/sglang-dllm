@@ -102,7 +102,7 @@ jobs:
           curl -o /tmp/test.jsonl -L https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
 
       - name: Run test
-        timeout-minutes: 120
+        timeout-minutes: 60
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
@@ -280,3 +280,4 @@ jobs:
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py --suite 1-npu
+
