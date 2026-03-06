@@ -107,9 +107,7 @@ suite_ascend = {
         TestFile("ascend/test_ascend_w4a4_quantization.py", 600),
     ],
     "per-commit-16-npu-a3": [
-        TestFile(
-            "../registered/dllm/test_llada2_mini_ascend.py", 800
-        ),
+        TestFile("../registered/dllm/test_llada2_mini_ascend.py", 800),
         TestFile("ascend/test_ascend_deepep.py", 3600),
     ],
 }
