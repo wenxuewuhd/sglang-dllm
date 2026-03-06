@@ -6,6 +6,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
@@ -20,7 +21,7 @@ class TestLLaDA2Mini(CustomTestCase):
         cls._old_disable_acl = os.environ.get("SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT")
         os.environ["SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT"] = "1"
 
-        cls.model = "inclusionAI/LLaDA2.0-mini"
+        cls.model = "/root/.cache/modelscope/hub/models/inclusionAI/LLaDA2.0-mini"
         cls.base_url = DEFAULT_URL_FOR_TEST
 
         other_args = [
@@ -39,7 +40,7 @@ class TestLLaDA2Mini(CustomTestCase):
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=3600,  # downloading model takes time, may change back to DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH after caching the model locally
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
         )
 
