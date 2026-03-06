@@ -92,9 +92,6 @@ suite_ascend = {
         TestFile("ascend/test_ascend_compile_graph_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_w8a8_quantization.py", 400),
         TestFile("test_embed_interpolate_unittest.py", 400),
-        TestFile(
-            "../registered/dllm/test_llada2_mini_ascend.py", 3600
-        ),  # downloading model takes long time
     ],
     "per-commit-2-npu-a2": [
         TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
@@ -111,6 +108,9 @@ suite_ascend = {
         TestFile("ascend/test_ascend_deepep.py", 3600),
         # TestFile("ascend/test_ascend_deepseek_mtp.py", 2800),
         TestFile("ascend/test_ascend_w4a4_quantization.py", 600),
+        TestFile(
+            "../registered/dllm/test_llada2_mini_ascend.py", 800
+        ),
     ],
 }
 
