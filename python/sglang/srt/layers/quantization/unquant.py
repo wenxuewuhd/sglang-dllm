@@ -57,6 +57,29 @@ if _use_aiter:
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 
+    def _npu_moe_loader_wrapper(
+        layer: torch.nn.Module,
+        original_loader,
+        expected_slices: int,
+    ):
+        """Wrap original loader: call it, then only after last slice convert dense layout to NZ (avoid OOM, no 2x HBM).
+        expected_slices: w13=2*num_experts (w1+w3 per expert), w2=num_experts."""
+
+        def wrapper(
+            param: Parameter, loaded_weight: torch.Tensor, *args, **kwargs
+        ) -> None:
+            if original_loader is not None:
+                original_loader(param, loaded_weight, *args, **kwargs)
+            n = getattr(param, "_npu_slice_count", 0) + 1
+            setattr(param, "_npu_slice_count", n)
+            if n >= expected_slices:
+                param.data = npu_format_cast(param.data.transpose(1, 2).contiguous())
+                setattr(param, "_npu_nz_converted", True)
+                torch.npu.empty_cache()
+
+        return wrapper
+
+
 try:
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
     from flashinfer.fused_moe.core import ActivationType
@@ -197,6 +220,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         )
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
+        if _is_npu:
+            orig = getattr(w13_weight, "weight_loader", None)
+            w13_weight.weight_loader = _npu_moe_loader_wrapper(
+                layer, orig, expected_slices=2 * num_experts
+            )
 
         if self.with_bias:
             w13_weight_bias = torch.nn.Parameter(
@@ -219,6 +247,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
+        if _is_npu:
+            orig = getattr(w2_weight, "weight_loader", None)
+            w2_weight.weight_loader = _npu_moe_loader_wrapper(
+                layer, orig, expected_slices=num_experts
+            )
 
         if self.with_bias:
             w2_weight_bias = torch.nn.Parameter(
@@ -313,9 +346,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 layer.num_local_experts, *new_shape_w2
             )
 
+        # NPU: convert dense layout to NZ in process_weights (if converted during loading, no need to convert again).
         if _is_npu:
             for weight_name in ["w13_weight", "w2_weight"]:
                 weight = getattr(layer, weight_name)
+                if getattr(weight, "_npu_nz_converted", False):
+                    continue  # already NZ (3D loaded)
                 weight.data = weight.data.transpose(1, 2)
                 weight.data = npu_format_cast(
                     weight.data,
