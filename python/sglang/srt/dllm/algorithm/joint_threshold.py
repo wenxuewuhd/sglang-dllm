@@ -62,7 +62,8 @@ def joint_threshold_update_step_vectorized(
     eligible = active & (~(no_mask_active & exceeded))
 
     # ---------- M2T ----------
-    log_thr = math.log(threshold)
+    # Avoid math.log on non-positive threshold (matches linear-path confidence > threshold).
+    log_thr = math.log(threshold) if threshold > 0 else float("-inf")
     neg_inf = torch.full_like(logp, float("-inf"))
     conf_m2t = torch.where(mask_pos, logp, neg_inf)
 
