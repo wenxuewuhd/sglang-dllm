@@ -125,7 +125,7 @@ class LowConfidence(DllmAlgorithm):
         super().__init__(config)
         self.threshold = config.algorithm_config.get("threshold", 0.95)
         self.vectorized_decoding = config.algorithm_config.get(
-            "vectorized_decoding", False
+            "vectorized_decoding", True
         )
 
     def run(

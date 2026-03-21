@@ -115,7 +115,7 @@ class JointThreshold(DllmAlgorithm):
         )
         self.penalty_lambda = config.algorithm_config.get("penalty_lambda", 0)
         self.vectorized_decoding = config.algorithm_config.get(
-            "vectorized_decoding", False
+            "vectorized_decoding", True
         )
 
     def run(
