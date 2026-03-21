@@ -151,7 +151,6 @@ class JointThreshold(DllmAlgorithm):
         post_edit_steps = torch.zeros(batch_size, dtype=torch.int32, device=device)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-        any_changed_flag = torch.tensor(False, device=device)
         skip_attn_backend_init = False
 
         max_iterations = self.block_size + self.max_post_edit_steps
@@ -178,7 +177,7 @@ class JointThreshold(DllmAlgorithm):
                     self.max_post_edit_steps,
                     self.penalty_lambda,
                 )
-                any_changed_flag = changed_any  # only last step matters
+                any_changed_in_last_step = changed_any.item()
                 continue
 
             # ---------- original non-vectorized path ----------
@@ -243,16 +242,11 @@ class JointThreshold(DllmAlgorithm):
                 any_changed_in_last_step = True
 
         # ---------- extra forward ----------
-        if self.vectorized_decoding:
-            if any_changed_flag.item():
-                out = model_runner.forward(
-                    forward_batch, skip_attn_backend_init, pp_proxy_tensors=None
-                )
-                logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
-        else:
-            if any_changed_in_last_step:
-                out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-                logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+        if any_changed_in_last_step:
+            out = model_runner.forward(
+                forward_batch, skip_attn_backend_init, pp_proxy_tensors=None
+            )
+            logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 
         next_token_ids = torch.reshape(forward_batch.input_ids, (batch_size, -1))
         next_token_ids_list = [
