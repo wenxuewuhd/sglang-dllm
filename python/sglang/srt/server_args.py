@@ -3429,6 +3429,8 @@ class ServerArgs:
             from sglang.srt.dllm.config import DllmConfig
 
             config = DllmConfig.from_server_args(self)
+
+            self.page_size = config.block_size
             if self.page_size % config.block_size != 0:
                 logger.warning(
                     f"Setting page size to {config.block_size} for diffusion LLM inference"

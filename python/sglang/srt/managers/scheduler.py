@@ -228,6 +228,7 @@ if is_mps():
     CudaStreamContext = nullcontext
 else:
     from torch.cuda import StreamContext as CudaStreamContext
+import torch_npu
 
 logger = logging.getLogger(__name__)
 
@@ -1261,8 +1262,36 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
+                profiling = batch.seq_lens.item() in (128, 960)
+                # profiling = False
+
+                if profiling:
+                    experimental_config = torch_npu.profiler._ExperimentalConfig(
+                        profiler_level=torch_npu.profiler.ProfilerLevel.Level2
+                    )
+
+                    with torch_npu.profiler.profile(
+                        activities=[
+                            torch_npu.profiler.ProfilerActivity.CPU,
+                            torch_npu.profiler.ProfilerActivity.NPU,
+                        ],
+                        schedule=torch_npu.profiler.schedule(
+                            wait=0, warmup=0, active=1, repeat=1, skip_first=0
+                        ),
+                        experimental_config=experimental_config,
+                        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                            "./npu_results_dbg"
+                        ),
+                    ) as prof:
+                        result = self.run_batch(batch)
+                        self.process_batch_result(batch, result)
+                        prof.step()
+                else:
+                    result = self.run_batch(batch)
+                    self.process_batch_result(batch, result)
+
+                # result = self.run_batch(batch)
+                # self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.self_check_during_idle()
