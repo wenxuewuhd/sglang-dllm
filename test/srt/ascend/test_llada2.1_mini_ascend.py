@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 
@@ -18,10 +17,9 @@ from sglang.test.test_utils import (
 class TestLLaDA2Mini(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls._old_disable_acl = os.environ.get("SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT")
-        os.environ["SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT"] = "1"
 
-        cls.model = "/root/.cache/modelscope/hub/models/inclusionAI/LLaDA2.0-mini"
+        # cls.model = "/root/.cache/modelscope/hub/models/inclusionAI/LLaDA2.0-mini"
+        cls.model = "/workspace/models/llada/LLaDA2.1-mini"
         cls.base_url = DEFAULT_URL_FOR_TEST
 
         other_args = [
@@ -34,7 +32,9 @@ class TestLLaDA2Mini(CustomTestCase):
             "--attention-backend",
             "ascend",
             "--dllm-algorithm",
-            "LowConfidence",  # TODO: Add dLLM configurations
+            "JointThreshold",  # TODO: Add dLLM configurations
+            "--dllm-algorithm-config",
+            "joint_threshold.yaml",
         ]
 
         cls.process = popen_launch_server(
@@ -48,14 +48,9 @@ class TestLLaDA2Mini(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-        if cls._old_disable_acl is None:
-            os.environ.pop("SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT", None)
-        else:
-            os.environ["SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT"] = cls._old_disable_acl
-
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
+            num_shots=0,
             data_path=None,
             num_questions=200,
             max_new_tokens=512,

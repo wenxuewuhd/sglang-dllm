@@ -21,7 +21,8 @@ class TestLLaDA2Mini(CustomTestCase):
         cls._old_disable_acl = os.environ.get("SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT")
         os.environ["SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT"] = "1"
 
-        cls.model = "/root/.cache/modelscope/hub/models/inclusionAI/LLaDA2.0-mini"
+        # cls.model = "/root/.cache/modelscope/hub/models/inclusionAI/LLaDA2.0-mini"
+        cls.model = "/workspace/models/llada/LLaDA2.0-mini"
         cls.base_url = DEFAULT_URL_FOR_TEST
 
         other_args = [
@@ -35,6 +36,8 @@ class TestLLaDA2Mini(CustomTestCase):
             "ascend",
             "--dllm-algorithm",
             "LowConfidence",  # TODO: Add dLLM configurations
+            # "--dllm-algorithm-config",
+            # "low_confidence.yaml",
         ]
 
         cls.process = popen_launch_server(

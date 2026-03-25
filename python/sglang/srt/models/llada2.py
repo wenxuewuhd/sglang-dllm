@@ -824,8 +824,8 @@ class LLaDA2MoeModelLM(nn.Module):
 
         if _is_cuda:
             alt_stream = torch.cuda.Stream()
-        elif _is_npu:
-            alt_stream = torch.npu.Stream()
+        # elif _is_npu:
+        #    alt_stream = torch.npu.Stream()
         else:
             alt_stream = None
 
