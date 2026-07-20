@@ -21,6 +21,28 @@ from sglang.srt.hardware_backend.npu.moe.matmul import GroupedMatmul
 logger = logging.getLogger(__name__)
 
 
+def _npu_format_cast_free_origin(
+    weight: torch.Tensor, source: Optional[torch.Tensor] = None
+) -> None:
+    """Rebind ``weight.data`` to the ACL-format cast of ``source`` (defaults to
+    ``weight.data``) and eagerly free the pre-cast storage.
+
+    ``npu_format_cast`` allocates a fresh FRACTAL_NZ tensor while lingering
+    references can keep the ND source pinned in HBM, roughly doubling MoE
+    load-time weight memory (fixed in #15904/#19541 with an explicit
+    ``resize_(0)``; the free was lost in #29503). The storage-identity guard
+    keeps every passthrough path safe (cast disabled via
+    SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT, CPU/meta tensors, ND-aligned
+    fallback, already-cast weights): there the source comes back unchanged and
+    must not be freed.
+    """
+    origin = weight.data
+    casted = npu_format_cast(source if source is not None else origin)
+    weight.data = casted
+    if casted.untyped_storage().data_ptr() != origin.untyped_storage().data_ptr():
+        origin.untyped_storage().resize_(0)
+
+
 # DEPRECATED METHOD
 # TODO: Remove in future realeses
 def fused_moe_npu(
@@ -332,7 +354,7 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
 
         # Process weight
         weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
-        weight.data = npu_format_cast(weight.data.transpose(1, 2))
+        _npu_format_cast_free_origin(weight, source=weight.data.transpose(1, 2))
         setattr(
             layer,
             f"{weight_prefix}_weight",
@@ -439,7 +461,7 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
 
         # Process weight
         weight = getattr(layer, f"{weight_prefix}_weight")
-        weight.data = npu_format_cast(weight.data.transpose(1, 2))
+        _npu_format_cast_free_origin(weight, source=weight.data.transpose(1, 2))
         weight.data = self._pack_to_int32(weight.data)
         setattr(
             layer,
@@ -692,7 +714,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         self._validate_weight_prefix(layer, weight_prefix)
 
         weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
-        weight.data = npu_format_cast(weight)
+        _npu_format_cast_free_origin(weight)
         setattr(
             layer,
             f"{weight_prefix}_weight",
