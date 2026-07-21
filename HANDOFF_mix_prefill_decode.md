@@ -86,6 +86,16 @@ MoeGatingTopK 2.7。
 (dLLM 走不到);logits 裁剪(lm_head+argmax 15ms/86ms)因动 T2T 语义被否;W8A8/EP 不在本 worktree 范围。
 **复现器**:mass-abort 用 scratchpad 的 abort_repro.py(128 并发 + os._exit 硬断连)。
 
+**与并行 session(DP/EP,分支 dllm-npu-deepep-fix)的 bug 对账**:
+- 他们长跑撞到的 `pool memory leak detected` 与本轮修复(`aa99813ac9`)是同一 bug(触发源=测试间
+  杀客户端的批量断连 abort;正常完成不泄漏)。**应 cherry-pick 该 commit 并去掉
+  `SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0` 重新验证**——绕过开关会把未来的真泄漏一起藏掉。
+  若 cherry-pick 后 DP/EP 长跑仍泄漏,则他们那边另有泄漏源,需单独查。
+- 他们发现的"dLLM 调度器不按 req-slot 上限收敛"(either/or prefill 轮 can_run_list 看不到在途
+  请求的槽位需求 → 池紧时超 admit,`alloc_req_slots runs out of memory`)与本轮修的准入饿死是
+  同一处门槛的一体两面。**混批模式下已构造性修复**(`_process_dllm_incoming_reqs_mixed` 按
+  全 batch 新槽需求 vs free pool 精确记账);either/or 路径仍带此 bug,留给 upstream。
+
 ---
 
 ## 你的任务
