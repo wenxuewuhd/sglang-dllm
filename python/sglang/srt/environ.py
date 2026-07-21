@@ -412,6 +412,14 @@ class Envs:
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
+
+    # Scheduler: diffusion LLM
+    # Schedule dLLM prefill-phase rows (block-size prompt chunks) and
+    # decode-phase rows (denoise blocks) into one mixed round instead of
+    # prefill-first either/or rounds. Every row is still exactly one
+    # block-size chunk, so the denoise step's uniform-block reshape holds;
+    # prompt-only rows self-finish on their first denoise step.
+    SGLANG_ENABLE_DLLM_MIXED_BATCH = EnvBool(False)
     # For non-streaming requests, the scheduler still flushes intermediate
     # output batches to the tokenizer manager every N decoded tokens so that
     # `first_token_time`/TTFT can be recorded. Lower this (e.g. to 1) to get
