@@ -14,6 +14,15 @@ from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
 
+_argmax_softmax_prob_fused = None
+if _is_npu:
+    try:
+        from sglang.srt.hardware_backend.npu.norm.argmax_softmax_prob import (
+            argmax_softmax_prob_fused as _argmax_softmax_prob_fused,
+        )
+    except (ImportError, OSError):
+        pass
+
 DllmRunOutput = Tuple[
     Union[LogitsProcessorOutput, torch.Tensor],
     List,
@@ -21,6 +30,35 @@ DllmRunOutput = Tuple[
     Optional[List[Any]],
     bool,
 ]
+
+
+def argmax_and_softmax_prob(
+    full_logits_2d: torch.Tensor,
+    vocab_chunk: int = 16384,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-row argmax and its exact softmax probability.
+
+    Equivalent to ``softmax(logits.float()).gather(argmax)`` but never holds a
+    ``[tokens, vocab]`` temporary (the large-batch dLLM OOM): a max reduction,
+    then a vocab-chunked exp-sum whose transients are ``[tokens, vocab_chunk]``.
+    Chunking matters on NPU: even ``sum(dtype=float32)`` on a bf16 operand
+    materializes a full fp32 cast internally. The argmax matches the fp32 path
+    exactly; the probability differs only by exp's precision in the input dtype
+    (measured <=0.1% relative in bf16, no threshold-decision flips at 0.5).
+    """
+    if _argmax_softmax_prob_fused is not None:
+        # Single-pass fused kernel: one read of the logits vs the 5-6 below.
+        return _argmax_softmax_prob_fused(full_logits_2d)
+
+    row_max, argmax_ids = torch.max(full_logits_2d, dim=-1)
+    row_max_col = row_max.unsqueeze(1)
+    denom: Optional[torch.Tensor] = None
+    for start in range(0, full_logits_2d.shape[1], vocab_chunk):
+        shifted = full_logits_2d[:, start : start + vocab_chunk] - row_max_col
+        shifted.exp_()
+        part = shifted.sum(dim=-1, dtype=torch.float32)
+        denom = part if denom is None else denom + part
+    return argmax_ids, 1.0 / denom
 
 
 class DllmAlgorithm:

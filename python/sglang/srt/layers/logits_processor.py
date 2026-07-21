@@ -690,6 +690,7 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
         use_logits_buffer: bool = True,
+        keep_lm_head_dtype: bool = False,
     ) -> torch.Tensor:
         """Get logits from hidden_states.
 
@@ -716,9 +717,17 @@ class LogitsProcessor(nn.Module):
             logits, local_hidden_states, logits_metadata
         )
 
-        logits = self._copy_logits_to_buffer(
-            logits, logits_metadata, use_buffer=use_logits_buffer
-        )
+        if keep_lm_head_dtype:
+            # Skip the fp32 buffer copy; a [tokens, vocab] fp32 materialization
+            # is what OOMs large dLLM batches (vocab 157k: 112 blocks -> 2.1 GiB
+            # per copy). Callers on this path consume the lm_head-dtype logits
+            # via reductions that never build another [tokens, vocab] fp32.
+            if logits.shape[-1] > self.vocab_size:
+                logits = logits[:, : self.vocab_size]
+        else:
+            logits = self._copy_logits_to_buffer(
+                logits, logits_metadata, use_buffer=use_logits_buffer
+            )
 
         if self.final_logit_softcapping:
             if not (_is_npu or _is_cpu):
@@ -862,7 +871,13 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
     ) -> LogitsProcessorOutput:
         assert self.return_full_logits
-        full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
+        # NPU: keep lm_head dtype (bf16). The denoise algorithms only need
+        # per-position argmax + its softmax probability and compute both via
+        # reductions, so the fp32 [tokens, vocab] copy is pure OOM risk. GPU
+        # keeps the fp32 path to leave upstream numerics untouched.
+        full_logits = self._get_logits(
+            hidden_states, lm_head, logits_metadata, keep_lm_head_dtype=_is_npu
+        )
         return LogitsProcessorOutput(
             full_logits=full_logits,
             next_token_logits=None,
