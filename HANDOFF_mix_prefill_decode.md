@@ -1,5 +1,66 @@
 # Handoff: FDFO 合并 prefill + decode 到同一 forward
 
+> **状态:本轮已完成(2026-07-21)。** 结论见下节;原任务说明保留在后面作背景。
+
+## 本轮结论(已落地,4 个 commit)
+
+| commit | 内容 |
+|---|---|
+| `182778cf26` | 混批调度:prefill 行 + decode 行进同一 forward,env 开关 `SGLANG_ENABLE_DLLM_MIXED_BATCH` |
+| `4dd66982a6` | `_get_dllm_remain_tokens` fallback 按 block_size 封顶(长输出打穿预算时产生变长行 → `view(B,32)` 崩,基线同款,长输出+满 batch 必现) |
+| `dd9a732fe5` | K 步冻结轮:`SGLANG_DLLM_FDFO_STEPS_PER_ROUND=N`,轮内连跑 N 个 forward,去噪状态批量驻留 device(`fdfo_batched_*` hooks) |
+| `aa99813ac9` | abort KV 泄漏修复:`cache_finished_req` 按 `kv_len_to_handle` 切 kv_indices(incomplete block 的 token 不在 origin+output 里,原实现每 abort 一个 incomplete 请求孤儿化一个 block) |
+
+**推荐部署**(910B3 单卡,RL rollout):
+```bash
+SGLANG_ENABLE_DLLM_MIXED_BATCH=1 SGLANG_DLLM_FDFO_STEPS_PER_ROUND=2 \
+ASCEND_RT_VISIBLE_DEVICES=<卡> python -m sglang.launch_server \
+  --model-path /workspace/models/LLaDA/LLaDA2.1-mini/ --trust-remote-code \
+  --attention-backend ascend --dllm-algorithm JointThreshold \
+  --mem-fraction-static 0.75 --max-running-requests 128 --dllm-fdfo \
+  --cuda-graph-config '{"decode":{"backend":"full","max_bs":128,"bs":[1,2,4,8,16,32,48,64,80,96,112,128]}}' \
+  --port <端口>
+```
+(graph 默认 max_bs=64,不配则 >64 行的大轮全跑 eager;实测 graph64→128 对吞吐仅 +0.5%,但 profile 前提必须配对。)
+
+**实测**(同卡配对,只差开关;精度全程 0.82-0.84 带内,parallel=1 输出与基线逐字节一致):
+
+| 配置 | gsm8k 1000题 par128 | 长序列变长 512in/2048out rr0.25 |
+|---|---|---|
+| either/or 基线 | 2986.6 tok/s | 1825.8 tok/s |
+| + 混批 | 3539/3565 (+19%) | 2114 (+16%) |
+| + graph128 | 3580 | — |
+| + K=2 | **3695-3794 (+24~27%)** | **2352 (+29%)**,TPOT 36.3ms |
+
+K=4 回退(3347):冻结行浪费 ~8% + 准入延迟压过节省。甜点 K=2。
+
+**当前一次 forward 的分布**(128行×32tok,K=2):墙钟 ~90ms = device 84.6ms + host/空闲 ~5.5ms(轮界
+~11ms ÷ K=2)。device 内:MoE GMM 31.0ms(36.6%,带宽受限 1.0TB/s,t/expert=128 未进算力区)、
+dense 21.6ms(lm_head 9.8 算力受限)、MoE 胶水 10.9、elementwise 7.8(去噪归约 5.0)、norm/rope 7.3、
+attention 6.1(7.2%,非瓶颈)。
+
+**关键认知修正**(相对本文下方原任务说明):
+1. **uniform-32 假设对混批根本不是障碍**——prefill 本来就是每轮 32-chunk(`_get_dllm_remain_tokens`
+   对 block_size 取 min),纯 prompt 行在 `step()` 里自终结,`step()` 逐行独立。真正的坑是 incoming
+   准入门槛(staging 行跨轮持 req 槽,`len(can_run_list) >= 可分配槽` 恒成立导致新请求饿死,batch
+   卡 64-80)——修正见 `_process_dllm_incoming_reqs_mixed`。
+2. **小 prefill 轮成本 ≈28-30ms(权重读地板),不是满轮 86ms**——所以收益是 +24~27% 而非预估的
+   +30-50%,naive 估计把浪费轮当满轮算了。
+3. **真实 host gap ≈10ms/forward,profiler(Level1+record_shapes)把 Free 放大 ~5×**——按 gsm8k
+   墙钟反推为准。
+4. 方案 B(整 prompt 变长行 + blockwise causal mask)按用户决定留给 upstream。
+
+**真异步 overlap(1-round-lag 流水)调研结论:no-go**(Plan agent 完整报告在 session 记录):
+1-round-lag 在收益与浪费结构上 ≈ 把 K 再翻倍(解完的行多陪跑一整轮,浪费=K/R),代码风险 ~20×,
+净收益 ≤+2-3%,9-12 人天。可捡的便宜子集(~3.5 人天,+2-4%,bitwise 保持):结果 D2H 走 copy_done
+异步(dLLM 的 copy_done 目前是死代码)+ stream_output/metrics 延后到下轮 launch 后。
+
+**遗留给 upstream**:同款 kv_indices 切片 bug 潜伏在 mamba/swa/pure_swa/unified/cpp radix cache
+(dLLM 走不到);logits 裁剪(lm_head+argmax 15ms/86ms)因动 T2T 语义被否;W8A8/EP 不在本 worktree 范围。
+**复现器**:mass-abort 用 scratchpad 的 abort_repro.py(128 并发 + os._exit 硬断连)。
+
+---
+
 ## 你的任务
 
 LLaDA2.1-mini 在 910B3 NPU 上跑 RL rollout（大 batch、追吞吐）。上一阶段已经把 FDFO
