@@ -34,10 +34,37 @@ ASCEND_RT_VISIBLE_DEVICES=<卡> python -m sglang.launch_server \
 
 K=4 回退(3347):冻结行浪费 ~8% + 准入延迟压过节省。甜点 K=2。
 
-**当前一次 forward 的分布**(128行×32tok,K=2):墙钟 ~90ms = device 84.6ms + host/空闲 ~5.5ms(轮界
-~11ms ÷ K=2)。device 内:MoE GMM 31.0ms(36.6%,带宽受限 1.0TB/s,t/expert=128 未进算力区)、
-dense 21.6ms(lm_head 9.8 算力受限)、MoE 胶水 10.9、elementwise 7.8(去噪归约 5.0)、norm/rope 7.3、
-attention 6.1(7.2%,非瓶颈)。
+**当前一次 forward 的耗时 breakdown**(128 行 × 32 tok = 4096 token,K=2,采样 16 个满轮 forward,
+profile 目录 scratchpad/prof_k2b,分析脚本 scratch_profile/analyze.py):
+
+墙钟结构(真实值按 gsm8k 墙钟反推;profiler Level1+record_shapes 会把空闲放大 ~5 倍,别直接信 Free):
+
+| 部分 | 时间 | 说明 |
+|---|---|---|
+| device 计算 | 84.6 ms | 下表 kernel 之和 |
+| host/设备空闲(摊每 forward) | ~5.5 ms | 轮界一次 ~11ms(D2H同步+状态scatter+结果处理+重建batch+H2D)÷ K=2;inner step 的 enqueue 藏进设备队列 |
+| **合计** | **~90 ms** | 调度轮 ~180ms 含 2 个 forward |
+
+device 84.6ms 按类别:
+
+| 类别 | ms | 占比 | 瓶颈属性 |
+|---|---|---|---|
+| MoE GroupedMatmul | 31.0 | 36.6% | 带宽受限(mte2≈0.95,权重读 ~1.0TB/s / 峰值1.6;算力 39-41%,t/expert=128 未进算力区) |
+| dense matmul | 21.6 | 25.5% | lm_head 为大头,算力受限(mac 0.93) |
+| MoE 胶水 | 10.9 | 12.8% | InitRouting/FinalizeRouting/GatingTopK 等 vector/scalar 小算子 |
+| 其他 elementwise | 7.8 | 9.2% | 大头是去噪归约 |
+| norm/rope | 7.3 | 8.6% | AddRmsNorm ×40 + split_qkv 融合核 |
+| attention (FIA) | 6.1 | 7.2% | 非瓶颈,mte2 0.51 |
+
+Top kernel(ms/forward):GMM w13 21.1(1109us/层×19)、lm_head 9.8(4096×157184,单个最大 dense 核)、
+GMM w2 9.9、FIA 6.1(305us×20)、_argmax_prob 去噪归约 5.0(vec 0.84)、AddRmsNorm 4.2(×40)、
+qkv-proj 4.2、MoeFinalizeRouting 3.3、MoeInitRouting 3.0、split_qkv 融合核 3.0、o-proj 2.8、
+MoeGatingTopK 2.7。
+
+读数:MoE GMM 是唯一还在带宽受限区的大头(W8A8/bs256 的依据);lm_head+去噪归约 14.8ms(17.5%)是
+全词表固定税(裁剪因动 T2T 语义被否);attention 和小算子经上阶段融合已不在关键路径;host 侧经
+混批+K=2 只剩 ~6%,继续压空间小。K=2 的账:省轮界 11ms/轮,付 ~7-8 冻结行陪跑 ~4.7ms/轮,
+净 ~3ms/forward ≈ +3.4%(与实测吻合);长序列陪跑更便宜、host 占比更高 → +11%。
 
 **关键认知修正**(相对本文下方原任务说明):
 1. **uniform-32 假设对混批根本不是障碍**——prefill 本来就是每轮 32-chunk(`_get_dllm_remain_tokens`
