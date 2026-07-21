@@ -606,6 +606,11 @@ class Envs:
     # falls back to the unfused split/qk_norm/rope path. None (default) keeps the
     # kernel always on; 0 forces the unfused path (used to A/B the crossover).
     SGLANG_NPU_FUSED_QKV_MAX_TOKENS = EnvInt(None)
+    # Ascend profiler detail for /start_profile. Level1 (default) records per-kernel
+    # AI Core pipe utilization (cube/memory/scalar attribution). Level2 adds the
+    # CANN and communication layers for timeline / host-dispatch-gap analysis, at
+    # a larger trace and higher capture overhead.
+    SGLANG_NPU_PROFILER_LEVEL2 = EnvBool(False)
 
     # MTHREADS & MUSA
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
