@@ -244,6 +244,52 @@ class JointThreshold(DllmAlgorithm):
             state["post_edit_steps"] = new_post_edit_steps[i]
         return done
 
+    def fdfo_batched_begin(self, forward_batch: ForwardBatch, states: List[Any]):
+        if not self.vectorized_decoding or self._use_shared_state:
+            return None
+        device = forward_batch.input_ids.device
+        return {
+            "prompt_masks": torch.stack([state["prompt_mask"] for state in states]),
+            "finished": torch.tensor(
+                [state["finished"] for state in states],
+                dtype=torch.bool,
+                device=device,
+            ),
+            "post_edit_steps": torch.tensor(
+                [state["post_edit_steps"] for state in states],
+                dtype=torch.int32,
+                device=device,
+            ),
+        }
+
+    def fdfo_batched_step(
+        self, forward_batch: ForwardBatch, full_logits: torch.Tensor, ctx
+    ) -> None:
+        joint_threshold_update_step_vectorized(
+            input_ids_1d=forward_batch.input_ids,
+            full_logits_2d=full_logits,
+            prompt_masks=ctx["prompt_masks"],
+            finished=ctx["finished"],
+            post_edit_steps=ctx["post_edit_steps"],
+            mask_id=self.mask_id,
+            blk=self.block_size,
+            threshold=self.threshold,
+            edit_threshold=self.edit_threshold,
+            max_post_edit_steps=self.max_post_edit_steps,
+            penalty_lambda=self.penalty_lambda,
+        )
+
+    def fdfo_batched_all_finished(self, ctx) -> bool:
+        return bool(ctx["finished"].all().item())
+
+    def fdfo_batched_end(self, ctx, states: List[Any]) -> List[bool]:
+        done = ctx["finished"].tolist()
+        new_post_edit_steps = ctx["post_edit_steps"].tolist()
+        for i, state in enumerate(states):
+            state["finished"] = done[i]
+            state["post_edit_steps"] = new_post_edit_steps[i]
+        return done
+
     def _step_per_row(
         self,
         forward_batch: ForwardBatch,
