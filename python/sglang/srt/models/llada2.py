@@ -32,6 +32,7 @@ from sglang.srt.distributed import (
     parallel_state,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -99,8 +100,14 @@ _is_npu = is_npu()
 split_qkv_rmsnorm_rope_pos_cache_half_npu = None
 if _is_npu:
     try:
-        from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope_pos_cache_half_npu import (
-            split_qkv_rmsnorm_rope_pos_cache_half_npu,
+        # Batch-gated grid wrapper around the installed jit kernel: same result,
+        # ~37% faster at large batch (see hardware_backend/npu/norm/split_qkv.py).
+        from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope_pos_cache_half_npu import (  # noqa: F401
+            split_qkv_rmsnorm_rope_pos_cache_half_npu as _upstream_split_qkv,
+        )
+
+        from sglang.srt.hardware_backend.npu.norm.split_qkv import (
+            split_qkv_rmsnorm_rope_pos_cache_half as split_qkv_rmsnorm_rope_pos_cache_half_npu,
         )
     except (ImportError, OSError):
         pass
@@ -521,6 +528,18 @@ class LLaDA2MoeAttention(nn.Module):
 
         self.alt_stream = alt_stream
 
+        # The fused split-qkv kernel wins at bs=1 but serializes rows past that
+        # (grid pinned to vector-core count); above this token count fall back to
+        # the unfused path. None keeps it always on (upstream default).
+        self.fused_qkv_max_tokens = envs.SGLANG_NPU_FUSED_QKV_MAX_TOKENS.get()
+
+    def _use_fused_qkv(self, num_tokens: int) -> bool:
+        if not (_is_npu and split_qkv_rmsnorm_rope_pos_cache_half_npu is not None):
+            return False
+        if self.fused_qkv_max_tokens is None:
+            return True
+        return num_tokens <= self.fused_qkv_max_tokens
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -530,7 +549,7 @@ class LLaDA2MoeAttention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
         qkv, _ = self.query_key_value(hidden_states)
-        if _is_npu and split_qkv_rmsnorm_rope_pos_cache_half_npu is not None:
+        if self._use_fused_qkv(hidden_states.shape[0]):
             q, k, v = split_qkv_rmsnorm_rope_pos_cache_half_npu(
                 qkv,
                 positions,

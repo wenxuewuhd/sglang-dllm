@@ -600,6 +600,12 @@ class Envs:
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)  # This argument is deprecated
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
+    # Token-count threshold for the fused split-qkv+rmsnorm+rope NPU kernel
+    # (LLaDA2 dLLM). The kernel's grid is pinned to the vector-core count, so it
+    # serializes rows and degrades past bs=1; above this many tokens the model
+    # falls back to the unfused split/qk_norm/rope path. None (default) keeps the
+    # kernel always on; 0 forces the unfused path (used to A/B the crossover).
+    SGLANG_NPU_FUSED_QKV_MAX_TOKENS = EnvInt(None)
 
     # MTHREADS & MUSA
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
