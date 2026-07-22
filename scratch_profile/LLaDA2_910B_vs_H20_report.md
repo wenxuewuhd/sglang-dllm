@@ -32,6 +32,14 @@
 
 ### 1.2 各算子的算术强度(AI)与瓶颈
 
+算术强度 **AI = 计算量(FLOP) / 访存量(byte)**,决定算子落在 ridge 哪一侧:AI > ridge 算力受限,AI < ridge 带宽受限。ridge = 算力峰值 / 带宽(910B 320T/1.6 = 200,H20 148/4.0 = 37)。各算子 AI 的算法:
+
+- **GEMM(有权重复用)**:`AI = 2·M·K·N / (K·N·2字节) = M`,即参与该权重的行数。MoE 的 M = 每专家 token 数 t;dense/lm_head 的 M = 总 token 数 = bs×block。
+- **attention**:`AI = KV 复用次数 = block × GQA组`(dLLM:32 × 4 = 128;自回归 decode block=1 只复用 4)。
+- **vector**:每元素读一次、写一次、O(1) 计算 → `AI ≈ 1`。
+
+例(bs=128):MoE 的 t = 128×32×8/256 = **128** → AI=128;dense 的 M = 128×32 = **4096** → AI=4096;attention = 32×4 = **128**。
+
 | 算子 | AI(算术强度) | 910B 瓶颈 (ridge 200) | H20 瓶颈 (ridge 37) | 相对 |
 |---|---|---|---|---|
 | MoE GMM | = t(每专家 token 数) | bs=128→t=128<200 带宽 | t=128>37 算力 | 随 t 变 |

@@ -224,6 +224,7 @@
     <p>算力比(2.16×)与带宽比(2.5×)接近互为倒数。因此算力受限的算子 910B 快约 2.16×,带宽受限的算子 H20 快约 2.5×,计算与带宽各占一半的 workload 两者相当。胜负取决于给定 bs 下各算子落在 ridge 的哪一侧。</p>
 
     <h3>1.2 各算子的算术强度(AI)与瓶颈</h3>
+    <div class="note"><b>AI = 计算量(FLOP) / 访存量(byte)</b>,决定算子落在 ridge 哪一侧(AI &gt; ridge 算力受限,AI &lt; ridge 带宽受限;ridge = 算力峰值/带宽,910B 320T/1.6=200,H20 148/4.0=37)。算法:<b>GEMM(有权重复用)</b> AI = 2·M·K·N / (K·N·2B) = M(参与该权重的行数)——MoE 的 M = 每专家 token 数 t,dense 的 M = bs×block;<b>attention</b> AI = KV 复用 = block × GQA组 = 32×4 = 128;<b>vector</b> 每元素读写各一次 → AI ≈ 1。例(bs=128):MoE t = 128×32×8/256 = 128,dense M = 4096。</div>
     <div class="tbl-wrap"><table>
       <thead><tr><th>算子</th><th>AI</th><th>910B(ridge 200)</th><th>H20(ridge 37)</th><th>相对</th></tr></thead>
       <tbody>
@@ -283,7 +284,9 @@
         <tr><td>activation</td><td class="n">~25 MB/req</td><td>∝ bs</td></tr>
       </tbody>
     </table></div>
-    <p>实测边界:eager 长序列 max bs ≈ 200;graph max_bs=128 ≈ 150;graph max_bs=160 运行时只剩 1.07GB、满负载贴边并触发 retract、无吞吐收益。<b>单卡长序列 bs 天花板约 160,但打大 batch 无收益</b>(MoE 在 t=160 仍带宽受限,attention/vector 随 bs 线性增长抵消)。推荐 bs=128 + 密桶 graph + FDFO + 混批 + mem-fraction 0.75。</p>
+    <p>每长请求边际成本 = KV ~100 MB + activation ~25 MB = <b>~125 MB/req</b>(KV = 20 层 × 4 KV头 × 128 × 2(k,v) × 2B = 40 KiB/token × 序列长)。最大 bs:</p>
+    <div class="note" style="font-family:var(--font-mono); font-size:.82rem;">bs_max = ( 64 GB × 可用率 − 权重 − overhead − graph ) / ( KV_per_req + act_per_req )</div>
+    <p>实测边界:eager 长序列 max bs ≈ 200(HBM 峰值 63.9GB,与理论 199 吻合);graph max_bs=128 ≈ 150;graph max_bs=160 运行时只剩 1.07GB、满负载贴边并触发 retract、无吞吐收益。<b>单卡长序列 bs 天花板约 160,但打大 batch 无收益</b>(graph 成本 ∝ max_bs 吃掉批头寸;MoE 在 t=160 仍带宽受限,attention/vector 随 bs 线性增长抵消)。推荐 bs=128 + 密桶 graph + FDFO + 混批 + mem-fraction 0.75。</p>
 
     <h3>2.3 bs=128 逐类对比 <span class="sub">每 forward:H20 ~90ms,910B ~85ms</span></h3>
     <div class="chart">
