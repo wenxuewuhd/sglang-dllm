@@ -65,6 +65,12 @@ def main():
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--warmup", type=float, default=70)
     ap.add_argument("--out", required=True)
+    # Clean device-kernel timeline by default (matches the NPU Level2 capture):
+    # with_stack attaches the full Python call stack to every op (the "level1"
+    # look), and record_shapes inflates host Free ~5x -- keep both off unless
+    # you specifically need them.
+    ap.add_argument("--record-shapes", action="store_true", default=False)
+    ap.add_argument("--with-stack", action="store_true", default=False)
     args = ap.parse_args()
     host = f"http://127.0.0.1:{args.port}"
 
@@ -97,8 +103,8 @@ def main():
             "output_dir": args.out,
             "num_steps": args.steps,
             "activities": ["CPU", "GPU"],
-            "record_shapes": True,
-            "with_stack": False,
+            "record_shapes": args.record_shapes,
+            "with_stack": args.with_stack,
             "profile_by_stage": False,
         },
     )

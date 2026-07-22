@@ -13,6 +13,15 @@
 #
 # Output: OUT/<...>/*.pt.trace.json  (kineto). Drag it into https://ui.perfetto.dev.
 #
+# ALIGNING WITH THE NPU CAPTURE: the NPU trace was a clean Level2 device-kernel
+# timeline. GPU has no "Level2" toggle (that is msprof/NPU-only); kineto detail
+# is controlled by with_stack / record_shapes instead. capture_fdfo.py now
+# defaults BOTH off, so no per-op Python call stacks (the "level1" look) and no
+# shape-metadata Free inflation. The GPU analog of the NPU Level2 device row is
+# the CUDA stream track in perfetto (the actual kernels); the CPU thread track
+# is the host aten tree (kept shallow by with_stack=off). Pass --with-stack to
+# capture_fdfo.py only if you actually want the Python stacks back.
+#
 # NOTE: scratch_profile/analyze.py does NOT work on GPU traces -- it parses the
 # Ascend msprof kernel_details.csv, which CUDA does not produce. For a GPU
 # per-kernel breakdown use perfetto's built-in slice aggregation, or
