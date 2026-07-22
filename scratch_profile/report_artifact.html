@@ -370,13 +370,14 @@
     </table></div>
     <p>长序列 TPOT 接近相等(而非 910B 更快):attention 的 AI=128 两者相当,占比上升稀释了 910B 的 dense 优势;且 910B FIA 只跑 24% MFU(实现受限,见 §4.2),长上下文 attention 略弱于 H20。因此 910B 的长序列吞吐优势来自调度(FDFO+混批把排队长尾压低,整批完成更快),而非每 token 算力。若把 FIA 修到 50% MFU,长序列每 token 也会转为 910B 领先。</p>
 
-    <h3>2.6 更长序列 <span class="sub">4K in / 1.5K out(5632 token/req),均开混批</span></h3>
+    <h3>2.6 更长序列 <span class="sub">4K in / 1.5K out(5632 token/req)</span></h3>
     <div class="tbl-wrap"><table>
-      <thead><tr><th></th><th class="n">bs</th><th class="n">输出吞吐</th><th class="n">总吞吐</th><th class="n">TPOT</th><th class="n">TTFT</th></tr></thead>
+      <thead><tr><th></th><th class="n">bs</th><th class="n">混批</th><th class="n">输出吞吐</th><th class="n">总吞吐</th><th class="n">TPOT</th><th class="n">TTFT</th></tr></thead>
       <tbody>
-        <tr><td class="h20c">H20</td><td class="n">128</td><td class="n">1593</td><td class="n">5886</td><td class="n">65.7 ms</td><td class="n">14190 ms</td></tr>
-        <tr><td class="h20c">H20</td><td class="n">72</td><td class="n">1476</td><td class="n">5452</td><td class="n">40.7 ms</td><td class="n">8700 ms</td></tr>
-        <tr class="hl"><td class="a910c">910B</td><td class="n">72</td><td class="n">1058</td><td class="n">3909</td><td class="n">48.1 ms</td><td class="n">17000 ms</td></tr>
+        <tr><td class="h20c">H20</td><td class="n">128</td><td class="n">否</td><td class="n">1024</td><td class="n">3784</td><td class="n">123.6 ms</td><td class="n">8563 ms</td></tr>
+        <tr><td class="h20c">H20</td><td class="n">128</td><td class="n">是</td><td class="n">1593</td><td class="n">5886</td><td class="n">65.7 ms</td><td class="n">14190 ms</td></tr>
+        <tr><td class="h20c">H20</td><td class="n">72</td><td class="n">是</td><td class="n">1476</td><td class="n">5452</td><td class="n">40.7 ms</td><td class="n">8700 ms</td></tr>
+        <tr class="hl"><td class="a910c">910B</td><td class="n">72</td><td class="n">是</td><td class="n">1058</td><td class="n">3909</td><td class="n">48.1 ms</td><td class="n">17000 ms</td></tr>
       </tbody>
     </table></div>
     <p>同 bs=72 下 <b>H20 快 1.40×</b>(输出吞吐 1476 vs 1058),每 token 也快 1.18×(TPOT 40.7 vs 48.1)。<b>与 512/2048(910B +10%)相反,crossover 同时取决于 bs 和上下文长度</b>——短到中等序列 910B 赢,长上下文(4K+)H20 赢。机理未用 4K 逐算子 profiling 坐实:decode attention 的 AI=128 与上下文无关(§1.2),两颗芯片随上下文线性同速增长、比值 ~平,非主因;更可能是 910B 被 64GB 显存逼到 bs=72(低 bs 下 MoE 的 t 更小、更带宽受限)+ 长 prompt 的 prefill 成本(910B TTFT 17s vs H20 8.7s)。显存也是 H20 的优势(96GB 可到 128,吞吐再高一档 1593)。长输入下混批对 H20 也大幅有效:bs=128 不开混批 1024 → 开混批 1593(+56%)。</p>
