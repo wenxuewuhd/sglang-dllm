@@ -1,0 +1,497 @@
+<style>
+  :root {
+    --ground: #f5f6f9; --surface: #ffffff; --surface-2: #eef0f5;
+    --ink: #181b23; --ink-soft: #525863; --ink-faint: #868d9c;
+    --border: #e3e6ed; --border-strong: #ccd1dc;
+    --a910: #a85f0a; --a910-fill: #b26b1233;
+    --h20: #0d7a74; --h20-fill: #0f7a7628;
+    --accent: #474c6b; --accent-soft: #6a6f92;
+    --font-sans: "PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    --font-mono: ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Menlo,Consolas,monospace;
+    --maxw: 62rem;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #0e1016; --surface: #161a22; --surface-2: #1c212b;
+      --ink: #e7eaf1; --ink-soft: #a1a9b9; --ink-faint: #6a7180;
+      --border: #242a35; --border-strong: #343c49;
+      --a910: #e0983f; --a910-fill: #e0983f2e;
+      --h20: #3bb0aa; --h20-fill: #3bb0aa26;
+      --accent: #9297c2; --accent-soft: #767ba6;
+    }
+  }
+  :root[data-theme="light"] {
+    --ground: #f5f6f9; --surface: #ffffff; --surface-2: #eef0f5;
+    --ink: #181b23; --ink-soft: #525863; --ink-faint: #868d9c;
+    --border: #e3e6ed; --border-strong: #ccd1dc;
+    --a910: #a85f0a; --a910-fill: #b26b1233;
+    --h20: #0d7a74; --h20-fill: #0f7a7628;
+    --accent: #474c6b; --accent-soft: #6a6f92;
+  }
+  :root[data-theme="dark"] {
+    --ground: #0e1016; --surface: #161a22; --surface-2: #1c212b;
+    --ink: #e7eaf1; --ink-soft: #a1a9b9; --ink-faint: #6a7180;
+    --border: #242a35; --border-strong: #343c49;
+    --a910: #e0983f; --a910-fill: #e0983f2e;
+    --h20: #3bb0aa; --h20-fill: #3bb0aa26;
+    --accent: #9297c2; --accent-soft: #767ba6;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--ground); color: var(--ink);
+    font-family: var(--font-sans); line-height: 1.7; font-size: 16px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 1.5rem; }
+
+  header.mast { border-bottom: 1px solid var(--border); background: linear-gradient(180deg, var(--surface), var(--ground)); }
+  .mast-inner { padding: 3rem 0 2rem; }
+  .kicker { font-family: var(--font-mono); font-size: .72rem; letter-spacing: .2em; text-transform: uppercase; color: var(--accent); font-weight: 600; display:flex; align-items:center; gap:.6rem; }
+  .kicker::before { content:""; width:1.6rem; height:2px; background: var(--accent); }
+  h1.title { font-size: clamp(1.8rem, 4.2vw, 2.7rem); line-height: 1.12; margin: .7rem 0 .3rem; font-weight: 760; letter-spacing:-.015em; }
+  h1.title .vs { color: var(--ink-faint); font-weight: 500; margin: 0 .3rem; }
+  .a910c { color: var(--a910); } .h20c { color: var(--h20); }
+  .subtitle { color: var(--ink-soft); font-size: 1rem; max-width: 48rem; margin: .2rem 0 0; }
+  .legend { display:flex; flex-wrap:wrap; gap:.5rem .8rem; margin-top:1.4rem; padding-top:1.2rem; border-top:1px dashed var(--border-strong); }
+  .lg { display:inline-flex; align-items:center; gap:.5rem; font-size:.8rem; color: var(--ink-soft); background: var(--surface); border:1px solid var(--border); padding:.28rem .65rem; border-radius:999px; }
+  .lg b { color: var(--ink); font-weight:650; }
+  .dot { width:.6rem; height:.6rem; border-radius:50%; flex:none; }
+  .dot.d910 { background: var(--a910); } .dot.dh20 { background: var(--h20); }
+  .dot.droof { background: transparent; border:1.5px dashed var(--ink-faint); }
+
+  section.ch { padding: 2.8rem 0; border-top: 1px solid var(--border); }
+  .ch-head { display:flex; align-items:baseline; gap:1rem; margin-bottom:1.4rem; }
+  .ch-num { font-family: var(--font-mono); font-size:1.9rem; font-weight:700; color: var(--border-strong); line-height:1; flex:none; }
+  .ch-title { font-size: clamp(1.35rem,2.8vw,1.7rem); font-weight:700; letter-spacing:-.01em; margin:0; }
+  h3 { font-size: 1.08rem; font-weight:670; margin: 2rem 0 .6rem; }
+  h3 .sub { font-weight:500; color: var(--ink-faint); font-size:.85em; }
+  p { margin:.7rem 0; color: var(--ink); max-width: 64ch; }
+  strong { font-weight:670; }
+  code, .mono { font-family: var(--font-mono); font-size:.88em; }
+  .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+
+  .note { border-left:3px solid var(--border-strong); background: var(--surface); padding:.8rem 1rem; margin:1.2rem 0; border-radius:0 8px 8px 0; font-size:.9rem; color: var(--ink-soft); }
+  .note b { color: var(--ink); }
+
+  .tbl-wrap { overflow-x:auto; margin:1.2rem 0; border:1px solid var(--border); border-radius:10px; background: var(--surface); }
+  table { border-collapse: collapse; width:100%; font-size:.88rem; min-width: 32rem; }
+  th, td { padding:.55rem .75rem; text-align:left; border-bottom:1px solid var(--border); vertical-align:top; }
+  thead th { font-size:.72rem; text-transform:uppercase; letter-spacing:.05em; color: var(--ink-faint); font-weight:650; background: var(--surface-2); }
+  tbody tr:last-child td { border-bottom:none; }
+  td.n, th.n { text-align:right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  tr.total td { font-weight:700; background: var(--surface-2); border-top:2px solid var(--border-strong); }
+  tr.hl td { background: var(--surface-2); }
+  .win910 { color: var(--a910); font-weight:640; }
+  .winh20 { color: var(--h20); font-weight:640; }
+  .tie { color: var(--ink-faint); }
+
+  /* conclusion cards */
+  .concl { display:grid; gap:.8rem; margin:0; }
+  .cc { display:grid; grid-template-columns:2rem 1fr; gap:.9rem; background: var(--surface); border:1px solid var(--border); border-radius:12px; padding:1rem 1.1rem; align-items:start; }
+  .cc .cn { font-family: var(--font-mono); font-weight:700; font-size:1.1rem; color: var(--accent); }
+  .cc p { margin:0; font-size:.95rem; }
+  .cc.c1 { border-left:3px solid var(--a910); } .cc.c2 { border-left:3px solid var(--h20); } .cc.c3 { border-left:3px solid var(--ink-faint); }
+
+  /* opposed ratio bars */
+  .ratio { display:grid; gap:.9rem; margin:1.2rem 0; }
+  .ratio-row { background: var(--surface); border:1px solid var(--border); border-radius:10px; padding:.85rem 1rem; }
+  .ratio-top { display:flex; justify-content:space-between; font-size:.85rem; margin-bottom:.45rem; }
+  .ratio-top .metric { font-weight:640; }
+  .ratio-bar { display:flex; height:24px; border-radius:6px; overflow:hidden; font-family: var(--font-mono); font-size:.76rem; font-weight:600; }
+  .ratio-bar .seg { display:flex; align-items:center; padding:0 .55rem; color:#fff; white-space:nowrap; }
+  .seg.s910 { background: var(--a910); } .seg.sh20 { background: var(--h20); } .seg.sright { justify-content:flex-end; }
+
+  .specs { display:grid; grid-template-columns:1fr 1fr; gap:1rem; margin:1.2rem 0; }
+  .spec { border:1px solid var(--border); border-radius:12px; padding:1rem 1.1rem; background: var(--surface); }
+  .spec.c910 { border-top:3px solid var(--a910); } .spec.ch20 { border-top:3px solid var(--h20); }
+  .spec h4 { margin:0 0 .5rem; font-size:1.1rem; font-weight:700; }
+  .spec.c910 h4 { color: var(--a910); } .spec.ch20 h4 { color: var(--h20); }
+  .spec dl { margin:0; display:grid; grid-template-columns:auto 1fr; gap:.28rem .8rem; font-size:.86rem; }
+  .spec dt { color: var(--ink-faint); }
+  .spec dd { margin:0; text-align:right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-weight:600; }
+
+  /* diverging bars */
+  .chart { background: var(--surface); border:1px solid var(--border); border-radius:12px; padding:1.3rem 1.2rem 1rem; margin:1.3rem 0; }
+  .chart-cap { display:flex; justify-content:space-between; font-size:.78rem; color: var(--ink-faint); margin-bottom:.9rem; flex-wrap:wrap; gap:.4rem; }
+  .chart-cap .side { font-weight:640; font-family: var(--font-mono); }
+  .dvg-row { display:grid; grid-template-columns:8rem 1fr 3rem; align-items:center; gap:.55rem; margin:.3rem 0; }
+  .dvg-label { font-size:.8rem; color: var(--ink-soft); text-align:right; }
+  .dvg-track { position:relative; display:flex; height:19px; }
+  .dvg-track::before { content:""; position:absolute; left:50%; top:-3px; bottom:-3px; width:1px; background: var(--border-strong); }
+  .dvg-half { flex:1; display:flex; overflow:hidden; }
+  .dvg-half.l { justify-content:flex-end; } .dvg-half.r { justify-content:flex-start; }
+  .dvg-bar { height:100%; border-radius:3px; }
+  .dvg-bar.b910 { background: var(--a910); transform-origin:left; }
+  .dvg-bar.bh20 { background: var(--h20); transform-origin:right; }
+  .dvg-val { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size:.78rem; }
+  .dvg-val.v910 { color: var(--a910); } .dvg-val.vh20 { color: var(--h20); } .dvg-val.vtie { color: var(--ink-faint); }
+  @media (prefers-reduced-motion: no-preference) {
+    .dvg-bar { animation: grow .7s cubic-bezier(.2,.7,.3,1) both; }
+    @keyframes grow { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+  }
+
+  /* line chart */
+  .linechart { background: var(--surface); border:1px solid var(--border); border-radius:12px; padding:1.2rem 1rem .8rem; margin:1.3rem 0; }
+  .linechart svg { width:100%; height:auto; display:block; }
+  .lc-grid { stroke: var(--border); stroke-width:1; }
+  .lc-axis { stroke: var(--border-strong); stroke-width:1; }
+  .lc-h20 { fill:none; stroke: var(--h20); stroke-width:2.5; }
+  .lc-910 { fill:none; stroke: var(--a910); stroke-width:2.5; }
+  .lc-h20d { fill: var(--h20); } .lc-910d { fill: var(--a910); }
+  .lc-txt { fill: var(--ink-faint); font-family: var(--font-mono); font-size:11px; }
+  .lc-cross { stroke: var(--accent); stroke-width:1; stroke-dasharray:3 3; }
+  .lc-legend { display:flex; gap:1.2rem; justify-content:center; margin-top:.5rem; font-size:.82rem; }
+  .lc-legend span { display:inline-flex; align-items:center; gap:.4rem; }
+  .lc-legend i { width:1.1rem; height:3px; border-radius:2px; display:inline-block; }
+
+  ul.clean { padding-left:1.1rem; margin:.7rem 0; }
+  ul.clean li { margin:.3rem 0; }
+  ul.clean li::marker { color: var(--accent-soft); }
+
+  .summary { background: var(--surface); border:1px solid var(--border-strong); border-radius:14px; padding:1.4rem 1.5rem; margin:1.3rem 0; }
+  .sum-row { display:grid; grid-template-columns:9rem 1fr; gap:1rem; padding:.65rem 0; border-bottom:1px solid var(--border); align-items:baseline; }
+  .sum-row:last-child { border-bottom:none; }
+  .sum-k { font-weight:660; color: var(--accent); font-size:.9rem; }
+  .sum-v { font-size:.9rem; color: var(--ink-soft); }
+  .sum-v b { color: var(--ink); }
+
+  footer { border-top:1px solid var(--border); padding:1.8rem 0 3rem; color: var(--ink-faint); font-size:.82rem; }
+
+  @media (max-width: 640px) {
+    .specs { grid-template-columns:1fr; }
+    .dvg-row { grid-template-columns:5.5rem 1fr 2.6rem; }
+    .dvg-label { font-size:.72rem; }
+    .sum-row { grid-template-columns:1fr; gap:.15rem; }
+    .cc { grid-template-columns:1.6rem 1fr; }
+  }
+  .theme-toggle { position:fixed; top:1rem; right:1rem; z-index:10; background: var(--surface); border:1px solid var(--border); color: var(--ink-soft); border-radius:999px; padding:.35rem .75rem; font-size:.78rem; cursor:pointer; font-family: var(--font-mono); }
+  .theme-toggle:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+</style>
+
+<button class="theme-toggle" id="tt" aria-label="切换主题">◐ 主题</button>
+
+<header class="mast">
+  <div class="wrap mast-inner">
+    <div class="kicker">性能分析 · dLLM 硬件对比</div>
+    <h1 class="title"><span class="a910c">Ascend 910B3</span><span class="vs">vs</span><span class="h20c">H20</span></h1>
+    <p class="subtitle">LLaDA2.1-mini(diffusion LLM,MoE,256 专家 top-8)在大 batch 吞吐场景下的对比分析:roofline、单卡实测、专家并行(EP)评估与后续方向。</p>
+    <div class="legend">
+      <span class="lg"><span class="dot d910"></span><b>910B 实测</b> · msprof / e2e bench</span>
+      <span class="lg"><span class="dot dh20"></span><b>H20 实测</b> · kineto trace(非饱和)</span>
+      <span class="lg"><span class="dot droof"></span><b>H20 roofline</b> · 推算</span>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <!-- 结论 -->
+  <section class="ch" style="border-top:none;">
+    <div class="ch-head"><span class="ch-num">—</span><h2 class="ch-title">结论</h2></div>
+    <div class="concl">
+      <div class="cc c1"><div class="cn">1</div><p><b>大 batch(bs=128)下 910B 略优于 H20。</b> 2k 输出长序列(512in/2048out)输出吞吐 <span class="num">2591 vs 2364</span>(+10%);短序列(gsm8k)<span class="num">3667 vs 3412</span>(+7%)。</p></div>
+      <div class="cc c2"><div class="cn">2</div><p><b>小 batch 下 910B 明显落后。</b> bs=1 时 910B 约为 H20 的 <span class="num">0.5×</span>(312 vs 592),bs=8 约 <span class="num">0.4×</span>。</p></div>
+      <div class="cc c3"><div class="cn">3</div><p><b>专家并行(EP)通信代价过大,当前不划算。</b> 128 blocks/卡 实测 a2a <span class="num">12.2 ms/层</span>,节点吞吐只有 4 张独立单卡的 <span class="num">1/4.6</span>。</p></div>
+    </div>
+  </section>
+
+  <!-- CH1 -->
+  <section class="ch">
+    <div class="ch-head"><span class="ch-num">01</span><h2 class="ch-title">Roofline 分析</h2></div>
+
+    <h3>1.1 两颗芯片的算力 / 带宽配比</h3>
+    <div class="specs">
+      <div class="spec c910"><h4>910B3</h4><dl>
+        <dt>算力 bf16</dt><dd>320 TFLOPS</dd>
+        <dt>带宽 HBM</dt><dd>1.6 TB/s</dd>
+        <dt>显存</dt><dd>64 GB</dd>
+        <dt>Ridge</dt><dd>200 f/B</dd>
+      </dl></div>
+      <div class="spec ch20"><h4>H20</h4><dl>
+        <dt>算力 bf16</dt><dd>148 TFLOPS</dd>
+        <dt>带宽 HBM</dt><dd>4.0 TB/s</dd>
+        <dt>显存</dt><dd>96 GB</dd>
+        <dt>Ridge</dt><dd>37 f/B</dd>
+      </dl></div>
+    </div>
+    <div class="ratio">
+      <div class="ratio-row"><div class="ratio-top"><span class="metric">算力(bf16)</span><span class="mono">910B 快 2.16×</span></div>
+        <div class="ratio-bar"><span class="seg s910" style="width:68.4%">910B · 320T</span><span class="seg sh20" style="width:31.6%">148T</span></div></div>
+      <div class="ratio-row"><div class="ratio-top"><span class="metric">带宽(HBM)</span><span class="mono">H20 快 2.5×</span></div>
+        <div class="ratio-bar"><span class="seg s910" style="width:28.6%">1.6</span><span class="seg sh20 sright" style="width:71.4%">H20 · 4.0 TB/s</span></div></div>
+    </div>
+    <p>算力比(2.16×)与带宽比(2.5×)接近互为倒数。因此算力受限的算子 910B 快约 2.16×,带宽受限的算子 H20 快约 2.5×,计算与带宽各占一半的 workload 两者相当。胜负取决于给定 bs 下各算子落在 ridge 的哪一侧。</p>
+
+    <h3>1.2 各算子的算术强度(AI)与瓶颈</h3>
+    <div class="tbl-wrap"><table>
+      <thead><tr><th>算子</th><th>AI</th><th>910B(ridge 200)</th><th>H20(ridge 37)</th><th>相对</th></tr></thead>
+      <tbody>
+        <tr><td>MoE GMM</td><td class="mono">= t(每专家 token)</td><td>t=128&lt;200 带宽</td><td>t=128&gt;37 算力</td><td class="tie">随 t 变</td></tr>
+        <tr><td>dense / lm_head</td><td class="mono">= M = 4096</td><td>&gt;&gt;200 算力</td><td>&gt;&gt;37 算力</td><td class="win910">910B ~2×</td></tr>
+        <tr><td>attention (FIA)</td><td class="mono">= 128</td><td>128&lt;200 边缘</td><td>128&gt;37 算力</td><td class="tie">~平</td></tr>
+        <tr><td>vector(去噪/norm/rope)</td><td class="mono">≈ 1</td><td>带宽</td><td>带宽</td><td class="winh20">H20 ~2.5×</td></tr>
+        <tr><td>MoE 路由</td><td class="mono">小算子</td><td>访存</td><td>访存</td><td class="winh20">H20</td></tr>
+      </tbody>
+    </table></div>
+    <p>只有 MoE 的 AI 随 bs 变化(AI = t = 每专家 token 数 ∝ bs),所以打大 batch 只对 MoE 有意义。vector(AI≈1)与 attention(AI≈128,由 dLLM block 32 × GQA 组 4 的 KV 复用决定)的 AI 都与 bs 无关。attention 在 H20 上算力受限、910B 上带宽受限,两者相当。</p>
+
+    <h3>1.3 MoE 在两颗芯片上的瓶颈</h3>
+    <div class="tbl-wrap"><table>
+      <thead><tr><th>t(每专家 token)</th><th>910B(ridge 200)</th><th>H20(ridge 37)</th></tr></thead>
+      <tbody>
+        <tr><td class="num">32(小 bs)</td><td>带宽受限 ~16%</td><td>已过 ridge ~45%</td></tr>
+        <tr class="hl"><td class="num">128(单卡 bs=128)</td><td>带宽受限 <b>39%</b>(实测 126T)</td><td>算力受限 <b>88%</b>(实测 130T)</td></tr>
+        <tr><td class="num">512(需 EP 堆)</td><td>进算力区 ~60%(189T)</td><td>已算力饱和(roofline)</td></tr>
+      </tbody>
+    </table></div>
+    <div class="note"><b>39% / 126T 可由带宽反推</b>(用实际带宽):MoE 每 forward 读约 30 GB 权重,实测 30.9ms → 实际带宽 0.97 TB/s;有效算力 = AI × 带宽 = 128 × 0.97 = 124 TFLOPS ≈ 实测 126T(320T 的 39%)。实际带宽 0.97 只有规格 1.6 的 61%(HBM 可达带宽一般为规格的 60-85%)。<b>bs=128 时 MoE 两者相当</b>(910B 39%/126T ≈ H20 88%/130T),未进入甜点(需 t≥512)。H20 88% 来自非饱和 trace,饱和后 MFU 可能微调,结论不变。</div>
+
+    <h3>1.4 小结</h3>
+    <div class="summary">
+      <div class="sum-row"><span class="sum-k">小 bs(≤128)</span><span class="sum-v">MoE 在 910B 带宽受限(仅用 39% 算力),2× 算力优势用不出;vector 带宽受限 H20 有利,attention 相当。910B 靠 <b>dense GEMM</b> 的算力优势扳平,整体约 <b>1.06×</b> 的小幅领先或相当。</span></div>
+      <div class="sum-row"><span class="sum-k">大 bs</span><span class="sum-v">把 t 推到 ≥512 时 910B 的 MoE 才进算力区、2× 优势才兑现。单卡 bs=128 只有 t=128,堆 t 需 DP+EP(第三章)。<b>大 bs 是 910B 的杠杆、不是 H20 的</b>(H20 的 MoE 在 t=29 即饱和)。</span></div>
+    </div>
+  </section>
+
+  <!-- CH2 -->
+  <section class="ch">
+    <div class="ch-head"><span class="ch-num">02</span><h2 class="ch-title">单卡优化与 bs=128 实测</h2></div>
+
+    <h3>2.1 单卡优化项 <span class="sub">均 910B 实测</span></h3>
+    <div class="tbl-wrap"><table>
+      <thead><tr><th>改进</th><th>机制</th><th class="n">收益</th></tr></thead>
+      <tbody>
+        <tr><td>FDFO 调度</td><td>消除 sync 锁步长尾浪费,连续补位保持满 batch</td><td class="n win910">+88%</td></tr>
+        <tr><td>混批 + K=2</td><td>prefill/decode 合并,消掉 47% 浪费小 prefill 轮</td><td class="n win910">+27~29%</td></tr>
+        <tr><td>去噪规约单遍融合核</td><td>argmax+softmax 一次读完 logits</td><td class="n">整步 −6%</td></tr>
+        <tr><td>split_qkv 宽 grid 融合核</td><td>大 batch 消逐行串行退化(8.6→3.0ms)</td><td class="n">整步 −6%</td></tr>
+        <tr><td>消 init D2H 同步</td><td>dLLM 用 CPU 镜像值,省 2 次 D2H</td><td class="n">+6.8%</td></tr>
+      </tbody>
+    </table></div>
+    <div class="note">CV 融合(多流 cube∥vector 重叠)在 NPU 不可行(实测:跨流 kernel 完全串行,双流 ratio=2.02)。Ascend 的 cube/vector 并行只能靠单 kernel 内融合。NPU 的优化方向是更少更胖的融合核,不是重叠。</div>
+
+    <h3>2.2 最大 bs 的推导(HBM 限制,长序列口径)</h3>
+    <div class="tbl-wrap"><table>
+      <thead><tr><th>部分</th><th class="n">大小</th><th>随 bs 变</th></tr></thead>
+      <tbody>
+        <tr><td>权重</td><td class="n">30.3 GB</td><td class="tie">固定</td></tr>
+        <tr><td>CANN/驱动 overhead</td><td class="n">8.8 GB</td><td class="tie">固定</td></tr>
+        <tr class="total"><td>固定合计</td><td class="n">39.1 GB</td><td>—</td></tr>
+        <tr><td>decode graph(密桶 max_bs=128)</td><td class="n">9.76 GB</td><td>∝ max_bs</td></tr>
+        <tr><td>KV 池预留</td><td class="n">~100 MB/req</td><td>∝ bs</td></tr>
+        <tr><td>activation</td><td class="n">~25 MB/req</td><td>∝ bs</td></tr>
+      </tbody>
+    </table></div>
+    <p>实测边界:eager 长序列 max bs ≈ 200;graph max_bs=128 ≈ 150;graph max_bs=160 运行时只剩 1.07GB、满负载贴边并触发 retract、无吞吐收益。<b>单卡长序列 bs 天花板约 160,但打大 batch 无收益</b>(MoE 在 t=160 仍带宽受限,attention/vector 随 bs 线性增长抵消)。推荐 bs=128 + 密桶 graph + FDFO + 混批 + mem-fraction 0.75。</p>
+
+    <h3>2.3 bs=128 逐类对比 <span class="sub">每 forward:H20 ~90ms,910B ~85ms</span></h3>
+    <div class="chart">
+      <div class="chart-cap"><span class="side" style="color:var(--h20)">◀ H20 更快</span><span>每类耗时差 Δ = H20 − 910B(ms/forward)</span><span class="side" style="color:var(--a910)">910B 更快 ▶</span></div>
+      <div class="dvg-row"><div class="dvg-label">dense matmul</div><div class="dvg-track"><div class="dvg-half l"></div><div class="dvg-half r"><div class="dvg-bar b910" style="width:100%"></div></div></div><div class="dvg-val v910">+14.6</div></div>
+      <div class="dvg-row"><div class="dvg-label">其他 vector</div><div class="dvg-track"><div class="dvg-half l"></div><div class="dvg-half r"><div class="dvg-bar b910" style="width:34.9%"></div></div></div><div class="dvg-val v910">+5.1</div></div>
+      <div class="dvg-row"><div class="dvg-label">去噪规约</div><div class="dvg-track"><div class="dvg-half l"></div><div class="dvg-half r"><div class="dvg-bar b910" style="width:15.8%"></div></div></div><div class="dvg-val v910">+2.3</div></div>
+      <div class="dvg-row"><div class="dvg-label">attention</div><div class="dvg-track"><div class="dvg-half l"></div><div class="dvg-half r"><div class="dvg-bar b910" style="width:2.7%"></div></div></div><div class="dvg-val vtie">+0.4</div></div>
+      <div class="dvg-row"><div class="dvg-label">MoE GMM</div><div class="dvg-track"><div class="dvg-half l"><div class="dvg-bar bh20" style="width:12.3%"></div></div><div class="dvg-half r"></div></div><div class="dvg-val vh20">−1.8</div></div>
+      <div class="dvg-row"><div class="dvg-label">norm / rope</div><div class="dvg-track"><div class="dvg-half l"><div class="dvg-bar bh20" style="width:47.3%"></div></div><div class="dvg-half r"></div></div><div class="dvg-val vh20">−6.9</div></div>
+      <div class="dvg-row"><div class="dvg-label">MoE 路由</div><div class="dvg-track"><div class="dvg-half l"><div class="dvg-bar bh20" style="width:63%"></div></div><div class="dvg-half r"></div></div><div class="dvg-val vh20">−9.2</div></div>
+    </div>
+    <div class="tbl-wrap"><table>
+      <thead><tr><th>类别</th><th class="n">H20</th><th class="n">910B</th><th class="n">Δ</th><th>瓶颈 · 相对</th></tr></thead>
+      <tbody>
+        <tr><td>dense matmul</td><td class="n">36.2</td><td class="n">21.6</td><td class="n win910">+14.6</td><td>算力 · <span class="win910">910B 2×</span></td></tr>
+        <tr><td>MoE GMM</td><td class="n">29.1</td><td class="n">30.9</td><td class="n tie">−1.8</td><td>H20 算力88% / 910B 带宽39% · <span class="tie">~平</span></td></tr>
+        <tr><td>去噪规约</td><td class="n">7.3</td><td class="n">5.0</td><td class="n win910">+2.3</td><td>vector · <span class="win910">910B</span></td></tr>
+        <tr><td>其他 vector</td><td class="n">7.9</td><td class="n">2.8</td><td class="n win910">+5.1</td><td>vector · <span class="win910">910B</span></td></tr>
+        <tr><td>attention</td><td class="n">6.9</td><td class="n">6.5</td><td class="n tie">+0.4</td><td>算力(AI=128) · <span class="tie">~平</span></td></tr>
+        <tr><td>MoE 路由</td><td class="n">1.7</td><td class="n">10.9</td><td class="n winh20">−9.2</td><td>小算子 · <span class="winh20">H20 5.5×</span></td></tr>
+        <tr><td>norm / rope</td><td class="n">0.4</td><td class="n">7.3</td><td class="n winh20">−6.9</td><td>vector · <span class="winh20">H20 15×</span></td></tr>
+        <tr class="total"><td>合计</td><td class="n">≈89.5</td><td class="n">≈85.0</td><td class="n win910">+4.5</td><td>910B 快 1.06×</td></tr>
+      </tbody>
+    </table></div>
+    <p>两颗芯片的优势在相反的算子上:910B 在大算力活上占优(dense GEMM +14.6ms),H20 在小算子上占优(MoE 路由 −9.2 + norm −6.9 ≈ 16ms)。MoE 相当但机理相反(H20 算力受限 88%,910B 带宽受限 39%)。<b>吞吐实测</b>:gsm8k 910B 3667 vs H20 3412(1.07×);长序列 910B 2591 vs H20 2364(1.10×)。per-forward 比与吞吐比一致。</p>
+
+    <h3>2.4 batch sweep 实测 <span class="sub">gsm8k 输出吞吐 vs parallel(= t)</span></h3>
+    <div class="linechart">
+      <svg viewBox="0 0 640 320" role="img" aria-label="吞吐随 parallel 变化,910B 在 parallel≈100 处超过 H20">
+        <!-- gridlines -->
+        <line class="lc-grid" x1="50" y1="300" x2="620" y2="300"/>
+        <line class="lc-grid" x1="50" y1="226.3" x2="620" y2="226.3"/>
+        <line class="lc-grid" x1="50" y1="152.6" x2="620" y2="152.6"/>
+        <line class="lc-grid" x1="50" y1="78.9" x2="620" y2="78.9"/>
+        <text class="lc-txt" x="44" y="303" text-anchor="end">0</text>
+        <text class="lc-txt" x="44" y="229" text-anchor="end">1k</text>
+        <text class="lc-txt" x="44" y="156" text-anchor="end">2k</text>
+        <text class="lc-txt" x="44" y="82" text-anchor="end">3k</text>
+        <line class="lc-axis" x1="50" y1="16" x2="50" y2="300"/>
+        <!-- crossover -->
+        <line class="lc-cross" x1="588" y1="16" x2="588" y2="300"/>
+        <text class="lc-txt" x="584" y="14" text-anchor="end" style="fill:var(--accent)">交叉 ~p100</text>
+        <!-- H20 line -->
+        <polyline class="lc-h20" points="50,256.4 212.9,199.3 294.3,158.3 375.7,119.4 457.1,89.8 538.6,61.2 620,48.6"/>
+        <!-- 910B line -->
+        <polyline class="lc-910" points="50,277 212.9,257.7 294.3,243.1 375.7,192.3 457.1,138.6 538.6,75.8 620,29.8"/>
+        <!-- endpoints -->
+        <circle class="lc-h20d" cx="620" cy="48.6" r="3.5"/>
+        <circle class="lc-910d" cx="620" cy="29.8" r="3.5"/>
+        <!-- x labels -->
+        <text class="lc-txt" x="50" y="315" text-anchor="middle">1</text>
+        <text class="lc-txt" x="212.9" y="315" text-anchor="middle">4</text>
+        <text class="lc-txt" x="294.3" y="315" text-anchor="middle">8</text>
+        <text class="lc-txt" x="375.7" y="315" text-anchor="middle">16</text>
+        <text class="lc-txt" x="457.1" y="315" text-anchor="middle">32</text>
+        <text class="lc-txt" x="538.6" y="315" text-anchor="middle">64</text>
+        <text class="lc-txt" x="620" y="315" text-anchor="middle">128</text>
+      </svg>
+      <div class="lc-legend"><span><i style="background:var(--h20)"></i>H20</span><span><i style="background:var(--a910)"></i>910B</span></div>
+    </div>
+    <div class="tbl-wrap"><table>
+      <thead><tr><th class="n">parallel(= t)</th><th class="n">H20</th><th class="n">910B</th><th>910B / H20</th><th class="n">H20 边际</th><th class="n">910B 边际</th></tr></thead>
+      <tbody>
+        <tr><td class="n">1</td><td class="n">592</td><td class="n">312</td><td class="winh20">0.53(H20 1.9×)</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td class="n">8</td><td class="n">1923</td><td class="n">772</td><td class="winh20">0.40(H20 2.5×)</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td class="n">32</td><td class="n">2853</td><td class="n">2190</td><td>0.77</td><td class="n">+16%</td><td class="n">+50%</td></tr>
+        <tr><td class="n">64</td><td class="n">3241</td><td class="n">3043</td><td>0.94</td><td class="n">+14%</td><td class="n">+39%</td></tr>
+        <tr class="hl"><td class="n">128</td><td class="n">3412</td><td class="n">3667</td><td class="win910">1.07(910B 超过)</td><td class="n">+5%</td><td class="n">+20%</td></tr>
+      </tbody>
+    </table></div>
+    <p>精度全程持平(两家 0.82-0.84)。两条曲线与 roofline 一致:小 batch(t&lt;37)两颗芯片 MoE 都带宽受限,H20 的 2.5× 带宽 + 小算子优势领先;H20 在 t≈37 越过 ridge 进入算力受限,吞吐增长放缓(p64→p128 仅 +5%);910B 的 ridge 为 200,单卡 t≤128 仍有算力头寸,持续上升(p64→p128 +20%),在 <b>parallel≈100 处超过 H20</b>。</p>
+
+    <h3>2.5 长序列 <span class="sub">512in / 2048out,concurrency 128</span></h3>
+    <div class="tbl-wrap"><table>
+      <thead><tr><th>指标</th><th class="n">H20</th><th class="n">910B</th></tr></thead>
+      <tbody>
+        <tr><td>输出吞吐 tok/s</td><td class="n">2364</td><td class="n win910">2591(+9.6%)</td></tr>
+        <tr><td>完成时长</td><td class="n">435.7 s</td><td class="n win910">397.7 s</td></tr>
+        <tr><td>Mean TTFT</td><td class="n">11100 ms</td><td class="n win910">3819 ms</td></tr>
+        <tr><td>Mean TPOT</td><td class="n">46.0 ms</td><td class="n">47.0 ms</td></tr>
+        <tr><td>P99 E2E</td><td class="n">371.7 s</td><td class="n win910">150.0 s</td></tr>
+      </tbody>
+    </table></div>
+    <p>长序列 TPOT 接近相等(而非 910B 更快):attention 的 AI=128 两者相当,占比上升稀释了 910B 的 dense 优势;且 910B FIA 只跑 24% MFU(实现受限,见 §4.2),长上下文 attention 略弱于 H20。因此 910B 的长序列吞吐优势来自调度(FDFO+混批把排队长尾压低,整批完成更快),而非每 token 算力。若把 FIA 修到 50% MFU,长序列每 token 也会转为 910B 领先。</p>
+  </section>
+
+  <!-- CH3 -->
+  <section class="ch">
+    <div class="ch-head"><span class="ch-num">03</span><h2 class="ch-title">专家并行(EP)评估</h2></div>
+
+    <h3>3.1 为什么评估 EP</h3>
+    <p>超过 H20 需把 MoE 推进算力区(t≥512),但单卡 bs=128 只有 t=128。EP 让每个专家收所有 DP 副本的 token:DP8+EP8、每卡 bs=128 → 每专家 t=1024,理论上进入甜点。附带把每卡权重从 30.6GB 降到 3.8GB,腾出约 55GB 给 KV。</p>
+    <div class="note"><b>实测结果</b>(910B):DP8+EP8 跑通,gsm8k 0.835(与单卡持平);MoE 进入甜点(GroupedMatmul 273-282 TFLOPS = 85-88% 峰值,t/expert=729);显存释放兑现。架构假设成立。</div>
+
+    <h3>3.2 通信代价的计算</h3>
+    <p>一个 token 路由到 K=8 个专家,在 EP=P 下落在 <code>r(P) = P·(1−(1−1/P)^K)</code> 个 rank 上(deep_ep 按目标 rank 发一份)。出卡字节 = <code>r(P)·H·2B·(P−1)/P</code>,combine 返回 ×2;可用带宽 = P−1 条 HCCS 链路 × 15.6 GB/s。</p>
+    <div class="tbl-wrap"><table>
+      <thead><tr><th class="n">ep</th><th class="n">目标 rank</th><th class="n">链路数</th><th class="n">可用带宽</th><th class="n">字节/token/层</th><th class="n">T=4096 时</th></tr></thead>
+      <tbody>
+        <tr><td class="n">2</td><td class="n">1.99</td><td class="n">1</td><td class="n">16 GB/s</td><td class="n">8.0 KB</td><td class="n">2.14 ms</td></tr>
+        <tr><td class="n">4</td><td class="n">3.60</td><td class="n">3</td><td class="n">47 GB/s</td><td class="n">21.6 KB</td><td class="n">1.94 ms</td></tr>
+        <tr class="hl"><td class="n">8</td><td class="n">5.25</td><td class="n">7</td><td class="n">109 GB/s</td><td class="n">36.8 KB</td><td class="n">1.41 ms</td></tr>
+      </tbody>
+    </table></div>
+    <p>ep 越大,每 token 搬的字节越多(8→37 KB),但链路数涨得更快(1→7),所以每 token 反而更便宜。单节点 8 卡,无 ep=16。（带宽按每链路 15.6 GB/s 线性取值。）</p>
+
+    <h3>3.3 收益的计算</h3>
+    <p>每卡的 GMM 行数在 EP 和非 EP 下完全一样(= T·K),EP 没有减少工作量,只改变这些行摊到的权重字节:1.61 GB → 1.61/P GB。</p>
+    <div class="note" style="font-family:var(--font-mono); font-size:.82rem;">时间/层 = max( 权重字节 / HBM带宽 &nbsp;,&nbsp; 行数·FLOP / 算力峰值 )<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;↑ EP 只动这一项&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;↑ EP 完全没动</div>
+    <div class="tbl-wrap"><table>
+      <thead><tr><th class="n">blocks/卡</th><th class="n">权重 roofline</th><th class="n">算力 roofline</th><th class="n">非 EP</th><th class="n">EP8</th><th class="n">省下</th></tr></thead>
+      <tbody>
+        <tr><td class="n">16</td><td class="n">1.46</td><td class="n">0.09</td><td class="n">1.46</td><td class="n">0.18</td><td class="n win910">1.28</td></tr>
+        <tr><td class="n">32</td><td class="n">1.46</td><td class="n">0.19</td><td class="n">1.46</td><td class="n">0.19</td><td class="n win910">1.28</td></tr>
+        <tr><td class="n">64</td><td class="n">1.46</td><td class="n">0.37</td><td class="n">1.46</td><td class="n">0.37</td><td class="n">1.09</td></tr>
+        <tr class="hl"><td class="n">128</td><td class="n">1.46</td><td class="n">0.75</td><td class="n">1.46</td><td class="n">0.75</td><td class="n">0.72</td></tr>
+        <tr><td class="n">200</td><td class="n">1.46</td><td class="n">1.17</td><td class="n">1.46</td><td class="n">1.17</td><td class="n">0.30</td></tr>
+      </tbody>
+    </table></div>
+    <p>“非 EP”全程为 1.46 ms(一直权重带宽受限、与 batch 无关)。这是收益的天花板:EP 最多把 1.46 削到算力 roofline 为止。batch 越大算力项越高、能削的越少,200 blocks/卡时收益趋近 0。收益天花板由模型结构决定(每层 256 专家权重 1.61GB),与互联速度无关。</p>
+
+    <h3>3.4 净账与交叉点 <span class="sub">ep=8</span></h3>
+    <div class="tbl-wrap"><table>
+      <thead><tr><th class="n">blocks/卡</th><th class="n">收益(均衡)</th><th class="n">a2a 地板</th><th class="n">净(均衡)</th><th class="n">净(1.3× 不均)</th></tr></thead>
+      <tbody>
+        <tr><td class="n">16</td><td class="n">1.28</td><td class="n">0.18</td><td class="n win910">+1.11</td><td class="n win910">+1.11</td></tr>
+        <tr><td class="n">64</td><td class="n">1.09</td><td class="n">0.71</td><td class="n win910">+0.39</td><td class="n win910">+0.27</td></tr>
+        <tr><td class="n">87</td><td class="n">0.96</td><td class="n">0.96</td><td class="n tie">0.00</td><td class="n winh20">−0.16</td></tr>
+        <tr class="hl"><td class="n">128</td><td class="n">0.72</td><td class="n">1.41</td><td class="n winh20">−0.69</td><td class="n winh20">−0.92</td></tr>
+        <tr><td class="n">200</td><td class="n">0.30</td><td class="n">2.21</td><td class="n winh20">−1.91</td><td class="n winh20">−2.26</td></tr>
+      </tbody>
+    </table></div>
+    <p>收益递减、代价线性上升,交叉点约 <b>87 blocks/卡</b>(不均衡则 79)。低于它 EP 有收益、高于它 EP 净亏,<b>128 在净亏一侧</b>。这是 roofline 交叉点;加上当前实现的库开销 + skew,交叉点进一步降到 ≤21 blocks/卡。</p>
+
+    <h3>3.5 实测 a2a 与 roofline 的差距</h3>
+    <p>实际跑的 DP4+EP4,实测 a2a = <b>12.2 ms/层</b>,理论地板(① 互联地板)只有 <b>2.84 ms/层</b>——实测是地板的 <b>4.3 倍</b>,多出的 9.4ms 是可优化的库开销 + skew,不是物理下限。整轮 95ms(单卡)→ 488ms,节点吞吐只有 4 张独立单卡的 1/4.6。</p>
+    <div class="tbl-wrap"><table>
+      <thead><tr><th>段</th><th class="n">ms/层</th><th class="n">占比</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td>① 互联地板</td><td class="n">2.84</td><td class="n">23%</td><td>理论最优字节 / HCCS 带宽,物理下限</td></tr>
+        <tr><td>② deep_ep 多搬字节</td><td class="n">2.36</td><td class="n">19%</td><td>库按 (token,专家) 发字节(可改)</td></tr>
+        <tr><td>③ 算子开销</td><td class="n">3.01</td><td class="n">25%</td><td>MC2 dispatch 的 AICPU 编排固定开销</td></tr>
+        <tr><td>④ rank 等待 / skew</td><td class="n">3.99</td><td class="n">33%</td><td>负载不均衡,集合通信整批等最慢卡</td></tr>
+      </tbody>
+    </table></div>
+    <p>负载不均衡实测(DP4+EP4,4 张卡):各卡处理行数 46707 / 28785 / 46785 / 19803,最多最少差 <b>2.4×</b>(均分应 35520)。不均衡来自各 DP rank 每轮 block 数不同 + 专家路由热度不均。行数最少的卡反而最慢(权重流式每卡固定 0.40GB,行数少则摊不动),集合通信中拉低整体。可用 EPLB + 对齐 block 数部分回收。</p>
+    <div class="note">即使换到 ep=8(最佳 EP 度数)+ 完美实现:互联地板 1.41ms/层(仍亏 0.92);即便互联翻倍(910C 口径)0.71ms/层,128 blocks/卡 仍亏 0.21ms/层。<b>EP 在 128 这个点上,即使是 roofline 也是净亏。</b></div>
+
+    <h3>3.6 结论</h3>
+    <ul class="clean">
+      <li><b>大 batch(≥87 blocks/卡)</b>:roofline 上已净亏,当前实现的 a2a 又是地板的 ~4 倍。不建议使用。</li>
+      <li><b>小 batch(≲87 blocks/卡)</b>:roofline 上有收益,但当前实现的 a2a 会把收益吃光。需先压库开销和 skew。</li>
+      <li><b>下一代硬件</b>:910C 互联翻倍把交叉点从 87 推到 130,刚好把 128 挪到有收益一侧,但余量很薄;收益天花板由模型结构决定,与互联速度无关。</li>
+      <li><b>追吞吐</b>用大 batch + 独立单卡,不用 DP8+EP8;<b>EP 目前唯一成立的价值是显存</b>(长序列档单卡放不下时用吞吐换容量)。</li>
+    </ul>
+  </section>
+
+  <!-- CH4 -->
+  <section class="ch">
+    <div class="ch-head"><span class="ch-num">04</span><h2 class="ch-title">后续优化方向</h2></div>
+    <p>dense 已算力饱和(78% 峰值、快于 H20 2×),不需改动。发力点两类:算法/结构协同(把 workload 往 910B 算力强项推)+ kernel 工程(FIA、融合核)。</p>
+
+    <h3>4.1 算法方向:把 workload 往算力密集推</h3>
+    <p>910B 在算力上占优、在带宽和小算子上吃亏。算法层面最有效的方向是把 dLLM 的结构往“更计算密集、更少带宽/小算子”改。</p>
+    <ul class="clean">
+      <li><b>① 把 block 做大。</b> block_size 决定 attention 和 MoE 的算术强度:attention AI = block × GQA组(4),block=128 → AI=512 &gt;&gt; ridge 200,进入算力区;MoE 的 t = block × bs × topk / experts,block=128、bs=128 → t=512,单卡即进入 MoE 甜点(EP 靠通信堆的 t,大 block 不用 a2a 就拿到)。参考:diffusion 版 Gemma 已做到 block_size=128。代价:block 内 token 更多,精度/收敛需验证。</li>
+      <li><b>② Blockwise MoE:压缩 block 内激活的专家数。</b> 一个 block 内的 token 语义相近,大概率路由到重叠的专家。把 block 的专家集合压到更少的 distinct 专家,可少读专家权重,直接降低 MoE 的权重带宽(30GB/forward 瓶颈)。参考:已有开源 dmoe。</li>
+      <li><b>③ 全词表冗余裁剪。</b> 每去噪步对全 32 位置算 lm_head(10.3ms)+ 全词表归约(6ms),但后期步骤 still-masked 位置很少、大部分冗余。只对 still-masked 位置算可大幅减少。障碍:JointThreshold 的 T2T 语义读所有非 mask 位置的概率,需重新设计算法。收益上界大,工程量也大。</li>
+    </ul>
+
+    <h3>4.2 attention FIA 效率(长序列)</h3>
+    <p>910B FIA 只跑 24% MFU,seq4096 时 attention 占整步 33%(短序列 7%,不重要)。24% 是实现低效而非带宽限制:attention AI=128 &lt; ridge 200 属带宽受限,MFU 上限本就是 ~40-64%,但 FIA 连这个都没达到(load pipe 和算力 pipe 都不饱和)。根因是 online-softmax 把 QK→softmax→AV 串成依赖链、cube/vector 交替互等产生气泡,而 NPU 不能靠多流重叠。靠核内融合可回收到 ~40-50%。</p>
+
+    <h3>4.3 更少更胖的融合核</h3>
+    <p>减 kernel 数 + 减冗余内存遍历。剩余目标:MoE 路由三段式融合(~3.5%)、norm/rope 进一步合并。单项收益不大(个位数 %),但可累积。</p>
+
+    <h3>4.4 硬件代际</h3>
+    <p>910C 互联翻倍(218 GB/s)时,EP 在 128blk/卡接近打平,大 batch + EP 进入甜点才真正可行。当前 910B3 上 EP 净亏,需下一代硬件。</p>
+  </section>
+
+  <!-- 总结 -->
+  <section class="ch">
+    <div class="ch-head"><span class="ch-num">∑</span><h2 class="ch-title">总结</h2></div>
+    <div class="tbl-wrap"><table>
+      <thead><tr><th>维度</th><th>结论</th></tr></thead>
+      <tbody>
+        <tr><td><b>小 bs(≤128)</b></td><td>相当 / 小幅领先 <span class="num">1.06×</span>。910B 靠 dense 算力扳平 vector/routing 的带宽劣势,MoE 未进甜点。</td></tr>
+        <tr><td><b>大 bs(单卡)</b></td><td>bs 天花板约 160,但无吞吐收益(MoE 仍带宽受限 + graph/KV 吃显存)。推荐 bs=128。</td></tr>
+        <tr><td><b>大 bs + EP</b></td><td>MoE 进甜点(85-88%),但 a2a 让节点吞吐降到 <span class="num">1/4.6</span>,128blk 净亏。EP 目前只值得为显存用。</td></tr>
+        <tr><td><b>后续方向</b></td><td>算法层:① block 做大(attention+MoE 同进算力区、单卡进甜点、免 a2a)② blockwise MoE(压 block 内专家、降 MoE 带宽)③ 全词表裁剪。</td></tr>
+        <tr><td><b>对 H20 的判断</b></td><td>小 batch H20 领先(bs=1 1.9×、p8 2.5×),大 batch 910B 超过:p128 短序列 <span class="num">+7%</span>、长序列 <span class="num">+10%</span>。交叉点约 parallel 100。</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+</main>
+
+<footer class="wrap">
+  LLaDA2.1-mini · Ascend 910B3 vs H20 · 性能分析。910B 为实测;H20 kernel 数据来自硬件 trace(该次 capture 非饱和,绝对标度待饱和数据复核),部分 H20 值为 roofline 推算,报告中已标注。
+</footer>
+
+<script>
+  (function () {
+    var btn = document.getElementById('tt');
+    btn.addEventListener('click', function () {
+      var cur = document.documentElement.getAttribute('data-theme');
+      var next = cur === 'dark' ? 'light' : (cur === 'light' ? 'dark' : (matchMedia('(prefers-color-scheme: dark)').matches ? 'light' : 'dark'));
+      document.documentElement.setAttribute('data-theme', next);
+    });
+  })();
+</script>
