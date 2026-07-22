@@ -190,7 +190,7 @@
   <section class="ch" style="border-top:none;">
     <div class="ch-head"><span class="ch-num">—</span><h2 class="ch-title">结论</h2></div>
     <div class="concl">
-      <div class="cc c1"><div class="cn">1</div><p><b>大 batch(bs=128)下 910B 略优于 H20。</b> 2k 输出长序列(512in/2048out)输出吞吐 <span class="num">2591 vs 2364</span>(+10%);短序列(gsm8k)<span class="num">3667 vs 3412</span>(+7%)。</p></div>
+      <div class="cc c1"><div class="cn">1</div><p><b>大 batch + 短到中等序列下 910B 略优于 H20。</b> 512in/2048out 输出吞吐 <span class="num">2591 vs 2364</span>(+10%),短序列 gsm8k +7%。但更长输入(4K in/1.5K out)H20 反超 <span class="num">~1.4×</span>(910B 受 64GB 显存限制只能到 bs≈72,低 bs + prefill 成本对 910B 不利)。</p></div>
       <div class="cc c2"><div class="cn">2</div><p><b>小 batch 下 910B 明显落后。</b> bs=1 时 910B 约为 H20 的 <span class="num">0.5×</span>(312 vs 592),bs=8 约 <span class="num">0.4×</span>。</p></div>
       <div class="cc c3"><div class="cn">3</div><p><b>专家并行(EP)通信代价过大,当前不划算。</b> 128 blocks/卡 实测 a2a <span class="num">12.2 ms/层</span>,节点吞吐只有 4 张独立单卡的 <span class="num">1/4.6</span>。</p></div>
     </div>
@@ -245,7 +245,7 @@
         <tr><td class="num">512(需 EP 堆)</td><td>进算力区 ~60%(189T)</td><td>已算力饱和(roofline)</td></tr>
       </tbody>
     </table></div>
-    <div class="note"><b>39% / 126T 可由带宽反推</b>(用实际带宽):MoE 每 forward 读约 30 GB 权重,实测 30.9ms → 实际带宽 0.97 TB/s;有效算力 = AI × 带宽 = 128 × 0.97 = 124 TFLOPS ≈ 实测 126T(320T 的 39%)。实际带宽 0.97 只有规格 1.6 的 61%(HBM 可达带宽一般为规格的 60-85%)。<b>bs=128 时 MoE 两者相当</b>(910B 39%/126T ≈ H20 88%/130T),未进入甜点(需 t≥512)。H20 88% 来自非饱和 trace,饱和后 MFU 可能微调,结论不变。</div>
+    <div class="note"><b>39% / 126T 可由带宽反推</b>(用实际带宽):MoE 每 forward 读约 30 GB 权重,实测 30.9ms → 实际带宽 0.97 TB/s;有效算力 = AI × 带宽 = 128 × 0.97 = 124 TFLOPS ≈ 实测 126T(320T 的 39%)。实际带宽 0.97 只有规格 1.6 的 61%(HBM 可达带宽一般为规格的 60-85%)。<b>bs=128 时 MoE 两者相当</b>(910B 39%/126T ≈ H20 88%/130T),未进入甜点(需 t≥512)。</div>
 
     <h3>1.4 小结</h3>
     <div class="summary">
@@ -260,12 +260,12 @@
 
     <h3>2.1 单卡优化项 <span class="sub">均 910B 实测</span></h3>
     <div class="tbl-wrap"><table>
-      <thead><tr><th>改进</th><th>机制</th><th class="n">收益</th></tr></thead>
+      <thead><tr><th>改进</th><th>机制</th><th class="n">吞吐提升</th></tr></thead>
       <tbody>
         <tr><td>FDFO 调度</td><td>消除 sync 锁步长尾浪费,连续补位保持满 batch</td><td class="n win910">+88%</td></tr>
         <tr><td>混批 + K=2</td><td>prefill/decode 合并,消掉 47% 浪费小 prefill 轮</td><td class="n win910">+27~29%</td></tr>
-        <tr><td>去噪规约单遍融合核</td><td>argmax+softmax 一次读完 logits</td><td class="n">整步 −6%</td></tr>
-        <tr><td>split_qkv 宽 grid 融合核</td><td>大 batch 消逐行串行退化(8.6→3.0ms)</td><td class="n">整步 −6%</td></tr>
+        <tr><td>去噪规约单遍融合核</td><td>argmax+softmax 一次读完 logits(去噪 13→6ms)</td><td class="n">+6%</td></tr>
+        <tr><td>split_qkv 宽 grid 融合核</td><td>大 batch 消逐行串行退化(8.6→3.0ms)</td><td class="n">+6%</td></tr>
         <tr><td>消 init D2H 同步</td><td>dLLM 用 CPU 镜像值,省 2 次 D2H</td><td class="n">+6.8%</td></tr>
       </tbody>
     </table></div>
@@ -369,6 +369,17 @@
       </tbody>
     </table></div>
     <p>长序列 TPOT 接近相等(而非 910B 更快):attention 的 AI=128 两者相当,占比上升稀释了 910B 的 dense 优势;且 910B FIA 只跑 24% MFU(实现受限,见 §4.2),长上下文 attention 略弱于 H20。因此 910B 的长序列吞吐优势来自调度(FDFO+混批把排队长尾压低,整批完成更快),而非每 token 算力。若把 FIA 修到 50% MFU,长序列每 token 也会转为 910B 领先。</p>
+
+    <h3>2.6 更长序列 <span class="sub">4K in / 1.5K out(5632 token/req),均开混批</span></h3>
+    <div class="tbl-wrap"><table>
+      <thead><tr><th></th><th class="n">bs</th><th class="n">输出吞吐</th><th class="n">总吞吐</th><th class="n">TPOT</th><th class="n">TTFT</th></tr></thead>
+      <tbody>
+        <tr><td class="h20c">H20</td><td class="n">128</td><td class="n">1593</td><td class="n">5886</td><td class="n">65.7 ms</td><td class="n">14190 ms</td></tr>
+        <tr><td class="h20c">H20</td><td class="n">72</td><td class="n">1476</td><td class="n">5452</td><td class="n">40.7 ms</td><td class="n">8700 ms</td></tr>
+        <tr class="hl"><td class="a910c">910B</td><td class="n">72</td><td class="n">1058</td><td class="n">3909</td><td class="n">48.1 ms</td><td class="n">17000 ms</td></tr>
+      </tbody>
+    </table></div>
+    <p>同 bs=72 下 <b>H20 快 1.40×</b>(输出吞吐 1476 vs 1058),每 token 也快 1.18×(TPOT 40.7 vs 48.1)。<b>与 512/2048(910B +10%)相反,crossover 同时取决于 bs 和上下文长度</b>——短到中等序列 910B 赢,长上下文(4K+)H20 赢。机理未用 4K 逐算子 profiling 坐实:decode attention 的 AI=128 与上下文无关(§1.2),两颗芯片随上下文线性同速增长、比值 ~平,非主因;更可能是 910B 被 64GB 显存逼到 bs=72(低 bs 下 MoE 的 t 更小、更带宽受限)+ 长 prompt 的 prefill 成本(910B TTFT 17s vs H20 8.7s)。显存也是 H20 的优势(96GB 可到 128,吞吐再高一档 1593)。长输入下混批对 H20 也大幅有效:bs=128 不开混批 1024 → 开混批 1593(+56%)。</p>
   </section>
 
   <!-- CH3 -->
@@ -475,7 +486,7 @@
         <tr><td><b>大 bs(单卡)</b></td><td>bs 天花板约 160,但无吞吐收益(MoE 仍带宽受限 + graph/KV 吃显存)。推荐 bs=128。</td></tr>
         <tr><td><b>大 bs + EP</b></td><td>MoE 进甜点(85-88%),但 a2a 让节点吞吐降到 <span class="num">1/4.6</span>,128blk 净亏。EP 目前只值得为显存用。</td></tr>
         <tr><td><b>后续方向</b></td><td>算法层:① block 做大(attention+MoE 同进算力区、单卡进甜点、免 a2a)② blockwise MoE(压 block 内专家、降 MoE 带宽)③ 全词表裁剪。</td></tr>
-        <tr><td><b>对 H20 的判断</b></td><td>小 batch H20 领先(bs=1 1.9×、p8 2.5×),大 batch 910B 超过:p128 短序列 <span class="num">+7%</span>、长序列 <span class="num">+10%</span>。交叉点约 parallel 100。</td></tr>
+        <tr><td><b>对 H20 的判断</b></td><td>小 batch H20 领先(bs=1 1.9×);大 batch + 短到中等序列 910B 超过(gsm8k +7%、512/2048 +10%);但长上下文(4K/1.5K)H20 反超 <span class="num">1.4×</span>(910B 受 64GB 显存限制只能到 bs≈72,低 bs + prefill 成本;精确归因待 profiling)。crossover 同时取决于 bs 和上下文长度。</td></tr>
       </tbody>
     </table></div>
   </section>
