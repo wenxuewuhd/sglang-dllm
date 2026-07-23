@@ -145,6 +145,23 @@
   .lc-legend span { display:inline-flex; align-items:center; gap:.4rem; }
   .lc-legend i { width:1.1rem; height:3px; border-radius:2px; display:inline-block; }
 
+  /* pipeline / batch-fill diagram */
+  .pipe { display:grid; gap:.9rem; margin:1.2rem 0 .4rem; }
+  .pipe-lane { background: var(--surface); border:1px solid var(--border); border-radius:10px; padding:.8rem 1rem; }
+  .pipe-title { display:flex; justify-content:space-between; gap:.5rem; flex-wrap:wrap; font-size:.84rem; font-weight:600; margin-bottom:.55rem; }
+  .pipe-title .fill { font-family:var(--font-mono); font-weight:600; }
+  .pipe-fwds { display:flex; gap:4px; height:74px; }
+  .pipe-fwd { flex:1; height:100%; display:flex; flex-direction:column-reverse; border-radius:2px 2px 0 0; overflow:hidden;
+    border:1px solid var(--border);
+    background: repeating-linear-gradient(45deg, var(--surface-2) 0 3px, transparent 3px 6px), var(--surface-2); }
+  .pipe-fwd .pf { background:#7b6cd6; width:100%; }
+  .pipe-fwd .dc { background:#2f9e8f; width:100%; }
+  .pipe-legend { display:flex; gap:1.1rem; font-size:.8rem; color:var(--ink-soft); margin:.3rem 0 .6rem; flex-wrap:wrap; }
+  .pipe-legend span { display:inline-flex; align-items:center; gap:.4rem; }
+  .pipe-legend i { width:.9rem; height:.9rem; border-radius:2px; display:inline-block; }
+  .pipe-legend i.pf { background:#7b6cd6; } .pipe-legend i.dc { background:#2f9e8f; }
+  .pipe-legend i.em { background: repeating-linear-gradient(45deg, var(--surface-2) 0 3px, transparent 3px 6px), var(--surface-2); border:1px solid var(--border); }
+
   ul.clean { padding-left:1.1rem; margin:.7rem 0; }
   ul.clean li { margin:.3rem 0; }
   ul.clean li::marker { color: var(--accent-soft); }
@@ -283,6 +300,42 @@
       </tbody>
     </table></div>
     <div class="note">CV 融合(多流 cube∥vector 重叠)在 NPU 不可行(实测:跨流 kernel 完全串行,双流 ratio=2.02)。Ascend 的 cube/vector 并行只能靠单 kernel 内融合。NPU 的优化方向是更少更胖的融合核,不是重叠。</div>
+
+    <p style="margin-top:1.5rem;"><b>混批做了什么</b> —— 每一列是一个 forward,竖条是这个 forward 里 batch 的填充(容量 128):</p>
+    <div class="pipe">
+      <div class="pipe-lane">
+        <div class="pipe-title"><span>Upstream FDFO:prefill / decode 分开轮</span><span class="fill" style="color:var(--ink-faint)">填充均值 ~43/128</span></div>
+        <div class="pipe-fwds">
+          <div class="pipe-fwd"><span class="pf" style="height:28%"></span></div>
+          <div class="pipe-fwd"><span class="dc" style="height:62%"></span></div>
+          <div class="pipe-fwd"><span class="pf" style="height:22%"></span></div>
+          <div class="pipe-fwd"><span class="dc" style="height:55%"></span></div>
+          <div class="pipe-fwd"><span class="pf" style="height:30%"></span></div>
+          <div class="pipe-fwd"><span class="dc" style="height:48%"></span></div>
+          <div class="pipe-fwd"><span class="pf" style="height:20%"></span></div>
+          <div class="pipe-fwd"><span class="dc" style="height:58%"></span></div>
+          <div class="pipe-fwd"><span class="pf" style="height:26%"></span></div>
+          <div class="pipe-fwd"><span class="dc" style="height:52%"></span></div>
+        </div>
+      </div>
+      <div class="pipe-lane">
+        <div class="pipe-title"><span>我们的 prefill + decode 混批:同一 forward</span><span class="fill" style="color:var(--a910)">填充均值 ~100/128</span></div>
+        <div class="pipe-fwds">
+          <div class="pipe-fwd"><span class="dc" style="height:84%"></span><span class="pf" style="height:16%"></span></div>
+          <div class="pipe-fwd"><span class="dc" style="height:88%"></span><span class="pf" style="height:12%"></span></div>
+          <div class="pipe-fwd"><span class="dc" style="height:80%"></span><span class="pf" style="height:20%"></span></div>
+          <div class="pipe-fwd"><span class="dc" style="height:86%"></span><span class="pf" style="height:14%"></span></div>
+          <div class="pipe-fwd"><span class="dc" style="height:82%"></span><span class="pf" style="height:18%"></span></div>
+          <div class="pipe-fwd"><span class="dc" style="height:90%"></span><span class="pf" style="height:10%"></span></div>
+          <div class="pipe-fwd"><span class="dc" style="height:83%"></span><span class="pf" style="height:17%"></span></div>
+          <div class="pipe-fwd"><span class="dc" style="height:87%"></span><span class="pf" style="height:13%"></span></div>
+          <div class="pipe-fwd"><span class="dc" style="height:81%"></span><span class="pf" style="height:19%"></span></div>
+          <div class="pipe-fwd"><span class="dc" style="height:85%"></span><span class="pf" style="height:15%"></span></div>
+        </div>
+      </div>
+    </div>
+    <div class="pipe-legend"><span><i class="pf"></i>prefill 行</span><span><i class="dc"></i>decode 行</span><span><i class="em"></i>空转 / 浪费</span></div>
+    <p>Upstream 把 prefill 和 decode 放在不同 forward:约 <b>47% 的轮次是只处理少量新 prompt 的小 prefill 轮</b>,decode 批在两次 admission 之间排空(填充均值 ~43/128,大量空转)。混批把 prefill 行和 decode 行<b>合进同一 forward</b>,batch 钉在满 128(均值 ~100),消掉浪费的小轮 → 短序列 +30~50%(本报告口径 +27~29%)。</p>
 
     <h3>2.2 最大 bs 的推导 <span class="sub">HBM 限制,2.5K 序列口径(512in/2048out);更长的 5.5K 见 §2.6</span></h3>
     <div class="tbl-wrap"><table>
