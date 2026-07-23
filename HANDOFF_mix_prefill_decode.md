@@ -84,7 +84,7 @@ MoeGatingTopK 2.7。
 
 **遗留给 upstream**:同款 kv_indices 切片 bug 潜伏在 mamba/swa/pure_swa/unified/cpp radix cache
 (dLLM 走不到);logits 裁剪(lm_head+argmax 15ms/86ms)因动 T2T 语义被否;W8A8/EP 不在本 worktree 范围。
-**复现器**:mass-abort 用 scratchpad 的 abort_repro.py(128 并发 + os._exit 硬断连)。
+**复现器**:mass-abort 用 scratch_profile/abort_repro.py(128 并发 + os._exit 硬断连)。
 
 **与并行 session(DP/EP,分支 dllm-npu-deepep-fix)的 bug 对账**:
 - 他们长跑撞到的 `pool memory leak detected` 与本轮修复(`aa99813ac9`)是同一 bug(触发源=测试间
