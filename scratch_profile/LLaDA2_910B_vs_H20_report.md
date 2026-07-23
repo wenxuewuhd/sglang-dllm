@@ -53,6 +53,17 @@
 - vector ≈ 1(rmsnorm/rope/softmax 无权重复用),带宽受限,H20 有利。
 - attention ≈ 128,由 dLLM block(32)× GQA 组(16Q/4KV=4)的 KV 复用决定(自回归 decode block=1 仅复用 4,AI≈4 带宽受限;dLLM 的 block 把 AI 抬到算力区)。AI=128 时 attention 在 H20 上算力受限、910B 上带宽受限,两者相当。
 
+**例:同一模型,blockwise dLLM vs 自回归(AR)的算术强度。** 差别只在每 forward 每请求处理的 token 数——AR decode = 1,blockwise dLLM = block(32),这把有权重复用的算子(dense/MoE)的 AI **×32**。
+
+| 算子(AI 公式) | AR bs=1 | AR bs=128 | dLLM bs=1 | dLLM bs=128 |
+|---|---|---|---|---|
+| dense/lm_head(= M 行数) | 1 | 128 | 32 | **4096** |
+| MoE GMM(= t) | 0.03 | 4 | 1 | **128** |
+| attention(= 复用次数) | 4 | 4 | 128 | 128 |
+| vector | ~1 | ~1 | ~1 | ~1 |
+
+贴回 ridge(910B 200 / H20 37):dense 进算力区(AI>200)AR 需 bs≥200、**dLLM 只需 bs≥7**;MoE 甜点(t≥512)AR 需 bs≥16384、**dLLM 只需 bs≥512**;attention 从 AR 的 AI=4(带宽受限、favors H20)抬到 dLLM 的 128。**AR 小 bs 全是带宽受限(favors H20);dLLM 靠 block 把算子推向算力受限(favors 910B)——这是 dLLM 本身就更适合算力强芯片的根因。**
+
 ### 1.3 MoE 在两颗芯片上的瓶颈
 
 | t (每专家 token) | 910B(ridge 200) | H20(ridge 37) |
