@@ -162,6 +162,30 @@
   .pipe-legend i.pf { background:#7b6cd6; } .pipe-legend i.dc { background:#2f9e8f; }
   .pipe-legend i.em { background: repeating-linear-gradient(45deg, var(--surface-2) 0 3px, transparent 3px 6px), var(--surface-2); border:1px solid var(--border); }
 
+  /* block-size arithmetic-intensity diagram */
+  .blockviz { display:grid; grid-template-columns:1fr 1fr; gap:1rem; margin:1.2rem 0 .3rem; }
+  .bv-panel { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:.9rem 1rem; }
+  .bv-title { font-size:.82rem; font-weight:650; margin-bottom:.7rem; }
+  .bv-row { display:grid; grid-template-columns:4rem 1fr 2.6rem; align-items:center; gap:.45rem; margin:.45rem 0; }
+  .bv-lbl { font-size:.76rem; font-family:var(--font-mono); color:var(--ink-soft); }
+  .bv-track { position:relative; height:20px; background:var(--surface-2); border-radius:3px; }
+  .bv-bar { height:100%; border-radius:3px; }
+  .bv-bar.bw { background:var(--h20); } .bv-bar.cp { background:var(--a910); } .bv-bar.neu { background:var(--accent-soft); }
+  .bv-ridge { position:absolute; top:-3px; bottom:-3px; border-left:2px dashed var(--accent); }
+  .bv-val { font-family:var(--font-mono); font-size:.74rem; font-weight:700; text-align:right; }
+  .bv-val.bwc { color:var(--h20); } .bv-val.cpc { color:var(--a910); } .bv-val.neuc { color:var(--accent); }
+  .bv-cap { font-size:.72rem; color:var(--ink-faint); margin-top:.55rem; }
+  @media (max-width:640px){ .blockviz { grid-template-columns:1fr; } }
+
+  /* block-width mapping (32 -> 256 token/block) */
+  .blockmap { display:grid; gap:.55rem; margin:1rem 0; }
+  .bm-row { display:grid; grid-template-columns:6.2rem 1fr; align-items:center; gap:.6rem; }
+  .bm-lbl { font-family:var(--font-mono); font-size:.78rem; color:var(--ink-soft); }
+  .bm-barwrap { display:flex; align-items:center; gap:.6rem; flex-wrap:wrap; }
+  .bm-bar { height:26px; background:var(--a910); border-radius:4px; display:flex; align-items:center; padding:0 .55rem; color:#fff; font-family:var(--font-mono); font-size:.74rem; font-weight:700; min-width:2rem; }
+  .bm-eff { font-size:.76rem; color:var(--ink-soft); }
+  .bm-eff b { color:var(--ink); }
+
   ul.clean { padding-left:1.1rem; margin:.7rem 0; }
   ul.clean li { margin:.3rem 0; }
   ul.clean li::marker { color: var(--accent-soft); }
@@ -534,6 +558,35 @@
       <li><b>② Blockwise MoE:压缩 block 内激活的专家数。</b> 一个 block 内的 token 语义相近,大概率路由到重叠的专家。把 block 的专家集合压到更少的 distinct 专家,可少读专家权重,直接降低 MoE 的权重带宽(30GB/forward 瓶颈)。参考:已有开源 dmoe。</li>
       <li><b>③ 全词表冗余裁剪。</b> 每去噪步对全 32 位置算 lm_head(10.3ms)+ 全词表归约(6ms),但后期步骤 still-masked 位置很少、大部分冗余。只对 still-masked 位置算可大幅减少。障碍:JointThreshold 的 T2T 语义读所有非 mask 位置的概率,需重新设计算法。收益上界大,工程量也大。</li>
     </ul>
+
+    <p style="margin-top:1.3rem;"><b>示例:从 32 token/block 映射到 256 token/block。</b> 每 forward 每请求处理的 block 变宽 8×,算力密集度随之上升:</p>
+    <div class="blockmap">
+      <div class="bm-row"><span class="bm-lbl">32 tok/block</span><div class="bm-barwrap"><div class="bm-bar" style="width:12.5%">32</div><span class="bm-eff">attention AI <b>128</b> · MoE 甜点需 bs <b>512</b></span></div></div>
+      <div class="bm-row"><span class="bm-lbl">256 tok/block</span><div class="bm-barwrap"><div class="bm-bar" style="width:100%">256 tokens</div></div></div>
+      <div class="bm-row"><span class="bm-lbl"></span><span class="bm-eff">attention AI <b>1024</b> · MoE 甜点需 bs <b>64</b></span></div>
+    </div>
+    <p>block 放大 8×(32→256)→ attention AI 也 ×8(128→1024,远超 910B ridge 200)、MoE 达到甜点所需的 bs ÷8(512→64)。<b>更少的请求就能喂饱算力。</b></p>
+
+    <p style="margin-top:1.5rem;"><b>把 block 从 32 一路扫到 256:</b></p>
+    <div class="blockviz">
+      <div class="bv-panel">
+        <div class="bv-title">① attention 算术强度 = block × GQA组(4)</div>
+        <div class="bv-row"><span class="bv-lbl">block 32</span><div class="bv-track"><div class="bv-ridge" style="left:19.5%"></div><div class="bv-bar bw" style="width:12.5%"></div></div><span class="bv-val bwc">128</span></div>
+        <div class="bv-row"><span class="bv-lbl">block 64</span><div class="bv-track"><div class="bv-ridge" style="left:19.5%"></div><div class="bv-bar cp" style="width:25%"></div></div><span class="bv-val cpc">256</span></div>
+        <div class="bv-row"><span class="bv-lbl">block 128</span><div class="bv-track"><div class="bv-ridge" style="left:19.5%"></div><div class="bv-bar cp" style="width:50%"></div></div><span class="bv-val cpc">512</span></div>
+        <div class="bv-row"><span class="bv-lbl">block 256</span><div class="bv-track"><div class="bv-ridge" style="left:19.5%"></div><div class="bv-bar cp" style="width:100%"></div></div><span class="bv-val cpc">1024</span></div>
+        <div class="bv-cap">虚线 = 910B ridge 200。32(带宽受限,青)→ 64/128/256 越过 ridge 进算力区(琥珀),256 时 AI 已 5× ridge。</div>
+      </div>
+      <div class="bv-panel">
+        <div class="bv-title">② 达到 MoE 甜点(t≥512)所需 bs</div>
+        <div class="bv-row"><span class="bv-lbl">block 32</span><div class="bv-track"><div class="bv-bar neu" style="width:100%"></div></div><span class="bv-val neuc">512</span></div>
+        <div class="bv-row"><span class="bv-lbl">block 64</span><div class="bv-track"><div class="bv-bar neu" style="width:50%"></div></div><span class="bv-val neuc">256</span></div>
+        <div class="bv-row"><span class="bv-lbl">block 128</span><div class="bv-track"><div class="bv-bar neu" style="width:25%"></div></div><span class="bv-val neuc">128</span></div>
+        <div class="bv-row"><span class="bv-lbl">block 256</span><div class="bv-track"><div class="bv-bar neu" style="width:12.5%"></div></div><span class="bv-val neuc">64</span></div>
+        <div class="bv-cap">MoE t = block×bs×8/256,甜点 t≥512 需 block×bs≥16384 → block 越大,所需 bs 越小。</div>
+      </div>
+    </div>
+    <p><b>结论:block 做大能用更小的 bs 达到更高的算力密集度。</b> attention 的 AI 随 block 线性上升(block=256 时 AI=1024,5× 于 910B ridge 200);MoE 达到甜点所需的 bs 随 block 反比下降(block=256 时单卡 bs=64 就够,更不用堆 EP)。两条都把 workload 推向 910B 的算力强项。</p>
 
     <h3>4.2 attention FIA 效率(长序列)</h3>
     <p>910B FIA 只跑 24% MFU,seq4096 时 attention 占整步 33%(短序列 7%,不重要)。24% 是实现低效而非带宽限制:attention AI=128 &lt; ridge 200 属带宽受限,MFU 上限本就是 ~40-64%,但 FIA 连这个都没达到(load pipe 和算力 pipe 都不饱和)。根因是 online-softmax 把 QK→softmax→AV 串成依赖链、cube/vector 交替互等产生气泡,而 NPU 不能靠多流重叠。靠核内融合可回收到 ~40-50%。</p>
