@@ -17,5 +17,5 @@ exec python -m sglang.launch_server \
   --model-path "$MODEL" --trust-remote-code \
   --dllm-algorithm JointThreshold --dllm-fdfo \
   --mem-fraction-static 0.78 --max-running-requests 72 \
-  --cuda-graph-config '{"decode":{"backend":"full","max_bs":72,"bs":[1,2,4,8,16,32,48,64,72]}}' \
+  --cuda-graph-config '{"decode":{"backend":"full","max_bs":72,"bs":[1,8,16,32,48,56,64,72]}}' \
   --port "$PORT"
