@@ -21,16 +21,21 @@ def post(url, payload, timeout=1200):
         return r.read()
 
 
-# deterministic varied 4096-token prompt (content irrelevant for kernel cost)
-INPUT_IDS = [((i * 131 + 17) % 60000) + 1 for i in range(4096)]
+# Per-request DISTINCT 4096-token prompt. Using one shared prompt for every
+# concurrent request makes all requests route to the same MoE experts in
+# lockstep -> artificially concentrated routing -> MoE GroupedMatmul reads far
+# fewer than 256 experts and is unrepresentatively fast. A per-request seed
+# gives diverse routing that matches a real mixed-prompt bench.
+def make_input_ids(seed):
+    return [((i * 131 + 17 + seed * 7919) % 60000) + 1 for i in range(4096)]
 
 
-def gen(host):
+def gen(host, seed):
     try:
         post(
             f"{host}/generate",
             {
-                "input_ids": INPUT_IDS,
+                "input_ids": make_input_ids(seed),
                 "sampling_params": {"temperature": 0, "max_new_tokens": 1536},
             },
         )
@@ -50,11 +55,13 @@ def main():
     post(f"{host}/flush_cache", {})
     stop = threading.Event()
     ex = cf.ThreadPoolExecutor(max_workers=args.conc * 3)
+    seq = [0]
 
     def feed():
         while not stop.is_set():
             for _ in range(args.conc):
-                ex.submit(gen, host)
+                ex.submit(gen, host, seq[0])
+                seq[0] += 1
             time.sleep(20)  # long reqs (1536 out) stay in flight a while
 
     threading.Thread(target=feed, daemon=True).start()
