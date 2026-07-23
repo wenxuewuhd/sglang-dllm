@@ -12,7 +12,7 @@
 
 ## 结论
 
-1. 大 batch + 短到中等序列下 910B 略优于 H20:512in/2048out 输出吞吐 2591 vs 2364(+10%),短序列 gsm8k +7%(3667 vs 3412)。但更长输入(4K in/1.5K out)H20 反超 ~1.4×(910B 受 64GB 显存限制只能到 bs≈72,低 bs + prefill 成本对 910B 不利)。
+1. 大 batch + 短到中等序列下 910B 略优于 H20:512in/2048out 输出吞吐 2591 vs 2364(+10%),短序列 gsm8k +7%(3667 vs 3412)。但更长输入(4K in/1.5K out)H20 反超 ~1.4×(910B 受 64GB 显存限制只能到 bs≈72,低 bs 下 MoE 更带宽受限;完整机理待 profiling)。
 2. 小 batch 下 910B 明显落后:bs=1 时 910B 约为 H20 的 0.5×(312 vs 592),bs=8 约 0.4×。
 3. EP(专家并行)通信代价过大,当前不划算:128 blocks/卡 实测 a2a 12.2ms/层,节点吞吐只有 4 张独立单卡的 1/4.6。
 
@@ -102,7 +102,7 @@ CV 融合(多流 cube∥vector 重叠)在 NPU 不可行(实测证伪):910B3 在 
 
 ### 2.2 最大 bs 的推导(HBM 限制)
 
-显存分解(64GB,长序列 512in/2048out 口径):
+显存分解(64GB,2.5K 序列口径,512in/2048out;更长的 5.5K 见 §2.5):
 
 | 部分 | 大小 | 随 bs 变化 |
 |---|---|---|
@@ -110,7 +110,7 @@ CV 融合(多流 cube∥vector 重叠)在 NPU 不可行(实测证伪):910B3 在 
 | CANN/驱动 overhead | 8.8 GB | 固定 |
 | 固定合计 | 39.1 GB | — |
 | decode graph(密桶 max_bs=128) | 9.76 GB | 随 max_bs 涨(160 桶要 12.21GB) |
-| KV 池预留 | (prompt+max_new)×40 KiB/req = 长序列 ~100 MB/req | ∝ bs |
+| KV 池预留 | (prompt+max_new)×40 KiB/req = 2.5K 序列 ~100 MB/req | ∝ bs |
 | activation | ~25 MB/req【实测】 | ∝ bs |
 
 每长请求边际成本 = KV 100MB + activation 25MB = ~125 MB/req。
@@ -121,11 +121,11 @@ bs_max = (64 GB × 可用率 − 权重 − overhead − graph) / (KV_per_req + 
 
 【910B 实测】的边界:
 
-- eager(无 graph):长序列 max bs ≈ 200(HBM 峰值 63.9GB,不 OOM),与理论 199 吻合。
-- graph max_bs=128(密桶):graph 9.76GB,长序列 max bs ≈ 150。
-- graph max_bs=160:graph 涨到 12.21GB,启动后运行时只剩 1.07GB,满负载长序列贴边 63.0GB 并触发 retract,吞吐 2185 ≈ bs=128 的 2130,无收益。
+- eager(无 graph):2.5K 序列 max bs ≈ 200(HBM 峰值 63.9GB,不 OOM),与理论 199 吻合。
+- graph max_bs=128(密桶):graph 9.76GB,2.5K 序列 max bs ≈ 150。
+- graph max_bs=160:graph 涨到 12.21GB,启动后运行时只剩 1.07GB,满负载 2.5K 序列贴边 63.0GB 并触发 retract,吞吐 2185 ≈ bs=128 的 2130,无收益。
 
-单卡长序列 bs 天花板约 160,但打大 batch 无收益:(a) graph 成本 ∝ max_bs 吃掉批头寸,(b) MoE 在 t=160 仍带宽受限(甜点需 t≥512,单卡达不到),attention/vector 随 bs 线性增长抵消。推荐单卡配置 = bs=128 + 密桶 graph + FDFO + 混批 + mem-fraction 0.75,不贴边、无 retract。
+单卡 2.5K 序列 bs 天花板约 160,但打大 batch 无收益:(a) graph 成本 ∝ max_bs 吃掉批头寸,(b) MoE 在 t=160 仍带宽受限(甜点需 t≥512,单卡达不到),attention/vector 随 bs 线性增长抵消。推荐单卡配置 = bs=128 + 密桶 graph + FDFO + 混批 + mem-fraction 0.75,不贴边、无 retract。
 
 ### 2.3 bs=128 逐类对比
 
@@ -186,7 +186,7 @@ bs_max = (64 GB × 可用率 − 权重 − overhead − graph) / (KV_per_req + 
 
 长序列 TPOT 接近相等(而非 910B 更快),原因有两点:(1) attention 的 AI=128 两者相当(§1.3),它占比上升只是把一个相当的组件放大,稀释了 910B 在 dense 上的短序列优势;(2) 910B FIA 只跑 24% MFU(实现受限,§4.2),长上下文 attention 略弱于 H20,抵消了 dense 优势,稳态每 token 相当(47 vs 46,910B 微慢 1ms)。
 
-因此 910B 的长序列吞吐优势来自调度而非每 token 算力:FDFO+混批把排队长尾压低(TTFT 3.8 vs 11.1s、P99 E2E 150 vs 371s),整批完成更快(397 vs 435s)。若把 FIA 修到 50% MFU(§4.2),长序列每 token 也会从相当转为 910B 领先。
+若把 FIA 修到 50% MFU(§4.2),长序列每 token 也会从相当转为 910B 领先。
 
 ### 2.5 更长序列(4K in / 1.5K out)
 
@@ -199,8 +199,8 @@ bs_max = (64 GB × 可用率 − 权重 − overhead − graph) / (KV_per_req + 
 | H20 | 72 | 是 | 1476 | 5452 | 40.7 ms | 8700 ms |
 | 910B | 72 | 是 | 1058 | 3909 | 48.1 ms | 17000 ms |
 
-- 同 bs=72 下 **H20 快 1.40×**(输出吞吐 1476 vs 1058,总吞吐 5452 vs 3909),每 token 也快 1.18×(TPOT 40.7 vs 48.1)。**与 512in/2048out(910B +10%)相反,crossover 同时取决于 bs 和上下文长度**——短到中等序列 910B 赢,长上下文(4K+)H20 赢。
-- **机理未用 4K 的逐算子 profiling 坐实**:decode attention 的 AI=128 与上下文长度无关(§1.2),两颗芯片随上下文线性同速增长、比值 ~平,所以 **decode attention 不是主因**。更可能是两条:(a) **910B 被 64GB 显存逼到 bs=72**,而低 bs 下 MoE 的 t 更小、更深地带宽受限,丢掉了 bs=128 时的 MoE 平局;(b) **长 prompt 的 prefill 成本**——910B TTFT 17s vs H20 8.7s(2×)。精确拆分待 4K/1.5K 的逐算子 profiling。
+- 同 bs=72 下 **H20 快 1.40×**(输出吞吐 1476 vs 1058,总吞吐 5452 vs 3909),每 token 也快 1.18×(TPOT 40.7 vs 48.1)。与 512in/2048out(910B +10%)相反。
+- **机理待 4K/1.5K 的逐算子 profiling 确定。** 一个已知因素:910B 被 64GB 显存逼到 bs=72(H20 可跑 128),而低 bs 本身对 910B 不利——MoE 的 t 更小、更深地带宽受限,910B 丢掉了 bs=128 时的 MoE 平局。是否还叠加序列长度的影响,待 profiling 再判断。
 - **显存也是 H20 的优势**:910B 64GB 在 4K/1.5K 只能到 bs≈72,H20 96GB 可到 128,吞吐再高一档(1593 vs 1476)。
 - **长输入下混批对 H20 也大幅有效**:H20 bs=128 不开混批 1024 → 开混批 1593 tok/s(+56%)。混批收益随 prompt 长度增长(4K prompt 的 prefill 昂贵,混批把它折进 decode),与短 prompt(gsm8k)下混批对 H20 几乎无效不矛盾。
 
@@ -365,6 +365,6 @@ NPU 的优化方向(第二章方法论):减 kernel 数 + 减冗余内存遍历�
 | 大 bs(单卡) | bs 天花板约 160,但无吞吐收益(MoE 仍带宽受限 + graph/KV 吃显存)。推荐 bs=128。 |
 | 大 bs + EP | MoE 进甜点(85-88%),但 a2a 让节点吞吐降到 1/4.6,128blk 净亏。EP 目前只值得为显存用。 |
 | 后续方向 | 算法层(§4.1):① block 做大(attention+MoE 同进算力区、单卡进甜点、免 a2a)② blockwise MoE(压 block 内专家、降 MoE 带宽)③ 全词表裁剪。 |
-| 对 H20 的判断 | 小 batch H20 领先(bs=1 1.9×);大 batch + 短到中等序列 910B 超过(gsm8k +7%、512/2048 +10%);但长上下文(4K/1.5K)H20 反超 1.4×(910B 受 64GB 显存限制只能到 bs≈72,低 bs + prefill 成本对 910B 不利;精确归因待 4K profiling)。crossover 同时取决于 bs 和上下文长度。 |
+| 对 H20 的判断 | 小 batch H20 领先(bs=1 1.9×);大 batch + 短到中等序列 910B 超过(gsm8k +7%、512/2048 +10%);但 4K in/1.5K out 时 H20 反超 1.4×(910B 受 64GB 显存限制只能到 bs≈72,低 bs 下 MoE t 更小对 910B 不利;精确归因待 4K profiling)。 |
 
 待刷新:H20 列的 kernel 构成 / 单 kernel 时间来自 H20 硬件 trace,但该次 capture 非饱和,绝对 per-forward 标度待用饱和数据复核。
