@@ -33,6 +33,13 @@ pattern nor the length distribution. Optimizing the gather won't help; the win
 is in the QK->softmax->AV pipelining. Standalone ~1092 us vs ~1232 us in-model
 (the extra ~140 us is contention with the rest of the forward + slightly
 deeper context at the profiled sample).
+
+--page-size sweep (block_size passed to the op; sglang uses 32):
+  32 : 1088 us  36%     64 : 970 us  40%     128: 970 us  40%
+  256:  967 us  41%     512: 961 us  41%
+block_size=32 is below the op's documented 128-512 range and costs ~11%; >=128
+plateaus at ~40% of roofline. So the page size is a real but minor lever -- the
+remaining ~60% gap is the thin-Q_S (32-row) PromptFlash tiling + online-softmax.
 """
 
 import argparse
@@ -47,8 +54,9 @@ import torch_npu  # noqa: F401  (registers torch.ops.npu.*)
 Q_HEADS = 16  # num_attention_heads
 KV_HEADS = 4  # num_key_value_heads  (GQA 4:1)
 HEAD_DIM = 128  # head_dim
-PAGE_SIZE = 32  # page_size / dllm_block_size
 Q_BLOCK = 32  # dLLM decode block: 32 query tokens per request per forward
+# KV page/block size. sglang uses 32 (== dllm_block_size), but the op doc says
+# block_size must be 128-512 in steps of 128 -> --page-size sweeps this.
 DTYPE = torch.bfloat16
 SPEC_BW = 1.6e12  # 910B3 HBM bandwidth (bytes/s)
 SPEC_TFLOPS = 320e12  # 910B3 bf16
@@ -96,11 +104,19 @@ def main():
         help="assign contiguous physical pages per request "
         "(best-case gather); default scatters pages like a real pool",
     )
+    ap.add_argument(
+        "--page-size",
+        type=int,
+        default=32,
+        help="KV page/block_size passed to the op (sglang=32; "
+        "doc says 128-512 in steps of 128)",
+    )
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=20)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
+    PAGE_SIZE = args.page_size
     dev = "npu"
     bs = args.bs
     uniform = args.uniform_ctx > 0
