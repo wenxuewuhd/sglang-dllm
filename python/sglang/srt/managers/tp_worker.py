@@ -472,7 +472,7 @@ class TpModelWorker(BaseTpWorker):
         from sglang.srt.dllm.step_timing import DllmStepTimer
 
         return DllmStepTimer(
-            device=self.device,
+            device=self.server_args.device,
             interval=envs.SGLANG_DEBUG_DLLM_STEP_TIMING_INTERVAL.get(),
         )
 
