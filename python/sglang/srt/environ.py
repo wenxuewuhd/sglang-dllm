@@ -245,6 +245,13 @@ class Envs:
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
+    # Per-step dLLM device/host timing. Logs mean device (model-forward, from
+    # device events) and host (scheduling + result processing = step wall-clock
+    # minus device) us/step every N steps. Lightweight (two events + perf_counter,
+    # no per-op hooks) so it does not perturb host timing the way a full profiler
+    # does. N = SGLANG_DEBUG_DLLM_STEP_TIMING_INTERVAL.
+    SGLANG_DEBUG_DLLM_STEP_TIMING = EnvBool(False)
+    SGLANG_DEBUG_DLLM_STEP_TIMING_INTERVAL = EnvInt(50)
 
     # IPC
     SGLANG_USE_PICKLE_IPC = EnvBool(True)
@@ -427,6 +434,13 @@ class Envs:
     # the trade-off is up to N-1 rounds of extra emission latency and a few
     # frozen rows re-forwarded per round.
     SGLANG_DLLM_FDFO_STEPS_PER_ROUND = EnvInt(1)
+    # dLLM steady-state throughput probe. When on, the algorithm logs, every
+    # SGLANG_DLLM_PROBE_WINDOW scheduler rounds, the three levers that fully
+    # determine throughput -- wall/forward, steps/block, effective bs -- so a
+    # per-forward device speedup that doesn't reach throughput can be attributed
+    # to denoise-step count or batch fill. Device-agnostic; off in production.
+    SGLANG_DLLM_PROBE = EnvBool(False)
+    SGLANG_DLLM_PROBE_WINDOW = EnvInt(100)
     # For non-streaming requests, the scheduler still flushes intermediate
     # output batches to the tokenizer manager every N decoded tokens so that
     # `first_token_time`/TTFT can be recorded. Lower this (e.g. to 1) to get
