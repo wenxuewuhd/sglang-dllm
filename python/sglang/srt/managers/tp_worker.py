@@ -474,6 +474,7 @@ class TpModelWorker(BaseTpWorker):
         return DllmStepTimer(
             device=self.server_args.device,
             interval=envs.SGLANG_DEBUG_DLLM_STEP_TIMING_INTERVAL.get(),
+            fwd_counter=lambda: self.dllm_algorithm._n_fwd,
         )
 
     @property

@@ -31,13 +31,19 @@ class DllmStepTimer:
     before the events are read) — no extra device synchronize on the hot path.
     """
 
-    def __init__(self, device: str, interval: int):
+    def __init__(self, device: str, interval: int, fwd_counter=None):
         self._module = torch.get_device_module(device)
         self._interval = max(1, interval)
+        # Monotonic total-model-forwards getter: one scheduler step runs
+        # fdfo_steps_per_round model forwards, so per-step device time must be
+        # divided by this to compare with a per-forward kernel trace.
+        self._fwd_counter = fwd_counter
         self._prev_start = None
         self._prev_end = None
         self._prev_t0 = None
+        self._prev_n_fwd = 0
         self._n = 0
+        self._fwd = 0
         self._dev_us = 0.0
         self._host_us = 0.0
 
@@ -46,15 +52,17 @@ class DllmStepTimer:
         start = self._module.Event(enable_timing=True)
         end = self._module.Event(enable_timing=True)
         t0 = time.perf_counter()
+        n_fwd = self._fwd_counter() if self._fwd_counter is not None else 0
         start.record()
         try:
             yield
         finally:
             end.record()
-            self._account(t0)
+            self._account(t0, n_fwd)
             self._prev_start, self._prev_end, self._prev_t0 = start, end, t0
+            self._prev_n_fwd = n_fwd
 
-    def _account(self, t0: float):
+    def _account(self, t0: float, n_fwd: int):
         if self._prev_start is None:
             return  # first step: no complete previous events yet
         dev_us = self._prev_start.elapsed_time(self._prev_end) * 1e3  # ms -> us
@@ -62,6 +70,7 @@ class DllmStepTimer:
         host_us = max(0.0, wall_us - dev_us)
         self._dev_us += dev_us
         self._host_us += host_us
+        self._fwd += max(0, n_fwd - self._prev_n_fwd)
         self._n += 1
         if self._n >= self._interval:
             self._flush()
@@ -69,15 +78,22 @@ class DllmStepTimer:
     def _flush(self):
         dev = self._dev_us / self._n
         host = self._host_us / self._n
+        step = dev + host
+        fps = self._fwd / self._n  # model forwards per scheduler step
+        per_fwd = (
+            f"  device/fwd {dev / fps / 1e3:.2f} ms ({fps:.1f} fwd/step)" if fps else ""
+        )
         logger.info(
             "[dllm-step-timing] over %d steps: device %.2f ms  host %.2f ms  "
-            "step %.2f ms  (host share %.0f%%)",
+            "step %.2f ms  (host share %.0f%%)%s",
             self._n,
             dev / 1e3,
             host / 1e3,
-            (dev + host) / 1e3,
-            host / (dev + host) * 100 if (dev + host) > 0 else 0,
+            step / 1e3,
+            host / step * 100 if step > 0 else 0,
+            per_fwd,
         )
         self._n = 0
+        self._fwd = 0
         self._dev_us = 0.0
         self._host_us = 0.0
