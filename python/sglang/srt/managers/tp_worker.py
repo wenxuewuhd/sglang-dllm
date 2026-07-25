@@ -23,7 +23,6 @@ import torch
 
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -464,20 +463,6 @@ class TpModelWorker(BaseTpWorker):
             self.dllm_algorithm = DllmAlgorithm.from_server_args(self.server_args)
         else:
             self.dllm_algorithm = None
-        self.dllm_step_timer = self._maybe_init_dllm_step_timer()
-
-    def _maybe_init_dllm_step_timer(self):
-        if self.dllm_algorithm is None or not envs.SGLANG_DEBUG_DLLM_STEP_TIMING.get():
-            return None
-        from sglang.srt.dllm.step_timing import DllmStepTimer
-
-        return DllmStepTimer(
-            device=self.server_args.device,
-            interval=envs.SGLANG_DEBUG_DLLM_STEP_TIMING_INTERVAL.get(),
-            # ModelRunner.forward bumps this once per model forward; a dLLM
-            # scheduler step runs several. Core field, present on every backend.
-            fwd_counter=lambda: self.model_runner.forward_pass_id,
-        )
 
     @property
     def model_runner(self) -> ModelRunner:
@@ -573,10 +558,7 @@ class TpModelWorker(BaseTpWorker):
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         if self.is_dllm():
-            if self.dllm_step_timer is None:
-                return self._forward_batch_generation_dllm(forward_batch, batch)
-            with self.dllm_step_timer.measure():
-                return self._forward_batch_generation_dllm(forward_batch, batch)
+            return self._forward_batch_generation_dllm(forward_batch, batch)
 
         if self.pp_group.is_last_rank:
             out = self.model_runner.forward(
