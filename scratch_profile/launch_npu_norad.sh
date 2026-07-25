@@ -22,9 +22,7 @@ export PYTHONPATH=$REPO/python:${PYTHONPATH:-}
 export ASCEND_RT_VISIBLE_DEVICES=$DEV
 export SGLANG_ENABLE_DLLM_MIXED_BATCH=1
 export SGLANG_DLLM_FDFO_STEPS_PER_ROUND=2
-export SGLANG_DEBUG_DLLM_STEP_TIMING=1
-export SGLANG_DEBUG_DLLM_STEP_TIMING_INTERVAL=${TIMING_INTERVAL:-50}
 
-echo "NPU DEV=$DEV PORT=$PORT MRR=$MRR (no-radix + step timing)"
+echo "NPU DEV=$DEV PORT=$PORT MRR=$MRR (no-radix)"
 
 exec python -m sglang.launch_server --model-path "$MODEL" --trust-remote-code --attention-backend ascend --dllm-algorithm JointThreshold --dllm-fdfo --mem-fraction-static 0.78 --max-running-requests "$MRR" --disable-radix-cache --cuda-graph-config '{"decode":{"backend":"full","max_bs":72,"bs":[1,8,16,32,48,56,64,72]}}' --port "$PORT"
