@@ -474,7 +474,9 @@ class TpModelWorker(BaseTpWorker):
         return DllmStepTimer(
             device=self.server_args.device,
             interval=envs.SGLANG_DEBUG_DLLM_STEP_TIMING_INTERVAL.get(),
-            fwd_counter=lambda: self.dllm_algorithm._n_fwd,
+            # ModelRunner.forward bumps this once per model forward; a dLLM
+            # scheduler step runs several. Core field, present on every backend.
+            fwd_counter=lambda: self.model_runner.forward_pass_id,
         )
 
     @property
