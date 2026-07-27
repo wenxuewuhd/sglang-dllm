@@ -225,14 +225,47 @@ caveat:910B 两版是否串行跑待确认(端口 31600/31500);H20 的 1476 是�
 
 - (H20 bs=128 无需再抓 trace,吞吐已在上表对照。)
 
+## 3h. 【已解】那 11% 丢在哪:每 step ~37ms 裸露 host,不是 kernel launch 串行度
+
+**方法**(2026-07-27,radix off + K=1,复现命令同 handoff):bench_serving random 4096/1536 seed 42、400 prompts、conc 72;稳态窗口内 py-spy 40s @250Hz nonblocking 采 scheduler(9625 样,误差 1.5%);**round 速率直接数 server log**(`Prefill batch, #new-seq: 72` 每 round 一行):41s 内 351 round → **8.56 round/s → step = 116.8 ms**。本轮 bench 1.21 req/s / 1854 tok/s(400 prompts 含收尾拖尾,conc 均值 63.2;与 §3g 的 1152-prompt 1.30/2004 一致)。
+
+### step 的 116.8 ms 解剖(py-spy 分段 × step 时长)
+
+| 段 | ms/step | 说明 |
+|---|---|---|
+| **等 forward**(阻塞在 `joint_threshold.py:217` 的 H2D copy,stream-ordered,吸收全部等待) | **78.3** | ≈ kernel-sum 76.37 → **graph 内 kernel 空隙仅 ~2-4ms,"NPU launch 串行度"假设排除** |
+| **裸露 host(device 空转)** | **~37** | 占 step **31%**,如下拆分 |
+| ├ `get_next_batch_to_run`(每 round 重建 ScheduleBatch:`_create_dllm_batch` + `prepare_for_extend` + `_alloc_extend_loc_with_kv_reuse` 各处 Python) | 18.1 | 最大单项 |
+| ├ forward 发射:torch_npu graph task update(`replay_with_input_update` **每次 replay 现场 spawn+join 一个线程**跑 `graph.update`;`update_capture_record` 在 helper 线程里 ~7ms Python) | 9.5 | `npu_cudagraph_backend.py:141-172` |
+| ├ 去噪状态 gather/scatter(`_step_vectorized_fdfo`:每 round 把 72 个 per-req dict stack/tensor 上卡、`tolist` 回来、Python 循环写回) | 5.1 | gather 不依赖 forward 输出,却排在 forward 后 |
+| ├ `process_batch_result_dllm`(72-req 循环;`base.py:237` 对全批 [72,32] `input_ids.tolist()`,但只有 done 行需要) | 2.8 | |
+| └ 其余(run_batch 胶水、event loop) | ~3 | |
+
+旁证:scheduler 进程 CPU 157%(主线程 ~90% busy + graph-update 线程);npu-smi AICore 计数器均值 86% 不可信(真实 device busy ≈ 8.56×76.37/1000 = 65-68%),**round 速率 × kernel-sum 的算术才是准的**。
+
+### 与 H20 对账(推算,H20 未直接 py-spy)
+
+H20 同负载 tok/round 相同 → round/s = 8.56×(2032/1854) = 9.38 → step ≈ 106.6 ms,kernel-sum 85.88 → **H20 裸露 host ≈ 21 ms/step**。对比:**910B 37ms vs H20 21ms,同一份 Python 910B 付 1.8×**(ARM 单核弱于 x86 + 全部 torch 调用过 `transfer_to_npu` decorated 包一层 + graph task update 线程机制是 NPU 独有)。§3d 旧账自洽:K=2 时裸露 host 21ms/step 摊 2 个 forward,K=1 后重建/发射每 forward 都付。
+
+### 判据落定 + 兑现空间
+
+**host 差得多 → 那 11% 在调度侧,可兑现。** 若把 37ms 压到 H20 的 21ms,step 116.8→100.8,round/s +16%(1.21→1.40 req/s 量级,反超 H20 bs=72)。优化排序(按 ms 和侵入度):
+
+1. **round 间增量复用 ScheduleBatch(18.1ms)**:每 round 只有 ~7/72 行换新 block(1854 tok/s ÷ 32 tok/block ÷ 8.56 round/s ≈ 6.8 行/round),其余行的 alloc/fill_ids/metadata 原样重建了 72 遍。
+2. **graph update 瘦身(9.5ms)**:done 行以外 seq_lens 不变 → 可跳过/稀疏 update;线程改常驻 worker 或直接同步做(spawn+join 每 step 一次)。
+3. **去噪状态常驻批式 device 张量(5.1ms)**:FDFO state 按 slot 常驻,round 间免 gather/scatter;最少也应把 216-224 的 gather 挪到 forward 发射前(不依赖 logits),别让阻塞 H2D 在 forward 后才排队。
+4. **`base.py:237` 只取 done 行的 tokens(~1-2ms)**:全批 tolist → 按 done gather。
+
 ## 4. 待办
 
 已完成:
 - [x] H20 同 config 抓一版 → §3g(两边 radix off + K=1 + `with_stack=False`,各 4 forwards)。
 - [x] 两边逐类 ms/forward 对齐 → §3g。**1.4× 已证伪:软件开销(radix + K=2),不是硬件。**
 
+已完成(续):
+- [x] **查 910B 那 11% kernel 优势为何没转成吞吐** → §3h。每 step ~37ms 裸露 host(batch 重建 18 + graph update 9.5 + 去噪 gather/scatter 5 + 结果处理 3),不是 kernel launch 串行度(graph 内空隙 ~2-4ms)。
+
 待做:
-- [ ] **查 910B 那 11% kernel 优势为何没转成吞吐**(当前最大未解项)。方向:host 剩余开销 + kernel launch 串行度。radix 已砍,需重新量 host——注意打点探针已删除(见 memory `dllm-step-timing-probe-howto` 如何加回),或用 py-spy 采样 scheduler。
 - [ ] 复核 MoE GMM 913us vs 早前 643us 的差异(路由分散度?频率?),确认哪个是真值。
 - [ ] H20 bs=128 trace(若抓)→ 验证 t/expert 72→128 是否让 MoE 进算力区。
 - [ ] **定稿后写回正式报告**(`LLaDA2_910B_vs_H20_report.md`,目前未改动):

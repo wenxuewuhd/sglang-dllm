@@ -1,4 +1,12 @@
-# Handoff:定位 910B 剩余的 host 开销
+# Handoff:定位 910B 剩余的 host 开销【已解,见 WORKING §3h】
+
+> **2026-07-27 已回答**:step 116.8ms 里 ~37ms(31%)是裸露 host(device 空转)——
+> batch 每 round 全量重建 18.1ms + torch_npu graph task update(每 replay spawn+join 线程)9.5ms
+> + 去噪状态 gather/scatter 5.1ms + 结果处理 ~3ms。等 forward 的 78.3ms ≈ kernel-sum 76.37ms →
+> **graph 内空隙仅 2-4ms,"kernel launch 串行度"假设排除**。H20 推算裸露 host ~21ms →
+> 910B 付 1.8×(ARM CPU + transfer_to_npu 包装 + graph update 线程机制)。
+> **判据落定:差在调度侧,可兑现**;压到 21ms ≈ +16% round/s。优化排序见 §3h。
+> 下面原文保留作背景。
 
 ## 要回答的问题
 
