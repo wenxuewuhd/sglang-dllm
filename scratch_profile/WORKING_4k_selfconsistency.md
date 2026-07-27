@@ -8,34 +8,38 @@
   - 命令:`--max-running-requests 72` + graph `max_bs=72` bs=`[1,8,16,32,48,56,64,72]` + `mem-fraction 0.78` + `SGLANG_ENABLE_DLLM_MIXED_BATCH=1` + `SGLANG_DLLM_FDFO_STEPS_PER_ROUND=2` + `SGLANG_NPU_PROFILER_LEVEL2=1`,attention-backend ascend。
   - capture:`capture_4k.py --conc 100 --steps 6 --warmup 150`,**每请求不同 prompt**。
   - 采样点:token usage 0.70 → Σ KV ≈ 305K tok ≈ 4.2K/req,12 个 forward 稳在 74–75 ms/forward。
-- **踩坑记录(务必保留):`capture_4k.py` 原来给所有并发请求发同一条 prompt。当 `--conc == MRR`(=72)时,72 个请求同时起跑、锁步在同一去噪相位 → top-8 路由几乎相同 → MoE grouped-matmul 只碰 ~142/256 专家 → GMM 被人为压快到 329us(表观 3.3 TB/s,超规格=物理不可能,是采样假象)。**修复:每请求不同 prompt(已提交 `51b95ac9b2`)。** 之后 MoE 回到读满 256 的全量带宽读。
-  - 旁证:`--conc 100`(队列错峰)即使同 prompt 也回到 653us;根因是 conc==MRR 的锁步,diverse prompt 是更稳的修法。
+- **踩坑记录(务必保留):`capture_4k.py` 原来给所有并发请求发同一条 prompt。当 `--conc == MRR`(=72)时,72 个请求同时起跑、锁步在同一去噪相位 → top-8 路由几乎相同 → MoE grouped-matmul 只碰 ~142/256 专家(EDR 实测)→ GMM 被人为压快到 329us(表观 3.3 TB/s,超规格=物理不可能,是采样假象)。**修复:每请求不同 prompt(已提交 `51b95ac9b2`)。**
+  - ⚠ **但"合成 diverse prompt"仍不够**:算术序列生成的 token 模式路由仍偏集中(757us ≈ ~211/256 专家)。**只有真实语料(ShareGPT)才读满 256(913us,1.17 TB/s)**。完整反推见 §3g 末。
+  - **→ 唯一可用于 MoE 归因的数据集是 `profiles/prof_npu_norad_bench/`(真实 ShareGPT)。** `prof_910b_4k_bs72_diverse`(合成)和更早的同 prompt 版本 MoE 数偏快,不可用于 roofline。
 
 ## 1. 逐算子自洽性(vs 910B3 规格 320 TFLOPS / 1.6 TB/s)
 
-per forward,bs=72,ctx≈4.2K,总 ~75 ms:
+数据源 **`profiles/prof_npu_norad_bench/`(真实 ShareGPT,radix off,K=1,4 forwards)**——唯一 MoE 读满 256 专家的一版。per forward,bs=72,ctx≈3.9K,总 **76.37 ms**:
 
 | 类别 | 实测 ms/fwd | 占比 | AI | 屋顶类型 | roofline 下限 ms/fwd | 效率(下限/实测) | 自洽? |
 |---|---|---|---|---|---|---|---|
-| attention (FIA) | 24.64 | 32.8% | 128 | 带宽(12.5 GB / 1.6 TB/s) | **7.80** | **32%** | ❌ 不自洽 |
-| MoE GMM | 21.99 | 29.3% | 72 | 带宽(30.6 GB / 1.6 TB/s) | **19.13** | **87%** | ✅ 自洽 |
-| dense matmul | 12.67 | 16.9% | ≫ridge | 算力(2.49 TFLOP / 320T) | **7.80** | 62%¹ | ✅ 自洽 |
-| MoE glue(路由) | 6.46 | 8.6% | — | vector/scalar | — | — | — |
-| 去噪+vector 杂项 | 4.89 | 6.5% | — | vector | — | — | — |
-| norm/rope | 4.39 | 5.8% | — | vector | — | — | — |
+| MoE GMM | 24.93 | 32.6% | 72 | 带宽(30.6 GB / 1.6 TB/s) | **19.13** | **77%** | ✅ 自洽 |
+| attention (FIA) | 22.67 | 29.7% | 128 | 带宽(11.5 GB / 1.6 TB/s) | **7.17** | **32%** | ❌ 不自洽 |
+| dense matmul | 12.70 | 16.6% | ≫ridge | 算力(2.49 TFLOP / 320T) | **7.80** | 61%¹ | ✅ 自洽 |
+| MoE glue(路由) | 6.44 | 8.4% | — | vector/scalar | — | — | — |
+| 去噪+vector 杂项 | 5.28 | 6.9% | — | vector | — | — | — |
+| norm/rope | 4.36 | 5.7% | — | vector | — | — | — |
 
-¹ dense 下限只算了 LM head + QKV/O + router,漏了 shared-expert 等,真实 FLOP 更高、MFU 比 62% 更好(LM head 单核 82%,mac=0.91)。dense 实际更贴屋顶。
+¹ dense 下限只算了 LM head + QKV/O + router,漏了 shared-expert 等,真实 FLOP 更高、MFU 比 61% 更好(LM head 单核 82%,mac=0.91)。dense 实际更贴屋顶。
 
 ### 逐条
 
-- **MoE GMM —— 干净自洽,正是 §1.2 预测。** AI = t/expert = 72 < ridge 200 → 带宽受限,读满 256 专家(30.6 GB/forward)。下限 19.1 ms,实测 22.0 ms = 规格带宽的 **87%**(有效 1.39 TB/s),mte2=0.94 载入饱和、mac=0.42 算力闲。硬地板:除非把 t/expert 推过 200(EP / 更大 batch),这 19 ms 不可压。
+- **MoE GMM —— 自洽,带宽受限,正是 §1.2 预测。** AI = t/expert = 72 < ridge 200 → 读满 256 专家(30.6 GB/forward)。下限 19.1 ms,实测 24.9 ms = 规格带宽的 **77%**(有效 **1.23 TB/s**),mte2=0.98 载入管线饱和、mac=0.36 算力闲。硬地板:除非把 t/expert 推过 200(EP / 更大 batch),这 19 ms 不可压。
+  - ⚠ 早前版本记的"21.99 ms / 87% / 1.39 TB/s"来自合成 prompt(专家未激活满),**已作废**,见 §0 与 §3g 末。
 - **dense matmul —— 自洽,算力受限。** LM head 82% MFU,合计 ~62–80%。AI 远超 ridge,纯算力区。
-- **FIA attention —— 唯一不自洽,长序列档最大可回收项。** AI=128 落带宽区,下限只要 7.8 ms,实测 24.6 ms = 屋顶的 **32%**,有效 0.51 TB/s(规格的 1/3)。mac=0.24 cube 闲 + mte2=0.93 载入忙但低效 → 卡在 online-softmax 的 QK→softmax→AV 串行气泡,两条 pipe 都没吃满。白扔 ~16.8 ms/forward = 整步的 22%。
-  - 若修到吃满带宽(→7.8 ms 下限):整步 75 → ~58 ms,输出吞吐 ≈ **+29%**。
+- **FIA attention —— 唯一不自洽,长序列档最大可回收项。** AI=128 落带宽区,下限只要 7.2 ms,实测 22.7 ms = 屋顶的 **32%**,有效 0.51 TB/s(规格的 1/3)。mac=0.25 cube 闲 + mte2=0.93 载入忙但低效 → 卡在 online-softmax 的 QK→softmax→AV 串行气泡,两条 pipe 都没吃满。白扔 ~15.5 ms/forward = 整步的 20%。
+  - 若修到吃满带宽(→7.2 ms 下限):整步 76 → ~61 ms,单 forward 提速 ≈ **+25%**。
 
-## 2. 对 H20 PK 的指向(待验证)
+## 2. 对 H20 PK 的指向【已由 §3g 解答:假设推翻】
 
-attention 是三类里唯一 3× 偏离屋顶的、且是最大项(33%)——最可能就是 910B 长序列被 H20 拉开 1.4× 的位置(H20 4 TB/s 带宽 + 更成熟 FA,同样 KV 读会快得多)。**判据:等 H20 `key_averages` 出来,重点比 attention 的 ms/forward;若 H20 明显低于 910B 的 24.6 ms,主因锁定。** MoE/dense 两边都贴各自屋顶,预计差距不大(算力 910B 反而占优)。
+~~attention 最可能是被 H20 拉开的位置~~ —— **实测否定**。H20 attention 24.12 ms 反而**比 910B 的 22.67 慢**;换算有效带宽 H20 ≈0.56 TB/s = **其 4 TB/s 规格的仅 14%**,比 910B 的 32% 还差。thin-M(每段 32 query 行)是**两家共同的**瓶颈,H20 的带宽优势在 attention 上完全没兑现。
+
+真实答案见 §3g:同 bs 下两边打平,1.4× 是软件开销(radix + K=2),H20 剩余 ~9% 来自显存容量。
 
 ## 3. 交付物
 
@@ -198,10 +202,28 @@ caveat:910B 两版是否串行跑待确认(端口 31600/31500);H20 的 1476 是�
 2. **H20 最后 ~9% 的领先来自显存容量**(96 vs 64GB → bs=128 vs 72),不是单位算力/带宽。910B 64GB 放不下 128×5632=72 万 token。**且 bs=128 是拿延迟换吞吐**:TPOT 25.3→41.2ms(+63%)、E2E 53→86.5s。若按 TPOT ≤30ms 的 SLO 卡,bs=128 不可用,两边就是 1.30 vs 1.32 的平局。
 3. **910B 那 11% 的 kernel 优势没转成吞吐** —— 说明还有 host/串行度的损失(radix 已砍掉最大项,剩下是调度 Python 其余部分 + kernel launch 串行度:H20 每 forward 1546 个小 kernel 但可异步重叠,NPU 230 个但串行度更高)。**这是当前最大的未解项,方向在 host 不在算子。**
 
+### ✅ MoE GMM 的历次差异已闭环:prompt 多样性 = 激活专家数
+
+早前几版 GMM 偏快**全是同 prompt 造成的专家未激活满**,不是频率/缓存玄学。以本版(真实 ShareGPT,满 256 专家)实测的 **1.17 TB/s** 为有效带宽基准,反推各版实际读取的权重量:
+
+| capture(w13 核) | us | 表观 TB/s | 反推读取量 | ≈激活专家数 |
+|---|---|---|---|---|
+| 同 prompt,conc=72(完全锁步) | 329 | 3.26 ❌ 超规格 | 0.385 GB | **~92** |
+| 同 prompt,conc=100(canonical) | 643 | 1.67 ❌ 超规格 | 0.752 GB | ~179 |
+| 同 prompt,conc=100(复现) | 659 | 1.63 ❌ 超规格 | 0.771 GB | ~184 |
+| 合成 diverse prompt,conc=100 | 757 | 1.42 | 0.886 GB | ~211 |
+| **真实 ShareGPT diverse(本版)** | **913** | **1.18** | **1.068 GB** | **~255 = 满** |
+
+- 单调关系一目了然:**prompt 越多样 → 激活专家越多 → 读的权重越多 → GMM 越慢**。
+- 前三版表观带宽 **>1.6 TB/s 规格上限,物理不可能** → 直接证明它们没读满 256 专家。
+- 与 expert-distribution recorder 的直接实测吻合:同 prompt conc=72 时实测**平均 142/256 激活**(层间 88–203),反推的 ~92 属同一量级(反推假设各层均匀,偏低正常)。
+- **→ 913us / 1.17 TB/s(规格的 73%)是真实负载下的有效值**,§3g 与 §1 一律以它为准。早前 643/659 那版**不可用于任何 roofline 归因**。
+
+推论:合成/重复 prompt 的 benchmark 会**系统性高估 MoE 性能**(这里高估 1.4×)。凡涉及 MoE 的测量必须用真实多样语料。
+
 ### 待验证
 
-- **MoE GMM 本版比之前慢**:913us/核 vs 早前 643–659us(有效带宽 1.17 vs 1.66 TB/s)。1.66 TB/s 超过 1.6 规格本身不合理(说明早前那版有缓存命中/路由集中),**1.17 TB/s 才是物理可信的满 256 专家读**。倾向本版(真实 ShareGPT 文本 → 路由更分散)更接近真实,值得再抓一版确认。
-- H20 bs=128 的 trace 若抓到,可验证大 batch 下 MoE 是否进算力区(t/expert 72→128)。
+- (H20 bs=128 无需再抓 trace,吞吐已在上表对照。)
 
 ## 4. 待办
 
