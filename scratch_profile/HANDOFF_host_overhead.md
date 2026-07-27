@@ -13,6 +13,12 @@
 - **不是去噪计算**。去噪阈值判定是 on-device kernel,py-spy 里 `fdfo_batched_end` 只占 ~3%。
 - **1.4× 的硬件差距不存在**,已证伪(见 §3g),不要再往那个方向找。
 
+## 当前推荐配置(已落地为脚本默认)
+
+**radix off + K=1**,`launch_{npu,h20}_norad{,_prof}.sh` 默认就是这个,直接用即可。
+- `SGLANG_DLLM_FDFO_STEPS_PER_ROUND` 的**代码默认本来就是 1**(`environ.py:429`),不需要改代码;K=2 通过 `FDFO_STEPS=2` 作为调优选项保留。
+- `--disable-radix-cache` 只在脚本里传,**没有改 server_args 的全局默认**(它默认仍是开)。这是有意的:radix 对**真有共享前缀**的负载(统一 system prompt、few-shot、RL rollout)是有效的,只在长序列+各不相同 prompt 时是纯开销。若要改全局默认需另行评估。
+
 ## 已知的量(radix off 之前的旧口径,需要用 K=1 重测)
 
 用当时的打点探针(K=2,radix off)测到:device ≈155 ms/step(=2 forward),**host ≈21 ms/step**,host 占 ~12%。
