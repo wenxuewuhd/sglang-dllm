@@ -265,25 +265,40 @@ H20 同负载 tok/round 相同 → round/s = 8.56×(2032/1854) = 9.38 → step �
 
 ## 3i. 【适用边界】gsm8k 反证:radix/K 的最优值取决于前缀共享度
 
-本文档前面所有 "radix off + K=1" 的结论**只对长序列 + prompt 各异成立**。gsm8k 上完全相反。
+本文档前面所有 "radix off + K=1" 的结论**只对长序列 + prompt 各异成立**。gsm8k 上要按 **shot 数**分开看——**同一个 benchmark 只改 shot 数,radix 的结论就翻转**。
 
-**gsm8k 1000 题 @ bs=128,同 commit 四格(910B3,`--parallel 128`,mem 0.75,graph max_bs=128):**
+⚠ **shot 数是关键变量,历史基线用的是 0-shot**(`bench_sglang.py` 的 `--num-shots` 默认是 **5**,不指定就是 5-shot)。5-shot 的吞吐比 0-shot 低 ~45%(多 5 个完整 Q&A 示例,prefill 重得多)、精度高 2–3 点。**跨 shot 数的数字不可比。**
 
-| | 精度 | Invalid | 输出吞吐 | Latency |
+**gsm8k 1000 题 @ bs=128(910B3,`--parallel 128`,mem 0.75,graph max_bs=128,同 commit):**
+
+| shot | radix | K | 精度 | 输出吞吐 |
 |---|---|---|---|---|
-| radix **on**, K=1 | 0.866 | 0.000 | 2032.0 | 64.2 s |
-| radix **on**, K=2 | 0.859 | 0.000 | **2081.4** | **62.3 s** |
-| radix **off**, K=1 | **0.868** | 0.000 | 1832.5 | 70.6 s |
-| radix **off**, K=2 | 0.862 | 0.000 | 1487.5 | 87.1 s |
+| **0-shot** | **off** | **2** | 0.831 | **4138.5** ← 本组最优 |
+| 0-shot | off | 1 | 0.829 | 3973.6 |
+| 0-shot | on | 2 | 0.832 | 3719.9 |
+| 0-shot | on | 1 | — | (未跑通,server 启动失败) |
+| 5-shot | on | 2 | 0.859 | **2081.4** ← 本组最优 |
+| 5-shot | on | 1 | 0.866 | 2032.0 |
+| 5-shot | off | 1 | 0.868 | 1832.5 |
+| 5-shot | off | 2 | 0.862 | 1487.5 |
 
-- **精度不受任何配置影响**:四格 0.859–0.868(历史区间 0.829–0.845,现在还更高),Invalid 全 0。radix on/off、K=1/K=2 都不改变正确性。
-- **radix off 在 gsm8k 上是亏的**:K=1 −9.8%,K=2 −28.5%。因为 **gsm8k 是 5-shot,1000 题共享同一段 few-shot 前缀**(`benchmark/gsm8k/bench_sglang.py:85` `raw_question = few_shot_examples + question`)→ 前缀算一次给全部请求复用,是 radix 的主场;而 4K/1.5K 用各异的 ShareGPT prompt,命中率 0,radix 纯开销。
-- **K 在这组里跟着 radix 翻转**(on 时 K=2 好 2.4%,off 时 K=1 好 23.2%)。**一个未验证的解释**:K=2 的价值本就是摊薄每轮 host 开销(代码注释明写),radix off 后 host 已很小、没得摊,只剩代价(bs≥64 无条件多跑一个 forward + 冻结批次推迟准入)。⚠ **这只是两个负载上的观察,不构成规则** —— 只有 2 个 payload、且 gsm8k 与长序列在 round 数/序列长度上也不同,无法把 K 的选择归因到 radix。K 仍需按 payload 自己扫。
+(0-shot radix-on K=2 的 3719.9 / 0.832 与历史基线 3580–3794 / 0.831–0.845 吻合 → 坐实历史是 0-shot。)
+
+- **精度不受任何配置影响**:同 shot 数内差异 ≤0.003(0-shot 0.829–0.832,5-shot 0.859–0.868),Invalid 全 0。radix on/off、K=1/K=2 都不改变正确性;**精度的绝对值由 shot 数决定**,不能跨 shot 比。
+- **radix 的结论随 shot 数翻转,判据是"能否命中"**:
+  - **5-shot** → 1000 题共享同一段 few-shot 前缀(`bench_sglang.py:85` `raw_question = few_shot_examples + question`)→ 有得命中 → **radix on 好**(off 亏 9.8%/28.5%)。
+  - **0-shot** → 每题 prompt 各异、**不可能命中** → **radix off 好**(快 11.3%)。
+  - → 决定因素**不是数据集、不是序列长度,而是 prompt 之间有没有可共享前缀**。同一个 gsm8k 换 shot 数就反过来,是这条判据最好的实证。
+- **K 不跟着 radix 走(此前的猜测被证伪)**:四个"radix off"的组合里,4K/1.5K 和 gsm8k-5shot 是 K=1 赢(+10.7%/+23.2%),但 **gsm8k-0shot 是 K=2 赢(+4.1%)**。同为 radix off 却结论相反 → **K 与 radix 无可靠关系,只能按 payload 实测扫。**
 
 **配置规则 —— radix 和 K 是两个独立旋钮,分开决定,不要耦合成一张表:**
 
 - **radix:看有没有命中的可能(结构性判断)。** 负载里请求之间**存在可共享前缀**(few-shot、统一 system prompt、多轮同 session)→ 开;各请求 prompt 互不相同、**根本不可能命中** → 关(此时前缀树的 match+insert 是纯开销,长序列下尤其贵,因为代价随 seq_len 走)。判据是"能否命中",不是序列长短——长序列若共享前缀,radix 一样该开。
-- **K:没有普适值,必须按 payload 实测扫。** 本文档两个负载各自的最优不同(4K/1.5K 是 K=1,gsm8k+radix-on 是 K=2),差异也不大且受 radix 状态、每请求 round 数、batch 大小等多因素影响。**不要从别的负载外推,直接扫 K=1/2(必要时 3/4)取最优。**
+- **K:没有普适值,必须按 payload 实测扫。** 实测三个负载最优各不相同,且**与 radix 状态无关**(同为 radix off,4K/1.5K 与 gsm8k-5shot 是 K=1 赢,gsm8k-0shot 却是 K=2 赢)。**不要从别的负载外推,直接扫 K=1/2(必要时 3/4)取最优。**
+
+**测量注意事项(踩过的坑):**
+- `bench_sglang.py --num-shots` **默认是 5**,不显式指定就是 5-shot;历史基线是 0-shot。**报数必须标注 shot 数**,否则吞吐差 45%、精度差 2–3 点,完全对不上。
+- **两个 server 不要同时启动**:并发启动会在同一 CWD 竞争 Ascend TBE 编译缓存(`kernel_meta/`),权重加载完就被杀(日志停在 `Load weight end` 后、无 `fired up`,尾部一堆 `TBE Subprocess ... main process disappeared`)。**必须错开启动**(等前一个 ready 再起下一个),本轮有 3 格因此失败。
 
 **不要改全局默认**(现为 radix on + K=1):对两种负载都不差(gsm8k 2032,离最优 −2.4%;长序列 K=1 本就最优)。`launch_*_norad*.sh` 是**长序列专用**脚本,其 radix off 的前提是"prompt 各异不可能命中",K=1 是该负载扫出来的值,两者都不要外推到别的负载。
 
