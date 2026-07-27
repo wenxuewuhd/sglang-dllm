@@ -193,11 +193,12 @@ class DllmAlgorithm:
         # is paid once per fdfo_steps_per_round forwards instead of per
         # forward. A row that finishes on an inner step is emitted with this
         # round's accept, at most fdfo_steps_per_round - 1 forwards late.
-        ctx = (
-            self.fdfo_batched_begin(forward_batch, states)
-            if self.fdfo_steps_per_round > 1
-            else None
-        )
+        #
+        # The batched path is preferred even for single-step rounds: begin
+        # gathers the states before the forward, so its blocking H2D copies hit
+        # an empty stream instead of draining the in-flight forward, and the
+        # round's only sync is the done-flag readback in end.
+        ctx = self.fdfo_batched_begin(forward_batch, states)
         if ctx is None:
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             done = self.step(forward_batch, out.logits_output.full_logits, states)
