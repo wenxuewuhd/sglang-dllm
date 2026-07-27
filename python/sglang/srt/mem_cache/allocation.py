@@ -403,6 +403,28 @@ def alloc_for_extend(
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 
 
+def _gather_reused_block_locs(
+    *,
+    req_to_token: torch.Tensor,
+    req_pool_indices: list[int],
+    prefix_lens: list[int],
+    block_len: int,
+    device: torch.device,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Re-read the retained KV block of every reuse row from ``req_to_token``
+    in one flat index op (rows share ``block_len``), instead of one slice +
+    cast kernel per row.
+    """
+    width = req_to_token.shape[1]
+    flat_cpu = torch.tensor(
+        [row * width + start for row, start in zip(req_pool_indices, prefix_lens)],
+        dtype=torch.int64,
+    ).unsqueeze(1) + torch.arange(block_len, dtype=torch.int64)
+    flat = flat_cpu.reshape(-1).to(device, non_blocking=True)
+    return req_to_token.reshape(-1)[flat].to(out_dtype).reshape(-1, block_len)
+
+
 def _alloc_extend_loc_with_kv_reuse(
     batch: ScheduleBatch,
     reuse_kv: list[bool],
@@ -415,11 +437,14 @@ def _alloc_extend_loc_with_kv_reuse(
     device = batch.device
     req_to_token = batch.req_to_token_pool.req_to_token
 
+    prefix_lens_list = prefix_lens_cpu.tolist()
+    extend_lens_list = extend_lens_cpu.tolist()
+
     for i, req in enumerate(batch.reqs):
         if not reuse_kv[i]:
             continue
-        prefix_len = int(prefix_lens_cpu[i])
-        extend_len = int(extend_lens_cpu[i])
+        prefix_len = prefix_lens_list[i]
+        extend_len = extend_lens_list[i]
         retained_len = len(req.dllm_incomplete_ids)
         if extend_len != retained_len:
             raise RuntimeError("dLLM FDFO retained KV must be reused as a full block.")
@@ -427,7 +452,7 @@ def _alloc_extend_loc_with_kv_reuse(
             raise RuntimeError("dLLM FDFO retained KV is missing.")
 
     alloc_extend_lens = [
-        0 if reuse_kv[i] else int(extend_lens_cpu[i]) for i in range(len(reuse_kv))
+        0 if reuse_kv[i] else extend_lens_list[i] for i in range(len(reuse_kv))
     ]
     alloc_extend_num_tokens = sum(alloc_extend_lens)
 
@@ -436,19 +461,17 @@ def _alloc_extend_loc_with_kv_reuse(
         if alloc_page_size == 1:
             fresh_slots = alloc_token_slots(batch.tree_cache, alloc_extend_num_tokens)
         else:
+            seq_lens_list = batch.seq_lens_cpu.tolist()
             alloc_seq_lens_cpu = torch.tensor(
                 [
-                    (
-                        int(prefix_lens_cpu[i])
-                        if reuse_kv[i]
-                        else int(batch.seq_lens_cpu[i])
-                    )
+                    prefix_lens_list[i] if reuse_kv[i] else seq_lens_list[i]
                     for i in range(len(reuse_kv))
                 ],
                 dtype=torch.int64,
             )
+            neg_one = torch.tensor([-1], device=device)
             last_loc = [
-                (t[-1:] if len(t) > 0 else torch.tensor([-1], device=device))
+                (t[-1:] if len(t) > 0 else neg_one)
                 for t in (r.prefix_indices for r in batch.reqs)
             ]
             fresh_slots = alloc_paged_token_slots_extend(
@@ -465,18 +488,38 @@ def _alloc_extend_loc_with_kv_reuse(
             )
 
     reuse_dtype = fresh_slots.dtype if fresh_slots is not None else torch.int64
+
+    reuse_rows = [i for i in range(len(reuse_kv)) if reuse_kv[i]]
+    req_pool_indices_list = req_pool_indices_cpu.tolist()
+    block_len = extend_lens_list[reuse_rows[0]]
+    reuse_gathered = None
+    if all(extend_lens_list[i] == block_len for i in reuse_rows):
+        reuse_gathered = _gather_reused_block_locs(
+            req_to_token=req_to_token,
+            req_pool_indices=[req_pool_indices_list[i] for i in reuse_rows],
+            prefix_lens=[prefix_lens_list[i] for i in reuse_rows],
+            block_len=block_len,
+            device=device,
+            out_dtype=reuse_dtype,
+        )
+
     parts: list[torch.Tensor] = []
     fresh_ptr = 0
+    reuse_ptr = 0
     for i in range(len(reuse_kv)):
-        prefix_len = int(prefix_lens_cpu[i])
-        extend_len = int(extend_lens_cpu[i])
+        extend_len = extend_lens_list[i]
         if reuse_kv[i]:
-            req_idx = int(req_pool_indices_cpu[i])
-            parts.append(
-                req_to_token[req_idx, prefix_len : prefix_len + extend_len].to(
-                    reuse_dtype
+            if reuse_gathered is not None:
+                parts.append(reuse_gathered[reuse_ptr])
+                reuse_ptr += 1
+            else:
+                prefix_len = prefix_lens_list[i]
+                req_idx = req_pool_indices_list[i]
+                parts.append(
+                    req_to_token[req_idx, prefix_len : prefix_len + extend_len].to(
+                        reuse_dtype
+                    )
                 )
-            )
         else:
             parts.append(fresh_slots[fresh_ptr : fresh_ptr + extend_len])
             fresh_ptr += extend_len
