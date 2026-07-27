@@ -247,6 +247,13 @@ caveat:910B 两版是否串行跑待确认(端口 31600/31500);H20 的 1476 是�
 
 H20 同负载 tok/round 相同 → round/s = 8.56×(2032/1854) = 9.38 → step ≈ 106.6 ms,kernel-sum 85.88 → **H20 裸露 host ≈ 21 ms/step**。对比:**910B 37ms vs H20 21ms,同一份 Python 910B 付 1.8×**(ARM 单核弱于 x86 + 全部 torch 调用过 `transfer_to_npu` decorated 包一层 + graph task update 线程机制是 NPU 独有)。§3d 旧账自洽:K=2 时裸露 host 21ms/step 摊 2 个 forward,K=1 后重建/发射每 forward 都付。
 
+### 细化(二次分析,2026-07-27 晚)
+
+- **C 段 9.5ms 里 7.5ms 是 `thread.join()`,且 join 发生在 `graph.replay()` 之后** —— replay 是异步 enqueue,join 期间 device 已在跑 forward,**这 7.5ms 大部分与 device 重叠,不是裸露的**。砍它未必按面值兑现。
+- 因此**确定裸露的是 ~28ms**(batch 重建 18.1 + 结果处理 2.8 + 去噪 post-sync 尾 ~4 + 杂项 ~3),37 是上界。
+- 未解小账:wait@217 实测 78.3ms,但按"replay 后 ~12ms 才到 217"推算应只剩 ~67ms 可等 → **差出 ~10ms,提示 device 起跑可能被 graph update 事件门控(update_capture_record 逐 record 重派发 FIA,layer0 的 update 没落地前 device 停在第一个 FIA)**。需一版 msprof timeline(arm_profile.py)看每 step device 起跑延迟才能定,决定 torch_npu update 机制值不值得动。
+- `update_capture_record` 的实现(torch_npu graphs.py:280-323):每次 replay 对**每个 recorded FIA op 重新走一遍完整 dispatch**(`record.op_cache_entry(*args,**kwargs)` on update_stream)→ ~7ms/step 纯 Python,bs=72 下 seq_lens 几乎每 round 都变(~7 行换块),"不变则跳过"很少命中。
+
 ### 判据落定 + 兑现空间
 
 **host 差得多 → 那 11% 在调度侧,可兑现。** 若把 37ms 压到 H20 的 21ms,step 116.8→100.8,round/s +16%(1.21→1.40 req/s 量级,反超 H20 bs=72)。优化排序(按 ms 和侵入度):
