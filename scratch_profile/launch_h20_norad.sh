@@ -17,12 +17,13 @@ DEV=${DEV:-0}
 PORT=${PORT:-31400}
 MODEL=${MODEL:-/workspace/models/LLaDA/LLaDA2.1-mini/}
 MRR=${MRR:-72}
+FDFO_STEPS=${FDFO_STEPS:-2}
 
 export CUDA_VISIBLE_DEVICES=$DEV
 export PYTHONPATH=$REPO/python:${PYTHONPATH:-}
 export SGLANG_ENABLE_DLLM_MIXED_BATCH=1
-export SGLANG_DLLM_FDFO_STEPS_PER_ROUND=2
+export SGLANG_DLLM_FDFO_STEPS_PER_ROUND=$FDFO_STEPS
 
-echo "H20 DEV=$DEV PORT=$PORT MRR=$MRR (no-radix)"
+echo "H20 DEV=$DEV PORT=$PORT MRR=$MRR K=$FDFO_STEPS (no-radix)"
 
 exec python -m sglang.launch_server --model-path "$MODEL" --trust-remote-code --dllm-algorithm JointThreshold --dllm-fdfo --mem-fraction-static 0.78 --max-running-requests "$MRR" --disable-radix-cache --cuda-graph-config '{"decode":{"backend":"full","max_bs":72,"bs":[1,8,16,32,48,56,64,72]}}' --port "$PORT"
