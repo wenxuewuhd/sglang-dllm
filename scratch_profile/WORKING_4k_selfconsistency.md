@@ -263,6 +263,32 @@ H20 同负载 tok/round 相同 → round/s = 8.56×(2032/1854) = 9.38 → step �
 3. **去噪状态常驻批式 device 张量(5.1ms)**:FDFO state 按 slot 常驻,round 间免 gather/scatter;最少也应把 216-224 的 gather 挪到 forward 发射前(不依赖 logits),别让阻塞 H2D 在 forward 后才排队。
 4. **`base.py:237` 只取 done 行的 tokens(~1-2ms)**:全批 tolist → 按 done gather。
 
+## 3i. 【适用边界】gsm8k 反证:radix/K 的最优值取决于前缀共享度
+
+本文档前面所有 "radix off + K=1" 的结论**只对长序列 + prompt 各异成立**。gsm8k 上完全相反。
+
+**gsm8k 1000 题 @ bs=128,同 commit 四格(910B3,`--parallel 128`,mem 0.75,graph max_bs=128):**
+
+| | 精度 | Invalid | 输出吞吐 | Latency |
+|---|---|---|---|---|
+| radix **on**, K=1 | 0.866 | 0.000 | 2032.0 | 64.2 s |
+| radix **on**, K=2 | 0.859 | 0.000 | **2081.4** | **62.3 s** |
+| radix **off**, K=1 | **0.868** | 0.000 | 1832.5 | 70.6 s |
+| radix **off**, K=2 | 0.862 | 0.000 | 1487.5 | 87.1 s |
+
+- **精度不受任何配置影响**:四格 0.859–0.868(历史区间 0.829–0.845,现在还更高),Invalid 全 0。radix on/off、K=1/K=2 都不改变正确性。
+- **radix off 在 gsm8k 上是亏的**:K=1 −9.8%,K=2 −28.5%。因为 **gsm8k 是 5-shot,1000 题共享同一段 few-shot 前缀**(`benchmark/gsm8k/bench_sglang.py:85` `raw_question = few_shot_examples + question`)→ 前缀算一次给全部请求复用,是 radix 的主场;而 4K/1.5K 用各异的 ShareGPT prompt,命中率 0,radix 纯开销。
+- **K 的最优值随 radix 翻转,机理同源**:K=2 的价值是摊薄每轮 host 开销。radix off → host 已很小、没得摊,K=2 只剩代价(bs≥64 无条件多跑一个 forward + 冻结批次推迟准入)→ K=1 赢 23.2%;radix on → host 开销回来,K=2 又有价值 → 小赢 2.4%。
+
+**配置规则(替代"一律 off + K=1"):**
+
+| 负载类型 | radix | K |
+|---|---|---|
+| 长序列、prompt 各异(4K/1.5K、真实 rollout) | **off** | **1** |
+| 短序列、共享前缀(gsm8k few-shot、统一 system prompt) | **on** | **2** |
+
+**不要改全局默认**(现为 radix on + K=1):它对两种负载都不差(gsm8k 2032,离最优 −2.4%;长序列 K=1 本就正确),只需按负载用 `--disable-radix-cache` 开关。`launch_*_norad*.sh` 是**长序列专用**脚本,其 K=1 + radix off 的默认不适用于 gsm8k 类负载。
+
 ## 4. 待办
 
 已完成:
