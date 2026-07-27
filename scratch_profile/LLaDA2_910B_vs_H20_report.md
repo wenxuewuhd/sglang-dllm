@@ -209,8 +209,10 @@ bs_max = (64 GB × 可用率 − 权重 − overhead − graph) / (KV_per_req + 
 |---|---|---|---|---|---|---|
 | 910B | 72 | radix off, K=1 | 2004 | 7349 | 1.30 | 25.0 ms |
 | H20 | 72 | radix off, K=1 | 2032 | 7450 | 1.32 | 25.3 ms |
+| H20 | 128 | radix off, K=1 | 2181 | 7999 | 1.42 | 41.2 ms |
+| H20 | 128 | upstream(不开混批) | 1024 | 3784 | 0.67 | 123.6 ms |
 
-差 1.5%,基本相同。逐算子对照(两边 radix off + K=1,真实 ShareGPT,ms/forward):
+同 bs=72、同配置下两颗芯片差 1.5%,基本相同。逐算子对照(两边 radix off + K=1,真实 ShareGPT,ms/forward):
 
 | 类别 | 910B | H20 | |
 |---|---|---|---|
@@ -224,7 +226,8 @@ bs_max = (64 GB × 可用率 − 权重 − overhead − graph) / (KV_per_req + 
 
 读数:910B 靠 dense 的 2× 算力优势,扳回了 MoE 路由 / norm 等小算子上的带宽劣势,kernel 总工作量还少 11%;attention、MoE 两大项打平。逐算子层面 910B 不输。
 
-- H20 的整体小幅领先来自显存容量:96GB 可上 bs=128 再换一档总吞吐,代价是 TPOT 大幅上升(bs=128 vs 72,TPOT +63%);910B 64GB 上不去 bs=128。
+- H20 的整体小幅领先来自显存容量:96GB 可上 bs=128,输出吞吐 2032→2181(+7%),代价是 TPOT 25.3→41.2 ms(+63%);910B 64GB 上不去 bs=128。若按 TPOT≤30ms 的 SLO 卡,bs=128 不可用,两边就是 bs=72 的平局。
+- 表末 upstream(不开混批)行是优化前基线:H20 bs=128 从 1024 → 2181 tok/s,混批 + radix off + K=1 三项合计 2.1×,长输入下 prefill 开销大、混批把它折进 decode 收益最明显。
 - 未解项:910B 那 11% 的 kernel 优势没有完全转成吞吐,说明还有 host 侧(调度 Python 剩余部分)+ kernel launch 串行度的损失——H20 每 forward ~1546 个小 kernel 但可异步重叠,NPU ~230 个但串行度更高。方向在 host,不在算子。
 
 ### 2.6 radix 前缀缓存:长序列必须关

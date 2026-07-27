@@ -469,9 +469,11 @@
       <tbody>
         <tr class="hl"><td class="a910c">910B</td><td class="n">72</td><td class="n">radix off · K=1</td><td class="n">2004</td><td class="n">7349</td><td class="n">1.30</td><td class="n">25.0 ms</td></tr>
         <tr><td class="h20c">H20</td><td class="n">72</td><td class="n">radix off · K=1</td><td class="n">2032</td><td class="n">7450</td><td class="n">1.32</td><td class="n">25.3 ms</td></tr>
+        <tr><td class="h20c">H20</td><td class="n">128</td><td class="n">radix off · K=1</td><td class="n">2181</td><td class="n">7999</td><td class="n">1.42</td><td class="n">41.2 ms</td></tr>
+        <tr><td class="h20c">H20</td><td class="n">128</td><td class="n">upstream(不开混批)</td><td class="n">1024</td><td class="n">3784</td><td class="n">0.67</td><td class="n">123.6 ms</td></tr>
       </tbody>
     </table></div>
-    <p>差 1.5%,基本相同。逐算子对照(两边 radix off + K=1,真实 ShareGPT,ms/forward):dense <b>910B 12.7 vs H20 26.0</b>(910B 2.05×)、MoE grouped gemm 24.9 vs 23.4(~平)、attention 22.7 vs 24.1(~平)、MoE 路由 6.4 vs 1.8 与 norm 4.4 vs 0.7(小算子 H20 快),kernel 合计 <b>910B 76.4 vs H20 85.9(910B 少 11%)</b>。逐算子层面 910B 靠 dense 的 2× 算力扳回小算子的带宽劣势,不输 H20。H20 的整体小幅领先来自显存容量:96GB 可上 bs=128 再换一档总吞吐,代价是 TPOT +63%,910B 上不去。</p>
+    <p>同 bs=72、同配置下两颗芯片差 1.5%,基本相同。逐算子对照(两边 radix off + K=1,真实 ShareGPT,ms/forward):dense <b>910B 12.7 vs H20 26.0</b>(910B 2.05×)、MoE grouped gemm 24.9 vs 23.4(~平)、attention 22.7 vs 24.1(~平)、MoE 路由 6.4 vs 1.8 与 norm 4.4 vs 0.7(小算子 H20 快),kernel 合计 <b>910B 76.4 vs H20 85.9(910B 少 11%)</b>。逐算子层面 910B 靠 dense 的 2× 算力扳回小算子的带宽劣势,不输 H20。H20 的整体小幅领先来自显存容量:96GB 可上 bs=128,输出吞吐 2032→2181(+7%),代价是 TPOT 25.3→41.2 ms(+63%),910B 64GB 上不去。表末 upstream(不开混批)行为优化前基线:H20 bs=128 从 1024 → 2181 tok/s(混批 + radix off + K=1 合计 2.1×,长输入下混批把 prefill 折进 decode 收益最明显)。</p>
   </section>
 
   <!-- CH3 -->
