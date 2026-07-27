@@ -276,7 +276,7 @@ H20 同负载 tok/round 相同 → round/s = 8.56×(2032/1854) = 9.38 → step �
 | **0-shot** | **off** | **2** | 0.831 | **4138.5** ← 本组最优 |
 | 0-shot | off | 1 | 0.829 | 3973.6 |
 | 0-shot | on | 2 | 0.832 | 3719.9 |
-| 0-shot | on | 1 | — | (未跑通,server 启动失败) |
+| 0-shot | on | 1 | 0.829 | 3529.5 |
 | 5-shot | on | 2 | 0.859 | **2081.4** ← 本组最优 |
 | 5-shot | on | 1 | 0.866 | 2032.0 |
 | 5-shot | off | 1 | 0.868 | 1832.5 |
@@ -287,9 +287,9 @@ H20 同负载 tok/round 相同 → round/s = 8.56×(2032/1854) = 9.38 → step �
 - **精度不受任何配置影响**:同 shot 数内差异 ≤0.003(0-shot 0.829–0.832,5-shot 0.859–0.868),Invalid 全 0。radix on/off、K=1/K=2 都不改变正确性;**精度的绝对值由 shot 数决定**,不能跨 shot 比。
 - **radix 的结论随 shot 数翻转,判据是"能否命中"**:
   - **5-shot** → 1000 题共享同一段 few-shot 前缀(`bench_sglang.py:85` `raw_question = few_shot_examples + question`)→ 有得命中 → **radix on 好**(off 亏 9.8%/28.5%)。
-  - **0-shot** → 每题 prompt 各异、**不可能命中** → **radix off 好**(快 11.3%)。
+  - **0-shot** → 每题 prompt 各异、**不可能命中** → **radix off 好**(K=2 +11.3%、K=1 +12.6%,两个 K 下一致)。
   - → 决定因素**不是数据集、不是序列长度,而是 prompt 之间有没有可共享前缀**。同一个 gsm8k 换 shot 数就反过来,是这条判据最好的实证。
-- **K 不跟着 radix 走(此前的猜测被证伪)**:四个"radix off"的组合里,4K/1.5K 和 gsm8k-5shot 是 K=1 赢(+10.7%/+23.2%),但 **gsm8k-0shot 是 K=2 赢(+4.1%)**。同为 radix off 却结论相反 → **K 与 radix 无可靠关系,只能按 payload 实测扫。**
+- **K 不跟着 radix 走(此前的猜测被证伪)**:radix off 的三个负载里,4K/1.5K 和 gsm8k-5shot 是 K=1 赢(+10.7%/+23.2%),**gsm8k-0shot 却是 K=2 赢(+4.1%)**;radix on 的两组里 K=2 都小赢(5-shot +2.4%、0-shot +5.4%)。同为 radix off 却结论相反 → **K 与 radix 无可靠关系,只能按 payload 实测扫。**
 
 **配置规则 —— radix 和 K 是两个独立旋钮,分开决定,不要耦合成一张表:**
 
