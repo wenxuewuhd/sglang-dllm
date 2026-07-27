@@ -1,12 +1,32 @@
-# Handoff:定位 910B 剩余的 host 开销【已解,见 WORKING §3h】
+# Handoff:定位 910B 剩余的 host 开销【已解,见 WORKING §3h;第一批优化已落地】
 
-> **2026-07-27 已回答**:step 116.8ms 里 ~37ms(31%)是裸露 host(device 空转)——
-> batch 每 round 全量重建 18.1ms + torch_npu graph task update(每 replay spawn+join 线程)9.5ms
-> + 去噪状态 gather/scatter 5.1ms + 结果处理 ~3ms。等 forward 的 78.3ms ≈ kernel-sum 76.37ms →
-> **graph 内空隙仅 2-4ms,"kernel launch 串行度"假设排除**。H20 推算裸露 host ~21ms →
-> 910B 付 1.8×(ARM CPU + transfer_to_npu 包装 + graph update 线程机制)。
-> **判据落定:差在调度侧,可兑现**;压到 21ms ≈ +16% round/s。优化排序见 §3h。
-> 下面原文保留作背景。
+> **2026-07-27 已回答**:step 里 ~28ms 是裸露 host(device 空转)——
+> batch 每 round 全量重建(最大项)+ 去噪状态 gather/scatter + 结果处理。等 forward ≈ kernel-sum →
+> **graph 内空隙仅 2-4ms,"kernel launch 串行度"假设排除**。H20 推算裸露 host 更小 →
+> 910B 为同一份 Python 付 ~1.8×(ARM CPU + transfer_to_npu 包装 + graph update 线程机制)。
+> **判据落定:差在调度侧,可兑现**。优化排序见 §3h。下面原文保留作背景。
+
+## 第一批优化已落地并验证(2026-07-27,commits `1b387db264` / `6a327bc0b2` / `48fe2df8fb`)
+
+同卡同协议 A/B(4K/1.5K bench 400 prompts conc 72;gsm8k zero-shot 全量 1319):
+
+| 指标 | 基线 | 优化后 |
+|---|---|---|
+| req/s | 1.21 | **1.25(+3.3%)** |
+| 输出 tok/s | 1854 | 1917 |
+| 稳态 step | ~100.0 ms | ~96.9 ms |
+| scheduler 进程 CPU | 157% | **52%**(spin-wait→sleep-wait,省一个多 ARM 核) |
+| gsm8k radix-on K=1 | 0.839 / 0.830(两次) | 0.828 / 0.836(两次)→ 噪声内 |
+| gsm8k radix-off K=1 | 0.830 | 0.821(Δ=同代码重跑波动 ±0.009)→ 噪声内 |
+
+**逐 commit 单点判决**(独立核账 agent,扣除采样伪影后与 wall −3.1ms 对平):
+- `6a327bc0b2` alloc retained-block gather 向量化:**−1.9~−2.3 ms/round,唯一确定见效**,基线 F 段 100% 裸露、砍多少兑现多少。
+- `1b387db264` K=1 走 batched 路径:净 ~−0.9(去噪发射 −1.65 / begin gather 前置 +0.74);同步原语从 spin 换 sleep,残差 +3~5ms 是否真实待 P1 打点分辨。
+- `48fe2df8fb` seq_lens_cpu 复用:收益 ≈0(严格少做事,保留不记账)。
+
+**⚠ 测量陷阱(新)**:py-spy 250Hz(4ms 栅格)对 ~100ms 强周期主循环会**频闪锁相**,把短相位段(如 2ms 的 process_batch_result)整段漏采,伪装成"优化收益"。修复:采样率与周期互质(如 `--rate 137`)+ `--idle`,并用"未改动代码段两份 profile ±15% 内"做自校验;round 速率必须在 py-spy 同窗口数 log 行,不能拿别的窗口平均。§3h 的绝对 ms 数受此影响整体偏大 ~15%(结构与排序不变)。
+
+**剩余靶子(按序)**:F 段仍有 ~9-10ms 裸露(alloc 还剩 ~3.5-3.9 + prepare/fill_ids ~4)→ ④ 增量 batch 复用;graph-update `.join()` 5.2-5.9ms(与 forward 部分重叠,动之前先 P1 打点+msprof 看 device 起跑是否被 update 门控);begin gather 常驻化(+0.6ms,顺手做)。
 
 ## 要回答的问题
 
