@@ -4,15 +4,15 @@
 >
 > 数据口径:
 > - 【910B 实测】= 910B3 上 msprof Level2 / e2e bench 实测。
-> - 【H20 实测】= H20上抓的 kineto trace;kernel 时间与构成为实测。
+> - 【H20 实测】= H20 上抓的 kineto trace;kernel 时间与构成为实测。
 > - 【H20 roofline】= roofline 推算(无 trace 覆盖处),依赖对 H20 MFU 的假设。
-> - 对绝对标度或 roofline 假设敏感的结论已显式标注,待用设备无关探针在 H20 上抓饱和数据后刷新。
+> - 4K/1.5K 档已用两边同口径(radix off + K=1、真实 ShareGPT、稳态 arm)的干净数据对齐(§2.5);短序列 bs=128 逐类(§2.3)为早期非饱和 trace,方法已被 §2.5 取代,趋势为准。
 
 ---
 
 ## 结论
 
-1. 大 batch + 短到中等序列下 910B 略优于 H20:512in/2048out 输出吞吐 2591 vs 2364(+10%),短序列 gsm8k +7%(3667 vs 3412)。但更长输入(4K in/1.5K out)H20 反超 ~1.4×(910B 受 64GB 显存限制只能到 bs≈72,低 bs 下 MoE 更带宽受限;完整机理待 profiling)。
+1. 大 batch 下 910B 与 H20 基本打平。短到中等序列 910B 略优:512in/2048out 输出吞吐 2591 vs 2364(+10%),gsm8k +7%(3667 vs 3412)。4K in/1.5K out 长序列在同 bs=72、正确配置(关 radix 前缀缓存 + STEPS_PER_ROUND=1)下也打平:910B 2004 vs H20 2032 tok/s,逐算子层面 910B 的 kernel 工作量还少 ~11%。H20 的整体小幅领先来自显存容量(96GB 可上 bs=128),不是单位算力或带宽——bs=128 以 TPOT +63% 为代价换总吞吐。
 2. 小 batch 下 910B 明显落后:bs=1 时 910B 约为 H20 的 0.5×(312 vs 592),bs=8 约 0.4×。
 3. EP(专家并行)通信代价过大,当前不划算:128 blocks/卡 实测 a2a 12.2ms/层,节点吞吐只有 4 张独立单卡的 1/4.6。
 
@@ -81,6 +81,8 @@
 注:实际带宽 0.97 TB/s 只有规格 1.6 的 61%(HBM 可达带宽一般为规格的 60-85%,此 256 专家分块访问模式为 61%,MTE2 load pipe 已 97% 占用)。按理论 1.6 算得 205T(64% 峰值);实测 39% 与之的差即带宽折损(64% × 61% = 39%)。ridge(200)按理论带宽算,落到实测 MFU 需乘此折损。H20 规格 4.0、有效 ~3.4(85%),两颗芯片的理论/实际带宽差都需计入。
 
 bs=128 时 MoE 两者相当:910B 带宽受限 39%(126T)≈ H20 算力受限 88%(130T),绝对值接近,MoE 在 bs=128 未进入甜点(需 t≥512)。
+
+注(MoE 测量口径):MoE 有效带宽对 prompt 多样性敏感——**合成/重复 prompt 会让专家激活不满、系统性高估 MoE 性能(实测可高估 1.4×)**,只有真实多样语料(ShareGPT)才读满 256 专家。4K decode 真实语料下 MoE 实测有效带宽 1.17–1.23 TB/s(规格 73–77%),比"深度带宽饥饿"略乐观。凡涉及 MoE 的 roofline 归因必须用真实语料。
 
 ### 1.4 小结
 
@@ -195,25 +197,43 @@ bs_max = (64 GB × 可用率 − 权重 − overhead − graph) / (KV_per_req + 
 | Mean TPOT | 46.0 ms | 47.0 ms |
 | P99 E2E | 371.7 s | 150.0 s |
 
-长序列 TPOT 接近相等(而非 910B 更快),原因有两点:(1) attention 的 AI=128 两者相当(§1.3),它占比上升只是把一个相当的组件放大,稀释了 910B 在 dense 上的短序列优势;(2) 910B FIA 只跑 24% MFU(实现受限,§4.2),长上下文 attention 略弱于 H20,抵消了 dense 优势,稳态每 token 相当(47 vs 46,910B 微慢 1ms)。
+长序列 TPOT 接近相等(而非 910B 更快):attention 的 AI=128 两者相当(§1.3),它占比上升只是把一个相当的组件放大,稀释了 910B 在 dense 上的短序列优势;且 attention 在两颗芯片上都被 FIA 的 thin-M 低效拖累(§4.2),谁也没占到带宽便宜,稳态每 token 相当(47 vs 46,910B 微慢 1ms)。
 
-若把 FIA 修到 50% MFU(§4.2),长序列每 token 也会从相当转为 910B 领先。
+若把 FIA 修到吃满带宽(§4.2),两颗芯片单 forward 都会缩,而 910B 的 kernel 工作量本就少(§2.5),会转为 910B 领先。
 
 ### 2.5 更长序列(4K in / 1.5K out)
 
-序列 5632 token/req。910B 受 64GB 显存限制 bs≈72(H20 96GB 可跑 128):
+序列 5632 token/req,多样 prompt(RL rollout 典型负载)。910B 受 64GB 显存限制 bs≈72,H20 96GB 可到 128。正确配置下(关 radix 前缀缓存 + STEPS_PER_ROUND=1,见 §2.6),同 bs=72 两颗芯片打平:
 
-| | bs | 混批 | 输出吞吐 tok/s | 总吞吐 tok/s | Mean TPOT | Mean TTFT |
+| | bs | 配置 | 输出吞吐 tok/s | 总吞吐 tok/s | req/s | Mean TPOT |
 |---|---|---|---|---|---|---|
-| H20 | 128 | 否 | 1024 | 3784 | 123.6 ms | 8563 ms |
-| H20 | 128 | 是 | 1593 | 5886 | 65.7 ms | 14190 ms |
-| H20 | 72 | 是 | 1476 | 5452 | 40.7 ms | 8700 ms |
-| 910B | 72 | 是 | 1058 | 3909 | 48.1 ms | 17000 ms |
+| 910B | 72 | radix off, K=1 | 2004 | 7349 | 1.30 | 25.0 ms |
+| H20 | 72 | radix off, K=1 | 2032 | 7450 | 1.32 | 25.3 ms |
 
-- 同 bs=72 下 **H20 快 1.40×**(输出吞吐 1476 vs 1058,总吞吐 5452 vs 3909),每 token 也快 1.18×(TPOT 40.7 vs 48.1)。与 512in/2048out(910B +10%)相反。
-- **机理待 4K/1.5K 的逐算子 profiling 确定。** 一个已知因素:910B 被 64GB 显存逼到 bs=72(H20 可跑 128),而低 bs 本身对 910B 不利——MoE 的 t 更小、更深地带宽受限,910B 丢掉了 bs=128 时的 MoE 平局。是否还叠加序列长度的影响,待 profiling 再判断。
-- **显存也是 H20 的优势**:910B 64GB 在 4K/1.5K 只能到 bs≈72,H20 96GB 可到 128,吞吐再高一档(1593 vs 1476)。
-- **长输入下混批对 H20 也大幅有效**:H20 bs=128 不开混批 1024 → 开混批 1593 tok/s(+56%)。混批收益随 prompt 长度增长(4K prompt 的 prefill 昂贵,混批把它折进 decode),与短 prompt(gsm8k)下混批对 H20 几乎无效不矛盾。
+差 1.5%,基本相同。逐算子对照(两边 radix off + K=1,真实 ShareGPT,ms/forward):
+
+| 类别 | 910B | H20 | |
+|---|---|---|---|
+| dense matmul | 12.70 | 26.02 | 910B 快 2.05× |
+| MoE grouped gemm | 24.93 | 23.42 | ~平(H20 6%) |
+| attention (FIA) | 22.67 | 24.12 | ~平(910B 6%) |
+| MoE 路由 glue | 6.44 | 1.81 | H20 快 3.6× |
+| norm/rope | 4.36 | 0.70 | H20 快 6.2× |
+| 去噪/其他小算子 | 5.28 | 9.81 | 910B 快 |
+| **kernel 合计** | **76.37** | **85.88** | **910B 少 11% 工作量** |
+
+读数:910B 靠 dense 的 2× 算力优势,扳回了 MoE 路由 / norm 等小算子上的带宽劣势,kernel 总工作量还少 11%;attention、MoE 两大项打平。逐算子层面 910B 不输。
+
+- H20 的整体小幅领先来自显存容量:96GB 可上 bs=128 再换一档总吞吐,代价是 TPOT 大幅上升(bs=128 vs 72,TPOT +63%);910B 64GB 上不去 bs=128。
+- 未解项:910B 那 11% 的 kernel 优势没有完全转成吞吐,说明还有 host 侧(调度 Python 剩余部分)+ kernel launch 串行度的损失——H20 每 forward ~1546 个小 kernel 但可异步重叠,NPU ~230 个但串行度更高。方向在 host,不在算子。
+
+### 2.6 radix 前缀缓存:长序列必须关
+
+多样 prompt 的长序列 decode 里前缀命中率为 0,radix 前缀缓存的匹配 / 插入是纯开销,占 scheduler host CPU 的 ~72%;`--disable-radix-cache` 后 host 降 ~90%。叠加 `STEPS_PER_ROUND=2` 每轮多一次去噪 schedule 的开销,这两项都是设备无关的软件开销,吃掉了长序列吞吐,且对 host 占比更高的 910B 伤害更大——关掉后 910B req/s +88%(0.69→1.30),H20 +38%(0.96→1.32)。
+
+配置建议:
+- 多样 prompt 长序列(RL rollout):`--disable-radix-cache` + `SGLANG_DLLM_FDFO_STEPS_PER_ROUND=1`。
+- 有共享前缀的短序列(gsm8k few-shot):保留 radix + K=2。
 
 ---
 
@@ -354,9 +374,13 @@ dense 已算力饱和(78% 峰值、已快于 H20 2×),不需改动。发力点�
 
 ### 4.2 attention FIA 效率(长序列)
 
-【910B 实测】FIA 只跑 24% MFU,seq4096 时 attention 占整步 33%(短序列 7%,不重要),是长序列档的关键。
+【910B 实测,4K decode】FIA 只跑到带宽 roofline 的 **32%**(有效 0.51 TB/s;下限 7.2 ms/forward vs 实测 22.7 ms),是长序列档最大的可回收项:修到吃满带宽 → 单 forward 76→~61 ms(**+25%**)。
 
-24% 是实现低效,不是带宽限制。attention AI=128 < ridge 200 属带宽受限,MFU 上限本就不是 100%,而是 128 × BW / 320 = ~40%(实际带宽)到 64%(理论带宽)。但 FIA 的 24% 连这个带宽上限都没达到:trace 里 FIA 的 load pipe(mte2)只有 0.51、算力 pipe 也低,两条 pipe 都不饱和。根因是 flash attention 的 online-softmax 把 QK(cube)→ softmax(vector)→ AV(cube)串成依赖链,cube/vector 交替互等产生流水气泡,而 NPU 不能靠多流重叠(§2.1)。因此 24 → ~40-50% 靠核内融合(单 kernel 内更好地排 cube+vector、减 softmax 串行气泡)可回收,不需更多带宽。
+**这不是带宽墙,是 kernel 实现低效,而且两颗芯片同病。** attention AI=128 < 910B ridge 200 属带宽受限,但 FIA 连带宽都没吃满:mac=0.25(cube 闲)+ mte2=0.93(载入忙但低效),两条 pipe 都空转。根因是 **thin-M**(TND 打包后每段只有 32 个 query 行,cube 的 M 维填不满)+ **online-softmax 的 QK→softmax→AV 串行气泡**,NPU 又不能靠多流重叠(§2.1)。**H20 的 flashinfer 在同一形状上更差**:有效 0.56 TB/s = 其 4 TB/s 规格的仅 **14%**(910B 是 32%)——所以 attention 上 H20 的带宽优势完全用不出,两边打平(§2.5)。
+
+- 解法:算子团队优化 thin-M(M=32 × N≈4231)的 tiling + QK/softmax/AV 流水(大头 ~60%);或算法侧增大去噪块把 M 撑大(§4.1 block 做大)。
+- KV `block_size=32` 另值 ~11%(block_table 间接开销),把 KV page 解耦到 128 即可消掉;算子内部本就按 128-tile 算。
+- 复现/交付:`scratch_profile/fia_decode_bench.py`(整核 roofline)、`fia_page_probe.py`(内部 tile 粒度探针),固定 shape `q[2304,16,128] / kv[·,·,512]`。
 
 ### 4.3 更少更胖的融合核
 
@@ -376,6 +400,6 @@ NPU 的优化方向(第二章方法论):减 kernel 数 + 减冗余内存遍历�
 | 大 bs(单卡) | bs 天花板约 160,但无吞吐收益(MoE 仍带宽受限 + graph/KV 吃显存)。推荐 bs=128。 |
 | 大 bs + EP | MoE 进甜点(85-88%),但 a2a 让节点吞吐降到 1/4.6,128blk 净亏。EP 目前只值得为显存用。 |
 | 后续方向 | 算法层(§4.1):① block 做大(attention+MoE 同进算力区、单卡进甜点、免 a2a)② blockwise MoE(压 block 内专家、降 MoE 带宽)③ 全词表裁剪。 |
-| 对 H20 的判断 | 小 batch H20 领先(bs=1 1.9×);大 batch + 短到中等序列 910B 超过(gsm8k +7%、512/2048 +10%);但 4K in/1.5K out 时 H20 反超 1.4×(910B 受 64GB 显存限制只能到 bs≈72,低 bs 下 MoE t 更小对 910B 不利;精确归因待 4K profiling)。 |
+| 对 H20 的判断 | 小 batch H20 领先(bs=1 1.9×);大 batch 两者基本打平:短序列 910B +7%、512/2048 +10%,4K/1.5K 同 bs 打平(2004 vs 2032 tok/s)。H20 的整体小幅领先来自显存容量(96GB→bs=128,代价 TPOT +63%),不是单位算力/带宽;逐算子层面 910B kernel 工作量还少 11%。 |
 
-待刷新:H20 列的 kernel 构成 / 单 kernel 时间来自 H20 硬件 trace,但该次 capture 非饱和,绝对 per-forward 标度待用饱和数据复核。
+配置注:多样 prompt 的长序列(RL rollout)用 `--disable-radix-cache` + `STEPS_PER_ROUND=1`(§2.5/§2.6);有共享前缀的短序列(gsm8k few-shot)保留 radix + K=2。
