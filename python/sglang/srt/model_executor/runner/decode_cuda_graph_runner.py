@@ -354,7 +354,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             max_num_token=self.max_num_token,
             hidden_size=self.model_runner.model_config.hidden_size,
             next_token_logits_buffer=self.model_runner.graph_shared_output.get_logits_buffer(
-                self.model_runner.model_config.vocab_size, rows=self.max_num_token
+                self.model_runner.model_config.vocab_size,
+                rows=self.max_num_token,
+                dtype=(
+                    self.model_runner.model_config.dtype
+                    if self.dllm_config is not None
+                    else torch.float
+                ),
             ),
             dtype=self.model_runner.model_config.dtype,
             dp_size=self.dp_size,

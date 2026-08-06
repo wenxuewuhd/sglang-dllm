@@ -770,13 +770,19 @@ class LogitsProcessor(nn.Module):
             # per copy). Callers on this path consume the lm_head-dtype logits
             # via reductions that never build another [tokens, vocab] fp32.
             #
-            # _copy_logits_to_buffer does two things; only the padding trim is
-            # reproduced here. Its other job -- publishing into
-            # next_token_logits_buffer, the graph-captured static buffer -- has
-            # no counterpart on this path: it returns full_logits with
-            # next_token_logits left None, so nothing ever reads that buffer.
             if logits.shape[-1] > self.vocab_size:
                 logits = logits[:, : self.vocab_size]
+            # dLLM graphs provide a model-dtype shared output buffer. Reusing it
+            # prevents every captured batch size from retaining a separate
+            # [tokens, vocab] output allocation.
+            logits_buffer = logits_metadata.next_token_logits_buffer
+            if (
+                logits_buffer is not None
+                and tuple(logits_buffer.shape) == tuple(logits.shape)
+                and logits_buffer.dtype == logits.dtype
+            ):
+                logits_buffer.copy_(logits)
+                logits = logits_buffer
         else:
             logits = self._copy_logits_to_buffer(
                 logits, logits_metadata, use_buffer=use_logits_buffer
@@ -932,10 +938,17 @@ class LogitsProcessor(nn.Module):
         # threshold the fp32 path is the faster one and there is no memory
         # pressure to trade against. See SGLANG_DLLM_KEEP_LOGITS_DTYPE_MIN_ROWS.
         min_rows = _keep_logits_dtype_min_rows()
+        logits_buffer = logits_metadata.next_token_logits_buffer
+        graph_keeps_lm_head_dtype = (
+            logits_buffer is not None and logits_buffer.dtype == hidden_states.dtype
+        )
         keep_lm_head_dtype = (
-            min_rows is not None
-            and min_rows >= 0
-            and hidden_states.shape[0] >= min_rows
+            graph_keeps_lm_head_dtype
+            or (
+                min_rows is not None
+                and min_rows >= 0
+                and hidden_states.shape[0] >= min_rows
+            )
         )
         full_logits = self._get_logits(
             hidden_states,
