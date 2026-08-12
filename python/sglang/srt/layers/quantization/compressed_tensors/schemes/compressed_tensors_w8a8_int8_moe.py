@@ -147,8 +147,12 @@ class NPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
             w2_weight=layer.w2_weight,
             w13_weight_scale=layer.w13_weight_scale,
             w2_weight_scale=layer.w2_weight_scale,
-            w13_weight_offset=layer.w13_weight_offset,
-            w2_weight_offset=layer.w2_weight_offset,
+            # Symmetric checkpoints carry no zero points, so create_weights()
+            # registers no offset params. AscendQuantInfo,
+            # process_weights_after_loading() and NPUW8A8Int8MoEMethod.apply all
+            # already treat the offsets as optional.
+            w13_weight_offset=getattr(layer, "w13_weight_offset", None),
+            w2_weight_offset=getattr(layer, "w2_weight_offset", None),
             w13_weight_bias=getattr(layer, "w13_weight_bias", None),
             w2_weight_bias=getattr(layer, "w2_weight_bias", None),
             w13_scale_bias=getattr(layer, "w13_scale_bias", None),
