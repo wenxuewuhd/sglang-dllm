@@ -658,6 +658,7 @@ class DeepseekV2MoE(nn.Module):
             ),
             swiglu_limit=getattr(config, "swiglu_limit", None),
             prefix=add_prefix("experts", prefix),
+            is_nextn=is_nextn,
         )
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):

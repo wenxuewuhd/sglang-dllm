@@ -7,6 +7,7 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
 (using any quantization method) and CPU experts (using AMX/AVX instructions).
 """
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -15,6 +16,8 @@ import torch
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_compiler_backend
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
@@ -59,13 +62,16 @@ class KTConfig:
 
 
 def create_kt_config_from_server_args(
-    server_args: "ServerArgs", layer_idx: int
+    server_args: "ServerArgs", layer_idx: int, is_nextn: bool = False
 ) -> Optional[KTConfig]:
     """Create KTConfig from ServerArgs if KT is configured.
 
     Args:
         server_args: Global server arguments
-        layer_idx: Layer index in the model
+        layer_idx: Layer index within the model being built
+        is_nextn: True when building an MTP/NextN draft model, whose layers are
+            numbered from 0 again and therefore need offsetting to stay distinct
+            from the target model's layers
 
     Returns:
         KTConfig if KT is configured, None otherwise
@@ -81,6 +87,20 @@ def create_kt_config_from_server_args(
     except Exception:
         # If we can't get the config, num_layers will be None
         pass
+
+    # An MTP draft layer is built with layer_id=0, which would otherwise collide
+    # with the target model's layer 0: both would resolve the same per-layer
+    # expert weights and each build its own KTMoEWrapper for index 0. MTP layers
+    # follow the target model's layers in the checkpoint's global numbering.
+    if is_nextn:
+        if num_layers is None:
+            logger.warning(
+                "[KT] num_hidden_layers unavailable; cannot offset the MTP draft "
+                "layer index. CPU experts for layer %d may be loaded twice.",
+                layer_idx,
+            )
+        else:
+            layer_idx += num_layers
 
     return KTConfig(
         layer_idx=layer_idx,

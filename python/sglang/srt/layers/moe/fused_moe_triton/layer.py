@@ -256,6 +256,7 @@ class FusedMoE(torch.nn.Module):
         with_bias=False,
         routing_method_type: Optional[RoutingMethodType] = None,
         is_gated: bool = True,
+        is_nextn: bool = False,
         gate_up_interleaved: bool = True,
     ):
         super().__init__()
@@ -364,7 +365,9 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method: Optional[FusedMoEMethodBase] = None
         server_args = get_server_args()
-        kt_config = create_kt_config_from_server_args(server_args, layer_id)
+        kt_config = create_kt_config_from_server_args(
+            server_args, layer_id, is_nextn=is_nextn
+        )
         if kt_config is not None:
             if quant_config is not None:
                 gpu_method = quant_config.get_quant_method(self, prefix)
