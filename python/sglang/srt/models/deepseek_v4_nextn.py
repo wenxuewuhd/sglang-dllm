@@ -42,6 +42,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer, DeepseekV4ForCausalLM
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
@@ -221,6 +222,14 @@ class DeepseekV4ModelNextN(nn.Module):
 
 
 class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
+    # The MTP layer's modules live under "model.decoder" here, while the checkpoint
+    # spells them "mtp.<i>.*" -- so the target model's mapper does not apply. Same
+    # purpose as DeepseekV4ForCausalLM.hf_to_sglang_mapper: rewrite the quantization
+    # config's `ignore` / target lists into this model's module paths.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={f"mtp.{i}.": "model.decoder." for i in range(8)},
+        orig_to_new_substr=DeepseekV4ForCausalLM.hf_to_sglang_mapper.orig_to_new_substr,
+    )
 
     def __init__(
         self,

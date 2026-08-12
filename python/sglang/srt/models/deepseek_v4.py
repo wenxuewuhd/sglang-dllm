@@ -147,6 +147,7 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_device, get_exec, get_forward, get_parallel
 
 if not _is_hip:
@@ -2579,6 +2580,27 @@ class DeepseekV4Model(nn.Module):
 
 
 class DeepseekV4ForCausalLM(nn.Module):
+    # DeepSeek-V4 checkpoints name modules in their own layout ("layers.2.attn.wq_a")
+    # rather than the HF layout the module tree is built with
+    # ("model.layers.2.self_attn.wq_a"). load_weights() handles the weight stream via
+    # remap_weight_name_to_dpsk_hf_format(); this mapper covers the other consumer --
+    # quantization configs, whose `ignore` / target lists are matched against module
+    # paths. Without it, every projection the checkpoint asks to keep in higher
+    # precision is built as a quantized param instead and the load dies in the weight
+    # loader with "init para dtype and loaded weight dtype should be the same".
+    #
+    # Only the module-path rules of remap_weight_name_to_dpsk_hf_format() belong here;
+    # its param-name rules (".scale" -> ".weight_scale_inv") do not apply to module names.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={"layers.": "model.layers."},
+        orig_to_new_substr={
+            ".attn.": ".self_attn.",
+            ".ffn.": ".mlp.",
+            ".attn_norm.": ".input_layernorm.",
+            ".ffn_norm.": ".post_attention_layernorm.",
+        },
+    )
+
     def __init__(
         self,
         config: DeepSeekV4Config,
