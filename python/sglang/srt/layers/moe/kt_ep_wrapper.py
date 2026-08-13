@@ -7,8 +7,10 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
 (using any quantization method) and CPU experts (using AMX/AVX instructions).
 """
 
+import logging
+import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Set, Tuple
 
 import torch
 
@@ -18,6 +20,11 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils.kt_accel import (
+    kt_current_stream,
+    kt_current_stream_handle,
+    kt_device_synchronize,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
@@ -33,6 +40,55 @@ try:
     KTRANSFORMERS_AVAILABLE = True
 except ImportError:
     KTRANSFORMERS_AVAILABLE = False
+
+
+logger = logging.getLogger(__name__)
+_npu_report_subscribed: Set[int] = set()
+
+
+def _npu_use_graph_host_callback(device: torch.device) -> bool:
+    if device.type != "npu":
+        return False
+    try:
+        if torch.npu.is_current_stream_capturing():
+            return True
+    except Exception:
+        pass
+    try:
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        return get_is_capture_mode()
+    except Exception:
+        return False
+
+
+def _ensure_npu_subscribe_report(stream) -> None:
+    key = int(stream.npu_stream)
+    if key in _npu_report_subscribed:
+        return
+    import torch_npu
+
+    torch_npu.npu._subscribe_report(stream)
+    _npu_report_subscribed.add(key)
+
+
+@torch.no_grad()
+def _kt_npu_graph_host_forward(args) -> None:
+    wrapper, hidden_states, stream_handle = args
+    wrapper.run_pinned_forward_sync(hidden_states, stream_handle)
+
+
+def resolve_kt_weight_path_for_layer(weight_path: str, layer_idx: int) -> str:
+    """Resolve a per-layer KT weight path without requiring a launcher patch."""
+    if "{layer_idx}" in weight_path:
+        return weight_path.format(layer_idx=layer_idx)
+    if weight_path.count("{}") == 1:
+        return weight_path.replace("{}", str(layer_idx), 1)
+    if weight_path.count("{}") > 1:
+        logger.warning(
+            "KT weight path has multiple '{}' placeholders; using it literally"
+        )
+    return weight_path
 
 
 @dataclass
@@ -76,10 +132,30 @@ def create_kt_config_from_server_args(
     if server_args.kt_weight_path is None:
         return None
 
+    if server_args.device == "npu":
+        if not server_args.kt_num_gpu_experts or server_args.kt_num_gpu_experts < 1:
+            raise ValueError(
+                "KT expert offload on NPU currently requires "
+                "--kt-num-gpu-experts >= 1"
+            )
+        if server_args.tp_size != 1 or server_args.ep_size != 1:
+            raise ValueError(
+                "KT expert offload on NPU currently supports only "
+                "--tensor-parallel-size 1 and --expert-parallel-size 1"
+            )
+        if server_args.moe_a2a_backend != "none":
+            raise ValueError(
+                "KT expert offload on NPU requires --moe-a2a-backend none; "
+                "the Ascend dispatcher hook does not support A2A dispatchers yet"
+            )
+        # torch_npu owns the ACL report subscriber used by graph host callbacks.
+        # Tell kt-kernel not to attach a second subscriber to the same stream.
+        os.environ["KT_EXTERNAL_NPU_REPORT_SUBSCRIBER"] = "1"
+
     # Try to get num_layers from model config
     num_layers = None
     try:
-        hf_config = server_args.get_hf_config()
+        hf_config = server_args.get_model_config().hf_config
         num_layers = getattr(hf_config, "num_hidden_layers", None)
     except Exception:
         # If we can't get the config, num_layers will be None
@@ -115,6 +191,25 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
     """
     topk_ids[topk_ids >= num_gpu_experts] = -1
     return topk_ids
+
+
+def mask_cpu_expert_routing_npu(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_gpu_experts: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Map CPU routes to a zero-weight valid expert for NPU grouped matmul.
+
+    Ascend routing kernels do not accept the ``-1`` sentinel used by CUDA.  A
+    valid expert id with a zero weight is equivalent and keeps the NPU kernel
+    inputs well formed.
+    """
+    is_gpu = topk_ids < num_gpu_experts
+    safe_ids = torch.where(is_gpu, topk_ids, torch.zeros_like(topk_ids))
+    safe_weights = torch.where(
+        is_gpu, topk_weights, torch.zeros_like(topk_weights)
+    )
+    return safe_ids, safe_weights
 
 
 class KTEPWrapperMethod(FusedMoEMethodBase):
@@ -219,19 +314,25 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts: num_gpu_experts to num_experts-1
         if self.tp_rank == 0:
+            gpu_experts_mask = torch.zeros(num_experts, dtype=torch.bool)
+            gpu_experts_mask[: self.num_gpu_experts] = True
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
                 num_experts_per_tok=num_experts_per_tok,
                 hidden_size=hidden_size,
                 moe_intermediate_size=intermediate_size_full,
-                num_gpu_experts=self.num_gpu_experts,
+                gpu_experts_mask=gpu_experts_mask,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
-                weight_path=self.kt_config.weight_path,
+                numa_nodes=None,
+                weight_path=resolve_kt_weight_path_for_layer(
+                    self.kt_config.weight_path, self.kt_config.layer_idx
+                ),
                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
                 method=self.kt_config.method,
                 max_deferred_experts_per_token=layer_max_deferred,
+                swiglu_limit=layer.moe_runner_config.swiglu_limit or 0.0,
             )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -246,7 +347,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # 2. Load CPU weights using KT wrapper
         if self.tp_rank == 0 and self.wrapper is not None:
-            torch.cuda.synchronize()
+            kt_device_synchronize(layer.w13_weight.device)
 
             # Get expert location metadata for CPU expert mapping
             from sglang.srt.eplb.expert_location_dispatch import (
@@ -260,6 +361,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             )
             self.wrapper.load_weights(physical_to_logical_map_cpu)
 
+            # Subscribe before NPU graph capture.  Subscribing lazily from the
+            # first captured forward performs an ACL control operation that is
+            # illegal during capture.
+            if layer.w13_weight.device.type == "npu":
+                _ensure_npu_subscribe_report(
+                    kt_current_stream(layer.w13_weight.device)
+                )
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
     ):
@@ -271,9 +380,92 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         """
         self.moe_runner_config = moe_runner_config
         if self.override_num_local_experts:
+            # AscendTPDispatcher sizes its expert_tokens buffer from
+            # ``num_experts`` while the runner uses ``num_local_experts``.
+            # Both must describe the resident NPU expert set.
+            moe_runner_config.num_experts = self.num_gpu_experts
             moe_runner_config.num_local_experts = self.num_gpu_experts
         # Delegate to GPU method to create its runner
         self.gpu_method.create_moe_runner(layer, moe_runner_config)
+
+    def attach_dispatcher(self, dispatcher) -> None:
+        """Attach KT at the correct side of the latest Ascend TP dispatcher.
+
+        Ascend dispatch expands tokens before ``quant_method.apply``.  CPU MoE
+        must consume the original token rows and be merged after finalize
+        routing, so the legacy wrapper-only submit/sync placement is invalid.
+        """
+        if dispatcher.__class__.__name__ != "AscendTPDispatcher":
+            return
+        dispatcher.register_pre_dispatch_hook(self._ascend_pre_dispatch)
+        dispatcher.register_post_combine_hook(self._ascend_post_combine)
+
+    def _submit_raw(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output,
+    ) -> None:
+        if self.tp_rank != 0 or self.wrapper is None:
+            return
+        topk_weights, topk_ids, _ = topk_output
+        self.wrapper.submit_forward(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            kt_current_stream_handle(hidden_states.device),
+        )
+
+    def _submit_raw_npu_graph(self, hidden_states: torch.Tensor, topk_output) -> None:
+        import torch_npu
+
+        assert self.wrapper is not None
+        topk_weights, topk_ids, _ = topk_output
+        stream = kt_current_stream(hidden_states.device)
+        _ensure_npu_subscribe_report(stream)
+        stream_handle = kt_current_stream_handle(hidden_states.device)
+        self.wrapper.copy_inputs_to_cpu_buffers(
+            hidden_states, topk_ids, topk_weights
+        )
+        torch_npu.npu._launch_host_func(
+            stream,
+            _kt_npu_graph_host_forward,
+            (self.wrapper, hidden_states, stream_handle),
+        )
+
+    def _ascend_pre_dispatch(self, dispatcher, hidden_states, topk_output):
+        del dispatcher
+        use_graph = (
+            self.tp_rank == 0
+            and self.wrapper is not None
+            and _npu_use_graph_host_callback(hidden_states.device)
+        )
+        self._ascend_pending_hidden_states = hidden_states
+        self._ascend_pending_graph = use_graph
+        if use_graph:
+            self._submit_raw_npu_graph(hidden_states, topk_output)
+        else:
+            self._submit_raw(hidden_states, topk_output)
+
+        safe_ids, safe_weights = mask_cpu_expert_routing_npu(
+            topk_output.topk_ids,
+            topk_output.topk_weights,
+            self.num_gpu_experts,
+        )
+        return hidden_states, topk_output._replace(
+            topk_ids=safe_ids,
+            topk_weights=safe_weights,
+        )
+
+    def _ascend_post_combine(self, dispatcher, hidden_states):
+        del dispatcher
+        original = self._ascend_pending_hidden_states
+        cpu_output = self.sync(
+            original,
+            cpu_already_synced=self._ascend_pending_graph,
+        )
+        self._ascend_pending_hidden_states = None
+        self._ascend_pending_graph = False
+        return hidden_states + cpu_output
 
     def submit(
         self,
@@ -302,10 +494,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Submit forward task to CPU (non-blocking)
         self.wrapper.submit_forward(
-            x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
+            x, topk_ids, topk_weights, kt_current_stream_handle(x.device)
         )
 
-    def sync(self, x: torch.Tensor) -> torch.Tensor:
+    def sync(self, x: torch.Tensor, *, cpu_already_synced: bool = False) -> torch.Tensor:
         """Synchronize and retrieve CPU expert computation results.
 
         This method waits for the CPU computation to complete and returns the results.
@@ -319,9 +511,28 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.tp_rank != 0 or self.wrapper is None:
             return torch.zeros_like(x)
 
-        # Wait for CPU computation and retrieve results
-        return self.wrapper.sync_forward(
-            x, torch.cuda.current_stream(x.device).cuda_stream
+        if cpu_already_synced:
+            return self.wrapper.copy_forward_output_to_device(x)
+        return self.wrapper.sync_forward(x, kt_current_stream_handle(x.device))
+
+    def _submit_cpu_npu_graph(
+        self,
+        dispatch_output: "StandardDispatchOutput",
+        x: torch.Tensor,
+    ) -> None:
+        """Capture CPU MoE as an Ascend graph host callback."""
+        import torch_npu
+
+        assert self.wrapper is not None
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        stream = kt_current_stream(x.device)
+        _ensure_npu_subscribe_report(stream)
+        stream_handle = kt_current_stream_handle(x.device)
+        self.wrapper.copy_inputs_to_cpu_buffers(x, topk_ids, topk_weights)
+        torch_npu.npu._launch_host_func(
+            stream,
+            _kt_npu_graph_host_forward,
+            (self.wrapper, x, stream_handle),
         )
 
     def apply(
@@ -345,32 +556,55 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         """
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
+        # The latest AscendTP path submits CPU work in a pre-dispatch hook and
+        # merges it in a post-combine hook.  Here only the resident NPU experts
+        # run on already-expanded dispatcher output.
+        if dispatch_output.format.is_ascend_tp():
+            return self.gpu_method.apply(layer, dispatch_output)
+
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
-        # Step 1: Submit CPU expert computation (non-blocking)
-        if self.tp_rank == 0:
-            self.submit(layer, dispatch_output)
-
-        # Step 2: Prepare GPU computation by masking CPU expert IDs
-        # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
-        topk_ids = topk_output.topk_ids
-        masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
-
-        # Create modified dispatch output for GPU computation
-        masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
-        masked_dispatch_output = dispatch_output._replace(
-            topk_output=masked_topk_output
+        use_npu_graph = (
+            self.tp_rank == 0
+            and self.wrapper is not None
+            and _npu_use_graph_host_callback(x.device)
         )
 
-        # Step 3: Execute GPU expert computation (any quantization method)
-        # This runs in parallel with CPU computation
-        gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
+        # Step 1: Submit CPU expert computation (non-blocking or captured host callback)
+        if use_npu_graph:
+            self._submit_cpu_npu_graph(dispatch_output, x)
+        elif self.tp_rank == 0:
+            self.submit(layer, dispatch_output)
 
-        # Step 4: Synchronize CPU results and merge with GPU results
-        output = gpu_combine_input.hidden_states
+        # Step 2/3: Run resident accelerator experts.  The all-CPU case must
+        # not call grouped matmul with an empty weight tensor.
+        if self.num_gpu_experts > 0:
+            topk_ids = topk_output.topk_ids
+            if x.device.type == "npu":
+                masked_topk_ids, masked_topk_weights = mask_cpu_expert_routing_npu(
+                    topk_ids, topk_output.topk_weights, self.num_gpu_experts
+                )
+                masked_topk_output = topk_output._replace(
+                    topk_ids=masked_topk_ids,
+                    topk_weights=masked_topk_weights,
+                )
+            else:
+                masked_topk_output = topk_output._replace(
+                    topk_ids=mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
+                )
+            masked_dispatch_output = dispatch_output._replace(
+                topk_output=masked_topk_output
+            )
+            output = self.gpu_method.apply(
+                layer, masked_dispatch_output
+            ).hidden_states
+        else:
+            output = torch.zeros_like(x)
+
+        # Step 4: Synchronize CPU results and merge with accelerator results.
         if self.tp_rank == 0:
-            cpu_output = self.sync(x)
+            cpu_output = self.sync(x, cpu_already_synced=use_npu_graph)
             output = output + cpu_output
 
         return StandardCombineInput(hidden_states=output)
