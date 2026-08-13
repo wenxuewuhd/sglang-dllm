@@ -8809,7 +8809,12 @@ class ServerArgs:
         # it, mirroring the forward scale split: the ue8m0 path
         # (DEEPGEMM_SCALE_UE8M0, true sm100, default on) or an sm90 opt-in
         # fp32-scale path (use FP4 expert ckpt). Disable in every other case.
-        if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+        if not is_cuda():
+            # This path calls DeepGEMM and imports CUDA-only kernels.  Keep it
+            # disabled on NPU/XPU/CPU even though the environment option
+            # defaults to true.
+            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+        elif envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
             from sglang.srt.layers import deep_gemm_wrapper
 
             sm = get_device_sm()

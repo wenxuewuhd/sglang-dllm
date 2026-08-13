@@ -12,6 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -149,6 +150,36 @@ class TestIgnoreListPrefixMatching(CustomTestCase):
         self.assertTrue(check_equal_or_regex_match(GATE_PROJ, ["re:.*gate_proj$"]))
         self.assertFalse(check_equal_or_regex_match(GATE_PROJ, ["re:.*down_proj$"]))
 
+    def test_deepseek_v4_fused_attention_ignore_mapping(self):
+        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+        mapped_ignore = DeepseekV4ForCausalLM.hf_to_sglang_mapper.apply_list(
+            ["layers.0.attn.wq_a", "layers.0.attn.wkv"]
+        )
+        fused_mapping = DeepseekV4ForCausalLM.packed_modules_mapping
+
+        self.assertEqual(
+            mapped_ignore,
+            [
+                "model.layers.0.self_attn.wq_a",
+                "model.layers.0.self_attn.wkv",
+            ],
+        )
+        self.assertTrue(
+            should_ignore_layer(
+                "model.layers.0.self_attn.wqkv_a",
+                ignore=mapped_ignore,
+                fused_mapping=fused_mapping,
+            )
+        )
+
+        with self.assertRaises(ValueError):
+            should_ignore_layer(
+                "model.layers.0.self_attn.wqkv_a",
+                ignore=mapped_ignore[:1],
+                fused_mapping=fused_mapping,
+            )
+
 
 class TestMixedPrecisionFormat(CustomTestCase):
     """The per-group `format` must win over a top-level "mixed-precision"."""
@@ -186,6 +217,34 @@ class TestMixedPrecisionFormat(CustomTestCase):
         self.assertEqual(scheme.pack_factor, 32 // 4)
         self.assertEqual(scheme.strategy, "group")
         self.assertEqual(scheme.group_size, 128)
+
+
+class TestNPUCompressedTensorsMoE(CustomTestCase):
+    def test_symmetric_w8a8_does_not_require_weight_offsets(self):
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8_moe import (
+            NPUCompressedTensorsW8A8Int8DynamicMoE,
+        )
+
+        captured = {}
+
+        class FakeRunner:
+            def run(self, dispatch_output, quant_info):
+                captured["quant_info"] = quant_info
+                return dispatch_output
+
+        scheme = object.__new__(NPUCompressedTensorsW8A8Int8DynamicMoE)
+        scheme.runner = FakeRunner()
+        layer = SimpleNamespace(
+            w13_weight=torch.empty(0),
+            w2_weight=torch.empty(0),
+            w13_weight_scale=torch.empty(0),
+            w2_weight_scale=torch.empty(0),
+        )
+        dispatch_output = object()
+
+        self.assertIs(scheme.apply_weights(layer, dispatch_output), dispatch_output)
+        self.assertIsNone(captured["quant_info"].w13_weight_offset)
+        self.assertIsNone(captured["quant_info"].w2_weight_offset)
 
 
 if __name__ == "__main__":
