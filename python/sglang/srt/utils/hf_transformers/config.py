@@ -74,6 +74,32 @@ def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
     )
 
 
+def _try_load_deepseek_v4_compat_config(
+    model, revision: Optional[str], trust_remote_code: bool, **kwargs
+):
+    """Load SGLang's DeepSeek-V4 compatibility config before AutoConfig.
+
+    Transformers 5.x ships a built-in ``deepseek_v4`` registration.  That
+    registration wins over SGLang's V3-compatible alias and validates
+    ``compress_ratios`` against a smaller set of values than the Flash
+    checkpoint uses.  Inspecting the raw model type first avoids depending on
+    global AutoConfig registration order while keeping other model types on the
+    standard loading path.
+    """
+    config_dict, _ = PretrainedConfig.get_config_dict(
+        model, revision=revision, **kwargs
+    )
+    if config_dict.get("model_type") != "deepseek_v4":
+        return None
+
+    return _CONFIG_REGISTRY["deepseek_v4"].from_pretrained(
+        model,
+        revision=revision,
+        trust_remote_code=trust_remote_code,
+        **kwargs,
+    )
+
+
 @register_model_config_parser("hf")
 class HfModelConfigParser(ModelConfigParserBase):
     def parse(
@@ -83,7 +109,11 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
-        config = _try_load_longcat_config(model, revision, **kwargs)
+        config = _try_load_deepseek_v4_compat_config(
+            model, revision, trust_remote_code, **kwargs
+        )
+        if config is None:
+            config = _try_load_longcat_config(model, revision, **kwargs)
         if config is None:
             config = AutoConfig.from_pretrained(
                 model,
