@@ -153,6 +153,20 @@ try:
     class _DeepseekV4ConfigAlias(_HFDeepseekV3Config):
         model_type = "deepseek_v4"
 
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # The checkpoint spells an uncompressed/SWA-only layer as ratio
+            # 1, while SGLang's DSV4 cache/backend APIs use ratio 0 for that
+            # same layout (4 and 128 select the compressed paths).
+            if getattr(self, "compress_ratios", None) is not None:
+                self.compress_ratios = [
+                    0 if ratio == 1 else ratio for ratio in self.compress_ratios
+                ]
+            # Flash checkpoints use the training-side name while SGLang's
+            # hybrid-layer shape derivation consumes the HF-standard name.
+            if not hasattr(self, "sliding_window"):
+                self.sliding_window = getattr(self, "sliding_window_size", None)
+
     _CONFIG_REGISTRY["deepseek_v32"] = _DeepseekV32ConfigAlias
     _CONFIG_REGISTRY["deepseek_v4"] = _DeepseekV4ConfigAlias
 
@@ -206,7 +220,12 @@ except ImportError:
 
 for name, cls in _CONFIG_REGISTRY.items():
     try:
-        AutoConfig.register(name, cls)
+        # Transformers 5.x ships a built-in DeepSeek-V4 config whose
+        # compress-ratio validation is incompatible with the Flash
+        # checkpoint.  Register SGLang's V3-compatible alias as the explicit
+        # override so indirect AutoConfig users (notably AutoTokenizer) see
+        # the same config as SGLang's model-config loader.
+        AutoConfig.register(name, cls, exist_ok=name == "deepseek_v4")
     except ValueError as e:
         err = str(e).lower()
         if "already registered" not in err and "already used" not in err:

@@ -147,8 +147,11 @@ class NPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
             w2_weight=layer.w2_weight,
             w13_weight_scale=layer.w13_weight_scale,
             w2_weight_scale=layer.w2_weight_scale,
-            w13_weight_offset=layer.w13_weight_offset,
-            w2_weight_offset=layer.w2_weight_offset,
+            # Symmetric W8A8 checkpoints do not have zero-point/offset
+            # tensors.  AscendQuantInfo already models these fields as
+            # optional, so keep them optional here as well.
+            w13_weight_offset=getattr(layer, "w13_weight_offset", None),
+            w2_weight_offset=getattr(layer, "w2_weight_offset", None),
             w13_weight_bias=getattr(layer, "w13_weight_bias", None),
             w2_weight_bias=getattr(layer, "w2_weight_bias", None),
             w13_scale_bias=getattr(layer, "w13_scale_bias", None),

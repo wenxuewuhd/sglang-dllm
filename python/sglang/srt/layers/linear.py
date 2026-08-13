@@ -269,7 +269,11 @@ class ReplicatedLinear(LinearBase):
             if param.dtype == torch.int8 or loaded_weight.dtype == torch.int8:
                 assert (
                     param.dtype == loaded_weight.dtype
-                ), "init para dtype and loaded weight dtype should be the same"
+                ), (
+                    "init para dtype and loaded weight dtype should be the same: "
+                    f"param={param.shape}/{param.dtype}, "
+                    f"loaded={loaded_weight.shape}/{loaded_weight.dtype}"
+                )
 
         assert (
             param.size() == loaded_weight.size()

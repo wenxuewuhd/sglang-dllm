@@ -189,7 +189,12 @@ class HashTopK(nn.Module):
             input_ids.shape[0] == hidden_states.shape[0] == router_logits.shape[0]
         ), f"{input_ids.shape=} {hidden_states.shape=} {router_logits.shape=}"
 
-        if envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
+        # The fused implementation in ``kernels.ops.attention.dsv4`` is a
+        # CUDA/HIP kernel.  NPU must stay on the device-native torch path until
+        # an NPU fused hash routing kernel is wired in; otherwise the first
+        # request attempts a CUDA JIT build and fails while looking for
+        # CUDA_HOME.
+        if envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get() and not _is_npu:
             from sglang.kernels.ops.attention.dsv4 import hash_topk
 
             topk_weights, topk_ids = hash_topk(

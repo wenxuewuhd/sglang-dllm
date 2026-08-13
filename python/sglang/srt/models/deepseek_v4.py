@@ -147,6 +147,7 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_device, get_exec, get_forward, get_parallel
 
 if not _is_hip:
@@ -2579,6 +2580,24 @@ class DeepseekV4Model(nn.Module):
 
 
 class DeepseekV4ForCausalLM(nn.Module):
+    # Official DeepSeek-V4 checkpoints use the native names ``layers.*.attn``
+    # and ``head`` in both the weight stream and compressed-tensors' ignore
+    # list, while the SGLang module tree uses ``model.layers.*.self_attn`` and
+    # ``lm_head``.  The loader applies this mapper to the quantization config
+    # before constructing modules, keeping the checkpoint's BF16 exclusions
+    # from falling through to the catch-all quantized ``Linear`` target.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            ".attn.": ".self_attn.",
+            ".ffn.": ".mlp.",
+        },
+        orig_to_new_prefix={
+            "layers.": "model.layers.",
+            "head": "lm_head",
+        },
+    )
+    packed_modules_mapping = {"wqkv_a": ["wq_a", "wkv"]}
+
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -3000,7 +3019,11 @@ class DeepseekV4ForCausalLM(nn.Module):
                         "SGLANG_OPT_FP8_WO_A_GEMM=0."
                     )
                 try:
-                    use_async_loading = should_async_load(loaded_weight)
+                    # The generic async loader restores only CUDA's
+                    # thread-local device.  Keep NPU copies on the scheduler
+                    # thread so torch_npu always uses the selected logical
+                    # device and errors retain the current checkpoint name.
+                    use_async_loading = should_async_load(loaded_weight) and not _is_npu
 
                     name = self.remap_weight_name_to_dpsk_hf_format(
                         name,
