@@ -95,6 +95,25 @@ def create_kt_config_from_server_args(
     )
 
 
+def build_prefix_gpu_experts_mask(
+    num_experts: int, num_gpu_experts: int
+) -> torch.Tensor:
+    """Bool mask marking the experts that stay resident on the accelerator.
+
+    kt-kernel's KTMoEWrapper takes ``gpu_experts_mask`` (a per-expert bool
+    tensor), which is what lets a caller place an arbitrary subset on device.
+    ``num_gpu_experts`` denotes the prefix case -- experts ``[0, N)`` resident --
+    so turn it into the equivalent mask. ``-1`` means "no CPU offload split",
+    matching the sentinel the FusedMoE weight loader already tests for.
+    """
+    mask = torch.zeros(num_experts, dtype=torch.bool)
+    if num_gpu_experts < 0:
+        mask[:] = True
+    else:
+        mask[: min(num_gpu_experts, num_experts)] = True
+    return mask
+
+
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.Tensor:
     """Mask CPU expert IDs by setting them to -1.
@@ -222,7 +241,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 num_experts_per_tok=num_experts_per_tok,
                 hidden_size=hidden_size,
                 moe_intermediate_size=intermediate_size_full,
-                num_gpu_experts=self.num_gpu_experts,
+                gpu_experts_mask=build_prefix_gpu_experts_mask(
+                    num_experts, self.num_gpu_experts
+                ),
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
                 weight_path=self.kt_config.weight_path,
