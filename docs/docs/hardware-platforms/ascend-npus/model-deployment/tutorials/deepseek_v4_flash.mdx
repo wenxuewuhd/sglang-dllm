@@ -176,9 +176,6 @@ source ${ASCEND_TOOLKIT_HOME}/opp/vendors/custom_transformer/bin/set_env.bash
 # Pick the physical card. The server still binds logical device 0 in-process.
 export ASCEND_RT_VISIBLE_DEVICES=0
 
-# DeepSeek-V4 specific kernel selection, consumed by the kt-kernel / custom operator side.
-export IS_DEEPSEEK_V4=1
-
 # Reduces HBM fragmentation across prefill chunks.
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
