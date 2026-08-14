@@ -68,7 +68,15 @@ def _ensure_npu_subscribe_report(stream) -> None:
         return
     import torch_npu
 
-    torch_npu.npu._subscribe_report(stream)
+    try:
+        torch_npu.npu._subscribe_report(stream)
+    except RuntimeError as exc:
+        # torch_npu >= 2.10 pre-subscribes capture streams inside NPUGraph, so a
+        # second AclrtSubscribeReport on the same stream fails with error 107011.
+        # The stream IS subscribed in that case, so only swallow that specific
+        # error and let anything else propagate.
+        if "107011" not in str(exc):
+            raise
     _npu_report_subscribed.add(key)
 
 
@@ -148,8 +156,13 @@ def create_kt_config_from_server_args(
                 "KT expert offload on NPU requires --moe-a2a-backend none; "
                 "the Ascend dispatcher hook does not support A2A dispatchers yet"
             )
-        # torch_npu owns the ACL report subscriber used by graph host callbacks.
-        # Tell kt-kernel not to attach a second subscriber to the same stream.
+        # Cross-repo contract: this variable is consumed by the companion
+        # kt-kernel build, not by SGLang.  SGLang owns the ACL report
+        # subscription for the streams used by graph host callbacks, so
+        # kt-kernel must not attach a second subscriber to the same stream --
+        # a double AclrtSubscribeReport fails with ACL error 107011.  A
+        # kt-kernel that does not understand this variable will still try to
+        # subscribe on its own; use the matching kt-kernel version.
         os.environ["KT_EXTERNAL_NPU_REPORT_SUBSCRIBER"] = "1"
 
     # Try to get num_layers from model config
@@ -363,7 +376,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # first captured forward performs an ACL control operation that is
             # illegal during capture.
             if layer.w13_weight.device.type == "npu":
-                _ensure_npu_subscribe_report(kt_current_stream(layer.w13_weight.device))
+                # Best effort only: ``_subscribe_report`` is a private torch_npu
+                # API, and the lazy path still subscribes outside capture, so a
+                # missing API must not break model loading.
+                try:
+                    _ensure_npu_subscribe_report(
+                        kt_current_stream(layer.w13_weight.device)
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[KT] pre-capture ACL report subscribe failed (non-fatal): %s",
+                        exc,
+                    )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
