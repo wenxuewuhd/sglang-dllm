@@ -16,8 +16,7 @@ def _accelerator(device: torch.device) -> Any:
 
         return torch.npu
     raise TypeError(
-        "KT heterogeneous MoE requires a CUDA or NPU device, "
-        f"got {device.type!r}"
+        "KT heterogeneous MoE requires a CUDA or NPU device, " f"got {device.type!r}"
     )
 
 

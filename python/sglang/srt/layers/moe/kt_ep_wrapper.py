@@ -206,9 +206,7 @@ def mask_cpu_expert_routing_npu(
     """
     is_gpu = topk_ids < num_gpu_experts
     safe_ids = torch.where(is_gpu, topk_ids, torch.zeros_like(topk_ids))
-    safe_weights = torch.where(
-        is_gpu, topk_weights, torch.zeros_like(topk_weights)
-    )
+    safe_weights = torch.where(is_gpu, topk_weights, torch.zeros_like(topk_weights))
     return safe_ids, safe_weights
 
 
@@ -365,9 +363,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # first captured forward performs an ACL control operation that is
             # illegal during capture.
             if layer.w13_weight.device.type == "npu":
-                _ensure_npu_subscribe_report(
-                    kt_current_stream(layer.w13_weight.device)
-                )
+                _ensure_npu_subscribe_report(kt_current_stream(layer.w13_weight.device))
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
@@ -423,9 +419,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         stream = kt_current_stream(hidden_states.device)
         _ensure_npu_subscribe_report(stream)
         stream_handle = kt_current_stream_handle(hidden_states.device)
-        self.wrapper.copy_inputs_to_cpu_buffers(
-            hidden_states, topk_ids, topk_weights
-        )
+        self.wrapper.copy_inputs_to_cpu_buffers(hidden_states, topk_ids, topk_weights)
         torch_npu.npu._launch_host_func(
             stream,
             _kt_npu_graph_host_forward,
@@ -497,7 +491,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             x, topk_ids, topk_weights, kt_current_stream_handle(x.device)
         )
 
-    def sync(self, x: torch.Tensor, *, cpu_already_synced: bool = False) -> torch.Tensor:
+    def sync(
+        self, x: torch.Tensor, *, cpu_already_synced: bool = False
+    ) -> torch.Tensor:
         """Synchronize and retrieve CPU expert computation results.
 
         This method waits for the CPU computation to complete and returns the results.
@@ -596,9 +592,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             masked_dispatch_output = dispatch_output._replace(
                 topk_output=masked_topk_output
             )
-            output = self.gpu_method.apply(
-                layer, masked_dispatch_output
-            ).hidden_states
+            output = self.gpu_method.apply(layer, masked_dispatch_output).hidden_states
         else:
             output = torch.zeros_like(x)
 
