@@ -3169,7 +3169,22 @@ class ServerArgs:
     ] = 2
     kt_num_gpu_experts: A[
         Optional[int],
-        "[ktransformers parameter] The number of GPU experts.",
+        "[ktransformers parameter] The number of GPU experts per MoE layer.",
+        NS("exec.moe"),
+    ] = None
+    kt_expert_placement_strategy: A[
+        Literal["prefix", "frequency"],
+        "[ktransformers parameter] Which experts stay resident on the accelerator: "
+        "'prefix' keeps experts 0..N-1 of every layer, 'frequency' keeps the N most "
+        "frequently activated experts of each layer as measured by "
+        "--kt-activation-freq-path.",
+        NS("exec.moe"),
+    ] = "prefix"
+    kt_activation_freq_path: A[
+        Optional[str],
+        "[ktransformers parameter] Path to an activation-frequency tensor of shape "
+        "[num_layers, num_experts] saved with torch.save. Required by "
+        "--kt-expert-placement-strategy frequency.",
         NS("exec.moe"),
     ] = None
     kt_max_deferred_experts_per_token: A[
