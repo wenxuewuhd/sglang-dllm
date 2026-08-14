@@ -70,11 +70,16 @@ _MXFP4_CKPT = os.environ.get("KT_MXFP4_CKPT", "")
 # straight from the per-layer GGUF (KT_GGUF_TEMPLATE, block_mxfp4 = e8m0 + half-block-packed codes)
 # that the CPU MoE already holds, instead of ALSO keeping a separate ~137GB pinned codes pool.
 #
-# !! PRECONDITION NOT MET IN THIS TREE !!  The DDR saving only materialises when the CPU MoE keeps
-# the GGUF as a shared file mapping, so that both sides hit the same page cache.  kt-kernel's
-# ``moe.hpp`` currently reads the GGUF with a parallel memcpy into private buffers, so turning this
-# on today costs an extra mapping instead of saving the pool.  Left default-off and unmodified until
-# the CPU side switches to mmap.
+# Sharing is real but partial, so this stays default-off.  kt-kernel does map the GGUF
+# (``kt-kernel/python/utils/loader.py`` hands ``moe.hpp`` a view over an ``np.memmap``), so the
+# reader below and the CPU MoE hit the same page cache and the pinned pool is genuinely recovered.
+# What is NOT recovered is kt-kernel's own copy: ``LLAMA_MOE_TP::load_weights`` memcpys each NUMA
+# subpool's ``intermediate_size / KT_THREADPOOL_COUNT`` slice into node-local buffers, so ~137GB of
+# anonymous DDR stays resident whatever this flag does.  With ``--kt-threadpool-count 8`` that copy
+# is unavoidable -- the zero-copy alias only applies to a single un-split pool -- so enabling this
+# trades a pinned, non-evictable pool for an evictable page cache that must survive alongside those
+# copies.  Enable it only when the box has the headroom to keep the GGUF cached; otherwise every
+# long prefill re-reads it from disk.
 _KT_GGUF_DEDUP = os.environ.get("KT_MXFP4_GGUF_DEDUP", "") == "1"
 _GGUF_TMPL = os.environ.get("KT_GGUF_TEMPLATE", "")
 _GGUF_READERS: dict = {}  # layer_idx -> GGUFReader (memmap)
