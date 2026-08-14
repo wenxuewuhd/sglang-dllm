@@ -28,7 +28,7 @@ KTransformers branch — there are no patches to apply by hand.
 | Quantization                | `--quantization compressed-tensors` (W8A8 on the NPU side)                                          |
 | Attention backend           | `--attention-backend ascend`                                                                       |
 | Paged KV cache              | `--page-size 128`                                                                                  |
-| NPU graph                   | **not verified** — use `--cuda-graph-backend-decode disabled --cuda-graph-backend-prefill disabled` |
+| NPU graph                   | On by default — **recommended**; pass no `--cuda-graph-backend-*` flag                              |
 
 <Note>
 Tensor parallelism, expert parallelism, A2A dispatch (`--moe-a2a-backend`), PD disaggregation and speculative decoding
@@ -245,8 +245,6 @@ python -m sglang.launch_server \
     --max-running-requests 1 \
     --chunked-prefill-size 8192 \
     --mem-fraction-static 0.81 \
-    --cuda-graph-backend-decode disabled \
-    --cuda-graph-backend-prefill disabled \
     --host 0.0.0.0 \
     --port ${PORT}
 ```
@@ -266,6 +264,7 @@ Parameter notes:
 | `--max-running-requests 1` | This configuration is validated for single-request serving only. |
 | `--chunked-prefill-size 8192` | Must be positive and a multiple of `--page-size`. Do **not** pass `-1`: the KT `LLAMAFILE` CPU MoE sizes its fp32 output buffer from the maximum chunk length, and `-1` collapses to 1, so any prefill longer than one token writes past the allocation and aborts in glibc. |
 | `--disable-radix-cache` | Prefix caching is not validated with the split expert set. |
+| *(no `--cuda-graph-backend-*` flag)* | NPU graph capture is on by default, and that is the recommended setting. Disabling it costs roughly 5× decode throughput; see [Performance](#performance). Turn it off only to isolate a capture problem. |
 
 ### Stopping the service
 
@@ -318,7 +317,23 @@ For the general methodology and datasets, see
 
 ## Performance
 
-TBD — to be filled.
+The one measurement worth publishing here is the effect of NPU graph capture, because it is large and it decides the
+default. Same single 910B die, same launch command, same 4096-token context, single request, greedy decoding,
+1000 new tokens, one warmup run followed by three measured runs:
+
+| Prompt tokens | NPU graph on (default) | Both graph backends `disabled` |
+|---------------|------------------------|--------------------------------|
+| 118           | ~17 tok/s              | ~3.1 tok/s                     |
+| 801           | ~17 tok/s              | ~3.1 tok/s                     |
+
+Decode-only throughput, `(completion_tokens - 1) / (end_to_end_latency - warmed_prefill_time)`. Graph mode is worth
+roughly **5×** here, and the gap does not shrink at the longer prompt.
+
+The numbers are rounded on purpose: the host these were taken on was heavily loaded, and per the warning below the
+absolute values move with CPU contention. The **ratio** is the reproducible part.
+
+Capturing the decode graph costs about 6 s of startup time and about 0.26 GB of HBM — negligible against the benefit.
+The prefill graph is auto-disabled for this configuration; only the decode graph is captured.
 
 For benchmark commands, see
 [Performance Testing on Ascend NPU](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing).
@@ -333,10 +348,8 @@ Benchmark on an otherwise idle host, and report the host's load alongside any nu
 
 These are stated as measured, not as expected behaviour:
 
-- **NPU graph (graph mode) is not verified.** Keep `--cuda-graph-backend-decode disabled` and
-  `--cuda-graph-backend-prefill disabled`. The graph host-callback path exists in the KT wrapper and the ACL `107011`
-  double-subscribe case is handled, but the end-to-end capture path has not been validated for this model.
-- **A 65536-token context is not verified.** Long-context behaviour, and the HBM headroom needed for it at a given
+- **A 65536-token context starts, but is not benchmarked.** The server comes up and serves at
+  `--context-length 65536`. Decode throughput across long sequence lengths, and the HBM headroom needed at a given
   `--kt-num-gpu-experts`, have not been measured.
 - **Single request only.** `--max-running-requests 1`; concurrent serving is untested.
 - **Decode throughput is not reproducible across hosts** for the CPU-contention reason above.
