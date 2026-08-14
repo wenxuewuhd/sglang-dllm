@@ -26,6 +26,9 @@ from sglang.srt.utils.kt_accel import (
     kt_current_stream,
     kt_current_stream_handle,
     kt_device_synchronize,
+    kt_new_event,
+    kt_new_stream,
+    kt_stream_context,
 )
 
 if TYPE_CHECKING:
@@ -46,6 +49,26 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 _npu_report_subscribed: Set[int] = set()
+
+# KT_SIDE_STREAM=1 (opt-in): enqueue the CPU-MoE host callback on a dedicated
+# side stream so the resident-expert GroupedMatmul keeps running on the compute
+# stream instead of being stream-order blocked behind the callback round trip.
+# Fork/join events express the dependency across the Ascend dispatch span:
+#   compute: ..router.. fork ------ dispatch + GPU experts + combine ---- wait(join) -- merge
+#   side:            wait(fork) D2H inputs + host callback          join
+# Only the NPU-graph submit path forks; the eager path (``submit_forward``) is a
+# kt-kernel async submit that is not stream ordered against the compute stream,
+# so it has nothing to hide behind a second stream.
+_KT_SIDE_STREAM = os.environ.get("KT_SIDE_STREAM", "") == "1"
+_kt_side_stream = None
+
+
+def _get_kt_side_stream(device: torch.device):
+    """One process-wide side stream, created outside graph capture."""
+    global _kt_side_stream
+    if _kt_side_stream is None:
+        _kt_side_stream = kt_new_stream(device)
+    return _kt_side_stream
 
 
 def _npu_use_graph_host_callback(device: torch.device) -> bool:
@@ -307,6 +330,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # KT wrapper will be initialized in create_weights
         self.wrapper: Optional[KTMoEWrapper] = None
 
+        # Side-stream fork/join state (KT_SIDE_STREAM=1 only; None keeps the
+        # post-combine hook on the single-stream path).
+        self._ascend_pending_join = None
+        self._kt_side_events = []
+
         # Store parameters needed for KT initialization
         self._layer_params = None
 
@@ -450,6 +478,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     _ensure_npu_subscribe_report(
                         kt_current_stream(layer.w13_weight.device)
                     )
+                    if _KT_SIDE_STREAM:
+                        # The side-stream variant launches the host callback on
+                        # the side stream, so it needs the same pre-capture
+                        # subscription; creating the stream here also keeps
+                        # stream creation out of the capture forward.
+                        _ensure_npu_subscribe_report(
+                            _get_kt_side_stream(layer.w13_weight.device)
+                        )
                 except Exception as exc:
                     logger.warning(
                         "[KT] pre-capture ACL report subscribe failed (non-fatal): %s",
@@ -524,6 +560,35 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             (self.wrapper, hidden_states, stream_handle),
         )
 
+    def _submit_raw_npu_graph_forked(
+        self, hidden_states: torch.Tensor, topk_output
+    ) -> None:
+        """Fork the captured CPU-MoE submit onto the side stream.
+
+        The matching join runs in ``_ascend_post_combine``; everything the
+        compute stream enqueues in between (Ascend dispatch, resident-expert
+        GroupedMatmul, combine) overlaps the host callback.
+        """
+        device = hidden_states.device
+        compute_stream = kt_current_stream(device)
+        side_stream = _get_kt_side_stream(device)
+        # A captured graph keeps record/wait nodes that reference these event
+        # objects, so a fresh pair per capture is kept alive for the process.
+        # Only capture-mode forwards reach this path, so the list is bounded by
+        # (captured shapes x warmups) and does not grow during serving.
+        fork_event = kt_new_event(device)
+        join_event = kt_new_event(device)
+        self._kt_side_events.append((fork_event, join_event))
+
+        fork_event.record(compute_stream)
+        side_stream.wait_event(fork_event)
+        with kt_stream_context(side_stream, device):
+            # ``kt_current_stream`` resolves to the side stream inside the
+            # block, so the D2H input copies and ``_launch_host_func`` both
+            # enqueue there.
+            self._submit_raw_npu_graph(hidden_states, topk_output)
+        self._ascend_pending_join = (join_event, side_stream, compute_stream)
+
     def _ascend_pre_dispatch(self, dispatcher, hidden_states, topk_output):
         del dispatcher
         use_graph = (
@@ -533,7 +598,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         )
         self._ascend_pending_hidden_states = hidden_states
         self._ascend_pending_graph = use_graph
-        if use_graph:
+        if use_graph and _KT_SIDE_STREAM:
+            self._submit_raw_npu_graph_forked(hidden_states, topk_output)
+        elif use_graph:
             self._submit_raw_npu_graph(hidden_states, topk_output)
         else:
             self._submit_raw(hidden_states, topk_output)
@@ -552,6 +619,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
     def _ascend_post_combine(self, dispatcher, hidden_states):
         del dispatcher
         original = self._ascend_pending_hidden_states
+        pending_join = self._ascend_pending_join
+        self._ascend_pending_join = None
+        if pending_join is not None:
+            join_event, side_stream, compute_stream = pending_join
+            # The compute stream resumes only once the side stream's host
+            # callback has returned, so the pinned CPU output is complete before
+            # ``sync`` enqueues its H2D copy.
+            join_event.record(side_stream)
+            compute_stream.wait_event(join_event)
         cpu_output = self.sync(
             original,
             cpu_already_synced=self._ascend_pending_graph,
