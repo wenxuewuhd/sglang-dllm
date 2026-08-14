@@ -110,8 +110,22 @@ Inside the container, clone this SGLang branch and the companion KTransformers b
 
 ```bash Command
 git clone <sglang-repo-url> <clone>
+
 git clone <ktransformers-repo-url> <kt-clone>
+cd <kt-clone>
+git submodule update --init third_party/llama.cpp third_party/pybind11
 ```
+
+<Warning>
+Both submodules are required. `kt-kernel/CMakeLists.txt` calls `add_subdirectory()` on **`third_party/pybind11`** as
+well as on `third_party/llama.cpp`, so initializing only `llama.cpp` makes the build fail at configure time. The other
+submodules registered in `.gitmodules` are not referenced by the kt-kernel build and can stay uninitialized.
+</Warning>
+
+`third_party/llama.cpp` is pinned to an upstream commit (tag `b3173`) that exists in the public llama.cpp repository, so
+the clone above works for everyone. That tag predates MXFP4, which the DeepSeek-V4 CPU experts need, so the delta lives
+in `kt-kernel/third_party_patches/llama.cpp/` and is applied automatically at CMake configure time. **You never run
+`git apply` by hand**, and re-running the configure step is safe — an already-patched tree is detected and skipped.
 
 ### Do not run `pip install -e python/` in this container
 
@@ -159,6 +173,15 @@ The kt-kernel Python package needs to be on the path as well:
 ```bash Command
 export PYTHONPATH=<clone>/python:<kt-clone>/kt-kernel/python:$PYTHONPATH
 ```
+
+<Warning>
+**Order matters.** `PYTHONPATH` is a first-match-wins search path, and wrapper scripts that set up the Ascend
+environment commonly *prepend* their own SGLang checkout to it. If such a script runs after your `export`, its entry
+lands in front of yours and Python imports that tree instead — with no error and no warning.
+
+Export `PYTHONPATH` **after** every environment-setup script has run, immediately before launching the server, and
+re-run the `print(sglang.__file__)` check at that point. Setting it earlier in the shell is not sufficient.
+</Warning>
 
 ## Online service deployment
 
