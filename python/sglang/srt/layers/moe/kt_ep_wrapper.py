@@ -14,6 +14,11 @@ from typing import TYPE_CHECKING, Optional, Set, Tuple
 
 import torch
 
+from sglang.srt.layers.moe.kt_expert_masks import (
+    ensure_kt_layer_masks,
+    get_layer_gpu_experts_mask,
+    get_layer_logical_to_gpu_index,
+)
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.runtime_context import (
     get_parallel,
@@ -112,6 +117,10 @@ class KTConfig:
         chunked_prefill_size: Chunk size for prefill computation
         method: CPU computation method (e.g., "int4")
         num_layers: Total number of layers in the model (optional)
+        gpu_experts_mask: Per-logical-expert flag, True where the expert is
+            resident on the accelerator (see ``kt_expert_masks``)
+        logical_to_gpu_index: Resident weight slot per logical expert, -1 for
+            the CPU-only experts
     """
 
     layer_idx: int
@@ -123,6 +132,8 @@ class KTConfig:
     max_deferred_experts_per_token: int
     method: str
     num_layers: Optional[int] = None
+    gpu_experts_mask: Optional[torch.Tensor] = None
+    logical_to_gpu_index: Optional[torch.Tensor] = None
 
 
 def create_kt_config_from_server_args(
@@ -174,9 +185,25 @@ def create_kt_config_from_server_args(
         # If we can't get the config, num_layers will be None
         pass
 
+    # Expert placement is a whole-model decision, so it is resolved once and
+    # then sliced per layer.  ``num_gpu_experts`` follows from the mask instead
+    # of ``kt_num_gpu_experts`` so that a placement which cannot host the
+    # requested count (e.g. fewer experts than requested) stays self-consistent.
+    ensure_kt_layer_masks(server_args)
+    gpu_experts_mask = get_layer_gpu_experts_mask(layer_idx)
+    logical_to_gpu_index = get_layer_logical_to_gpu_index(layer_idx)
+    num_gpu_experts = int(gpu_experts_mask.sum().item())
+    if server_args.kt_num_gpu_experts and num_gpu_experts == 0:
+        raise ValueError(
+            f"KT expert placement left layer {layer_idx} with no resident "
+            f"experts while --kt-num-gpu-experts is "
+            f"{server_args.kt_num_gpu_experts}; the layer is classified dense by "
+            "first_k_dense_replace / moe_layer_freq."
+        )
+
     return KTConfig(
         layer_idx=layer_idx,
-        num_gpu_experts=server_args.kt_num_gpu_experts,
+        num_gpu_experts=num_gpu_experts,
         cpuinfer_threads=server_args.kt_cpuinfer,
         threadpool_count=server_args.kt_threadpool_count,
         weight_path=server_args.kt_weight_path,
@@ -184,41 +211,54 @@ def create_kt_config_from_server_args(
         method=server_args.kt_method,
         max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
         num_layers=num_layers,
+        gpu_experts_mask=gpu_experts_mask,
+        logical_to_gpu_index=logical_to_gpu_index,
     )
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
-def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.Tensor:
-    """Mask CPU expert IDs by setting them to -1.
+def mask_cpu_expert_ids(
+    topk_ids: torch.Tensor, logical_to_gpu_index: torch.Tensor
+) -> torch.Tensor:
+    """Rewrite routed logical expert ids into resident accelerator weight slots.
 
-    This function masks expert IDs that should be computed on CPU (IDs >= num_gpu_experts)
-    so they won't be computed on GPU. The masked IDs are set to -1, which causes the
-    GPU MoE kernel to skip those experts.
+    ``logical_to_gpu_index`` already stores -1 for the offloaded experts, so the
+    gather both remaps the resident experts and produces the -1 sentinel that
+    makes the GPU MoE kernel skip the CPU ones.
 
     Args:
-        topk_ids: Tensor of shape [num_tokens, top_k] containing expert IDs
-        num_gpu_experts: Number of experts that should run on GPU (experts 0 to num_gpu_experts-1)
+        topk_ids: Tensor of shape [num_tokens, top_k] holding logical expert ids
+        logical_to_gpu_index: Per-layer logical id -> resident slot table
 
     Returns:
-        Modified topk_ids tensor with CPU expert IDs masked as -1
+        A new topk_ids tensor with CPU expert ids masked as -1
     """
-    topk_ids[topk_ids >= num_gpu_experts] = -1
-    return topk_ids
+    return logical_to_gpu_index[topk_ids].to(topk_ids.dtype)
 
 
 def mask_cpu_expert_routing_npu(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
-    num_gpu_experts: int,
+    gpu_experts_mask: torch.Tensor,
+    logical_to_gpu_index: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Map CPU routes to a zero-weight valid expert for NPU grouped matmul.
 
     Ascend routing kernels do not accept the ``-1`` sentinel used by CUDA.  A
     valid expert id with a zero weight is equivalent and keeps the NPU kernel
-    inputs well formed.
+    inputs well formed.  Resident experts are rewritten to their weight slot,
+    which is the identity only for the prefix placement.
+
+    Both tables are expected to already live on ``topk_ids.device`` (moved in
+    ``process_weights_after_loading``): NPU has no eager warmup forward, so the
+    first forward runs under graph capture, where a host-to-device copy is
+    rejected by ACL.
     """
-    is_gpu = topk_ids < num_gpu_experts
-    safe_ids = torch.where(is_gpu, topk_ids, torch.zeros_like(topk_ids))
+    mask_on_device = gpu_experts_mask.to(topk_ids.device)
+    index_on_device = logical_to_gpu_index.to(topk_ids.device)
+    is_gpu = mask_on_device[topk_ids]
+    gpu_slots = index_on_device[topk_ids].to(topk_ids.dtype)
+    safe_ids = torch.where(is_gpu, gpu_slots, torch.zeros_like(topk_ids))
     safe_weights = torch.where(is_gpu, topk_weights, torch.zeros_like(topk_weights))
     return safe_ids, safe_weights
 
@@ -260,6 +300,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         self.gpu_method = gpu_method
         self.kt_config = kt_config
+        self.gpu_experts_mask = kt_config.gpu_experts_mask
+        self.logical_to_gpu_index = kt_config.logical_to_gpu_index
         self.num_gpu_experts = kt_config.num_gpu_experts
         self.override_num_local_experts = True
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
@@ -322,18 +364,33 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             **extra_weight_attrs,
         )
 
-        # 2. Initialize KT wrapper for CPU experts
+        # 2. Pin the placement tables to this layer's expert count.  An
+        # expert-parallel shard makes the layer's local expert count differ from
+        # the global placement table; the prefix placement is identical either
+        # way, so it is rebuilt at the local width and every consumer below
+        # (the CPU kernel, routing, the checkpoint loader) reads one table.
+        if (
+            self.gpu_experts_mask is None
+            or self.gpu_experts_mask.numel() != num_experts
+        ):
+            self.gpu_experts_mask = torch.zeros(num_experts, dtype=torch.bool)
+            self.gpu_experts_mask[: self.num_gpu_experts] = True
+            self.logical_to_gpu_index = torch.where(
+                self.gpu_experts_mask,
+                torch.arange(num_experts, dtype=torch.long),
+                torch.full((num_experts,), -1, dtype=torch.long),
+            )
+
+        # 3. Initialize KT wrapper for CPU experts
         # CPU experts: num_gpu_experts to num_experts-1
         if self.tp_rank == 0:
-            gpu_experts_mask = torch.zeros(num_experts, dtype=torch.bool)
-            gpu_experts_mask[: self.num_gpu_experts] = True
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
                 num_experts_per_tok=num_experts_per_tok,
                 hidden_size=hidden_size,
                 moe_intermediate_size=intermediate_size_full,
-                gpu_experts_mask=gpu_experts_mask,
+                gpu_experts_mask=self.gpu_experts_mask,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
                 numa_nodes=None,
@@ -356,7 +413,20 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if hasattr(self.gpu_method, "process_weights_after_loading"):
             self.gpu_method.process_weights_after_loading(layer)
 
-        # 2. Load CPU weights using KT wrapper
+        # 2. Move the placement tables to the accelerator once, at this
+        # deterministic pre-capture point.  NPU has no eager warmup forward, so
+        # the first forward already runs under graph capture, where the
+        # host-to-device copy of a per-forward ``.to(device)`` is rejected by ACL
+        # (error 107030).  With the tables resident, ``.to(same_device)`` is a
+        # no-op.  The all-CPU layer never routes to the accelerator and may have
+        # no tables at all.
+        if self.num_gpu_experts > 0 and self.gpu_experts_mask is not None:
+            device = layer.w13_weight.device
+            self.gpu_experts_mask = self.gpu_experts_mask.to(device)
+            if self.logical_to_gpu_index is not None:
+                self.logical_to_gpu_index = self.logical_to_gpu_index.to(device)
+
+        # 3. Load CPU weights using KT wrapper
         if self.tp_rank == 0 and self.wrapper is not None:
             kt_device_synchronize(layer.w13_weight.device)
 
@@ -467,7 +537,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         safe_ids, safe_weights = mask_cpu_expert_routing_npu(
             topk_output.topk_ids,
             topk_output.topk_weights,
-            self.num_gpu_experts,
+            self.gpu_experts_mask,
+            self.logical_to_gpu_index,
         )
         return hidden_states, topk_output._replace(
             topk_ids=safe_ids,
@@ -603,7 +674,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             topk_ids = topk_output.topk_ids
             if x.device.type == "npu":
                 masked_topk_ids, masked_topk_weights = mask_cpu_expert_routing_npu(
-                    topk_ids, topk_output.topk_weights, self.num_gpu_experts
+                    topk_ids,
+                    topk_output.topk_weights,
+                    self.gpu_experts_mask,
+                    self.logical_to_gpu_index,
                 )
                 masked_topk_output = topk_output._replace(
                     topk_ids=masked_topk_ids,
@@ -611,7 +685,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 )
             else:
                 masked_topk_output = topk_output._replace(
-                    topk_ids=mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
+                    topk_ids=mask_cpu_expert_ids(topk_ids, self.logical_to_gpu_index)
                 )
             masked_dispatch_output = dispatch_output._replace(
                 topk_output=masked_topk_output
@@ -626,6 +700,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             output = output + cpu_output
 
         return StandardCombineInput(hidden_states=output)
+
+    def map_logical_expert_id_for_gpu_load(self, logical_expert_id: int) -> int:
+        """Map a checkpoint expert id to its accelerator weight slot.
+
+        Returns -1 when the expert is offloaded to the CPU and must not be
+        loaded into the accelerator weight tensors at all.
+        """
+        if self.logical_to_gpu_index is None:
+            if logical_expert_id < self.num_gpu_experts:
+                return logical_expert_id
+            return -1
+        return int(self.logical_to_gpu_index[logical_expert_id].item())
 
     def __getattr__(self, name: str):
         """Delegate attribute access to the wrapped GPU method.
