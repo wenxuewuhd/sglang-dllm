@@ -459,6 +459,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                         exc,
                     )
 
+        # 4. Reserve the streaming-prefill HBM slot and start the DDR expert pool build, both
+        # of which must happen before the KV pool is sized.  No-op unless KT_PREFILL_STREAM=1.
+        # Imported here rather than at module scope: kt_stream_prefill imports this module.
+        from sglang.srt.layers.moe.kt_stream_prefill import maybe_reserve_slot
+
+        maybe_reserve_slot(self, layer.w13_weight.device, layer)
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
     ):
