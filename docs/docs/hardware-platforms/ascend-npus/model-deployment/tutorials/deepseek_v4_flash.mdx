@@ -1,0 +1,345 @@
+---
+title: "DeepSeek-V4-Flash"
+metatags:
+  description: "Deploy DeepSeek-V4-Flash on a single Ascend NPU with SGLang, using KTransformers CPU expert offload."
+---
+
+## Introduction
+
+DeepSeek-V4-Flash is a Mixture-of-Experts (MoE) large language model. Its total parameter count does not fit into a
+single Ascend 910B die, so this tutorial deploys it in a **heterogeneous single-card** configuration: attention, dense
+layers and a small resident subset of experts run on the NPU in W8A8, while the remaining experts run on the host CPU
+from MXFP4 GGUF files through the KTransformers (KT) CPU MoE kernel.
+
+This is a **single-card, single-request** deployment aimed at functional bring-up and experimentation, not a
+throughput-optimised production setup. Read [Known limitations](#known-limitations) before you rely on any number you
+measure with it.
+
+Everything in this page is meant to work from a plain `git clone` of the SGLang branch plus the companion
+KTransformers branch — there are no patches to apply by hand.
+
+## Supported features
+
+| Feature                     | Example usage                                                                                     |
+|-----------------------------|---------------------------------------------------------------------------------------------------|
+| Single-card deployment      | `--tensor-parallel-size 1 \`<br/>`--expert-parallel-size 1`                                        |
+| CPU expert offload (KT)     | `--kt-method LLAMAFILE \`<br/>`--kt-num-gpu-experts 32 \`<br/>`--kt-weight-path '<weights-dir>/dsv4_layer{layer_idx}_mxfp4.gguf'` |
+| CPU thread pools            | `--kt-cpuinfer 128 \`<br/>`--kt-threadpool-count 8` (8 NUMA nodes × 16 threads)                     |
+| Quantization                | `--quantization compressed-tensors` (W8A8 on the NPU side)                                          |
+| Attention backend           | `--attention-backend ascend`                                                                       |
+| Paged KV cache              | `--page-size 128`                                                                                  |
+| NPU graph                   | **not verified** — use `--cuda-graph-backend-decode disabled --cuda-graph-backend-prefill disabled` |
+
+<Note>
+Tensor parallelism, expert parallelism, A2A dispatch (`--moe-a2a-backend`), PD disaggregation and speculative decoding
+are **not** supported together with KT CPU expert offload on NPU. SGLang rejects `--tensor-parallel-size > 1`,
+`--expert-parallel-size > 1` and any `--moe-a2a-backend` other than `none` at startup with an explicit error.
+</Note>
+
+## Prerequisites
+
+### Environment
+
+For general Ascend environment setup (driver, firmware, container flags), see:
+
+- [Ascend NPU Quickstart](/docs/hardware-platforms/ascend-npus/getting-started/quick_start)
+- [SGLang Installation with NPU Support](/docs/hardware-platforms/ascend-npus/getting-started/installation)
+
+This tutorial is written and validated against the following image:
+
+```
+quay.io/ascend/sglang:main-cann9.0.0-910b
+```
+
+| Component  | Version |
+|------------|---------|
+| CANN       | 9.0.0   |
+| torch      | 2.10    |
+| torch_npu  | 2.10    |
+| Python     | 3.11    |
+| Hardware   | Atlas 800I A2 (910B), single die |
+
+<Warning>
+The CANN version matters. `torch_npu` 2.10 pre-subscribes NPU graph capture streams internally; SGLang's KT wrapper
+tolerates the resulting ACL error `107011` on a second subscribe. Older `torch_npu` releases behave differently and are
+not covered by this tutorial.
+</Warning>
+
+In addition to the base image you need:
+
+1. **A matching kt-kernel wheel**, built from the companion KTransformers branch. SGLang sets
+   `KT_EXTERNAL_NPU_REPORT_SUBSCRIBER=1` for the KT process; a kt-kernel that does not understand this variable will
+   subscribe a second ACL report on the same stream and fail with error `107011` once NPU graph capture is involved.
+2. **The CANN custom operator packages** used by the DeepSeek-V4 attention path. They install into
+   `${ASCEND_TOOLKIT_HOME}/opp/vendors/` and expose themselves through `ASCEND_CUSTOM_OPP_PATH`. Source their
+   `set_env.bash` before launching (see [Environment variables](#environment-variables)); the model fails to load with
+   missing-operator errors otherwise.
+
+### Model weights
+
+Two weight sets are required, and they are **not** interchangeable:
+
+| Side | Format | Passed as | Notes |
+|------|--------|-----------|-------|
+| NPU  | W8A8 (`compressed-tensors` / `int-quantized`) directory | `--model-path <model-dir>` | Attention, dense layers, resident experts |
+| CPU  | MXFP4 GGUF, **one file per layer** | `--kt-weight-path '<weights-dir>/dsv4_layer{layer_idx}_mxfp4.gguf'` | Offloaded experts |
+
+Reserve disk space for both. The MXFP4 expert files dominate: roughly 3.4 GB per MoE layer.
+
+<Info>
+MXFP4 rather than Q8_0 for the CPU side is deliberate. The CPU MoE is memory-bandwidth bound during decode, and Q8_0
+roughly doubles the bytes read per token.
+</Info>
+
+#### The `{layer_idx}` placeholder
+
+`--kt-weight-path` is a **template**, not a single file. SGLang substitutes the MoE layer index into the literal
+`{layer_idx}` placeholder once per layer, so layer 3 reads `dsv4_layer3_mxfp4.gguf`. Two consequences:
+
+- **Always single-quote the value in the shell.** In double quotes, `${VAR:-...{layer_idx}.gguf}` makes bash treat the
+  first `}` of `{layer_idx}` as the end of the parameter expansion and silently produces a broken path.
+- A path without any placeholder is used literally for every layer, which is almost never what you want.
+
+## Installation
+
+Start the container from the image above using the standard Ascend `docker run` flags documented in
+[SGLang Installation with NPU Support](/docs/hardware-platforms/ascend-npus/getting-started/installation), and mount
+both weight directories into it.
+
+Inside the container, clone this SGLang branch and the companion KTransformers branch:
+
+```bash Command
+git clone <sglang-repo-url> <clone>
+git clone <ktransformers-repo-url> <kt-clone>
+```
+
+### Do not run `pip install -e python/` in this container
+
+<Warning>
+The image already ships an editable SGLang install. Re-running `pip install -e python/` from a fresh clone installs
+`python/pyproject.toml`, which is the **CUDA** variant: it pulls `torch`, `flashinfer` and `cuda-python`, replaces the
+image's `torch` 2.10 with a CUDA build, and leaves `torch_npu` bound to a torch that no longer exists. The NPU stack is
+then unusable and the container has to be recreated.
+</Warning>
+
+The supported way to run from a clone is `PYTHONPATH` only — see the next section. If you genuinely must install, first
+swap in the NPU project file exactly as the upstream installation guide does:
+
+```bash Command
+mv <clone>/python/pyproject_npu.toml <clone>/python/pyproject.toml
+pip install -e <clone>/python[all_npu]
+```
+
+This `mv` is a manual step by design; the repository keeps the CUDA `pyproject.toml` in place so CUDA users are not
+broken.
+
+### The `PYTHONPATH` trap
+
+This is the single most common way to waste a debugging session on this image.
+
+The pip-installed editable SGLang points at `/sgl-workspace/sglang` — **a different, older source tree**. If you launch
+the server from your clone without overriding `PYTHONPATH`, Python imports that old tree instead. The server starts
+normally, prints no warning, and **none of your changes take effect**.
+
+Always export the path and then verify it:
+
+```bash Command
+export PYTHONNOUSERSITE=1
+export PYTHONPATH=<clone>/python:$PYTHONPATH
+
+python -c "import sglang; print(sglang.__file__)"
+```
+
+The last line is the important one. It must print a path under `<clone>/python/sglang/...`. If it prints
+`/sgl-workspace/sglang/...`, stop and fix the environment — this check is what turns a silent wrong-code failure into an
+explicit one. Run it in the same shell that launches the server, after every environment change.
+
+The kt-kernel Python package needs to be on the path as well:
+
+```bash Command
+export PYTHONPATH=<clone>/python:<kt-clone>/kt-kernel/python:$PYTHONPATH
+```
+
+## Online service deployment
+
+### Environment variables
+
+```bash Command
+# Source CANN, ATB and the custom operator vendor environments. Paths vary per image;
+# ASCEND_TOOLKIT_HOME is the single anchor everything else derives from.
+export ASCEND_TOOLKIT_HOME=/usr/local/Ascend/ascend-toolkit/latest
+source ${ASCEND_TOOLKIT_HOME}/set_env.sh
+source ${ASCEND_TOOLKIT_HOME}/../../nnal/atb/set_env.sh
+source ${ASCEND_TOOLKIT_HOME}/opp/vendors/customize/bin/set_env.bash
+source ${ASCEND_TOOLKIT_HOME}/opp/vendors/custom_transformer/bin/set_env.bash
+
+# Pick the physical card. The server still binds logical device 0 in-process.
+export ASCEND_RT_VISIBLE_DEVICES=0
+
+# DeepSeek-V4 specific kernel selection, consumed by the kt-kernel / custom operator side.
+export IS_DEEPSEEK_V4=1
+
+# Reduces HBM fragmentation across prefill chunks.
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+
+# Ascend runtime tuning.
+export TASK_QUEUE_ENABLE=1
+export SGLANG_SET_CPU_AFFINITY=1
+
+# Never leave an HTTP proxy set: the startup warmup POSTs to the server's own port,
+# and a localhost proxy turns that into a 502 that aborts initialization.
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+
+ulimit -n 65536
+```
+
+### Launch command
+
+```bash Command
+# ============================================================
+# Before running, update the following:
+#   <model-dir>    W8A8 weight directory (NPU side)
+#   <weights-dir>  directory holding the per-layer MXFP4 GGUF files (CPU side)
+#   <numa>         number of NUMA nodes to use for the CPU MoE thread pools
+#   PORT           the port to serve on
+# ============================================================
+
+python -m sglang.launch_server \
+    --model-path <model-dir> \
+    --device npu \
+    --attention-backend ascend \
+    --tensor-parallel-size 1 \
+    --expert-parallel-size 1 \
+    --moe-a2a-backend none \
+    --page-size 128 \
+    --quantization compressed-tensors \
+    --disable-shared-experts-fusion \
+    --dtype bfloat16 \
+    --trust-remote-code \
+    --disable-radix-cache \
+    --kt-method LLAMAFILE \
+    --kt-num-gpu-experts 32 \
+    --kt-weight-path '<weights-dir>/dsv4_layer{layer_idx}_mxfp4.gguf' \
+    --kt-cpuinfer 128 \
+    --kt-threadpool-count 8 \
+    --max-running-requests 1 \
+    --chunked-prefill-size 8192 \
+    --mem-fraction-static 0.81 \
+    --cuda-graph-backend-decode disabled \
+    --cuda-graph-backend-prefill disabled \
+    --host 0.0.0.0 \
+    --port ${PORT}
+```
+
+Parameter notes:
+
+| Parameter | Why |
+|-----------|-----|
+| `--tensor-parallel-size 1 --expert-parallel-size 1` | Only single-card KT offload is supported; anything else is rejected at startup. |
+| `--moe-a2a-backend none` | The Ascend dispatcher hook that KT attaches to does not support A2A dispatchers. |
+| `--quantization compressed-tensors` | Matches the on-disk W8A8 (`int-quantized`) NPU weights. |
+| `--disable-shared-experts-fusion` | Shared-expert fusion is incompatible with the split GPU/CPU expert set. |
+| `--page-size 128` | `--chunked-prefill-size` must be a positive multiple of this value. |
+| `--kt-num-gpu-experts 32` | Experts kept resident on the NPU per layer. Each additional expert costs roughly 1 GB of HBM; lower it if you hit OOM, raise it if you have headroom. |
+| `--kt-threadpool-count <numa>` | kt-kernel creates one sub-pool per value and binds sub-pool *i* to NUMA node *i*. Exceeding the host's NUMA node count fails at startup with `NUMA node N not found`. |
+| `--kt-cpuinfer <numa*16>` | Total CPU MoE threads, i.e. about 16 per NUMA node. Do not allocate every core — the spin threads, the NPU host callback and the OS need headroom. |
+| `--max-running-requests 1` | This configuration is validated for single-request serving only. |
+| `--chunked-prefill-size 8192` | Must be positive and a multiple of `--page-size`. Do **not** pass `-1`: the KT `LLAMAFILE` CPU MoE sizes its fp32 output buffer from the maximum chunk length, and `-1` collapses to 1, so any prefill longer than one token writes past the allocation and aborts in glibc. |
+| `--disable-radix-cache` | Prefix caching is not validated with the split expert set. |
+
+### Stopping the service
+
+`kill -INT <pid>` **alone is not enough** — the main process can take up to 30 s to exit, or hang entirely. Send
+`SIGINT` first so the workers shut down cleanly, then follow up with `SIGTERM`:
+
+```bash Command
+kill -INT ${PID}
+sleep 5
+kill -TERM ${PID}
+```
+
+## Functional verification
+
+Port readiness is **not** an acceptance signal — with a broken CPU expert path the server still binds its port and
+answers health probes while generating nothing. Both checks below must pass.
+
+1. Health check returns HTTP 200:
+
+```bash Command
+curl -s -o /dev/null -w '%{http_code}\n' http://${HOST}:${PORT}/health_generate
+```
+
+2. `/generate` returns a **non-empty** `text` field:
+
+```bash Command
+curl http://${HOST}:${PORT}/generate \
+    -H "Content-Type: application/json" \
+    -d '{
+        "text": "What is the capital of France?",
+        "sampling_params": {
+            "max_new_tokens": 64,
+            "temperature": 0
+        }
+    }'
+```
+
+An HTTP 200 with `"text": ""` is a **failure**, not a pass. The usual cause is a wrong `--kt-weight-path` template or a
+kt-kernel that silently loaded no experts; check the server log for the per-layer GGUF paths it resolved.
+
+For more request examples, see
+[Testing the Service](/docs/hardware-platforms/ascend-npus/getting-started/installation#testing-the-service).
+
+## Accuracy evaluation
+
+TBD — to be filled. No accuracy evaluation has been run for this configuration yet, so no numbers are published here.
+
+For the general methodology and datasets, see
+[Accuracy Evaluation on Ascend NPU](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation).
+
+## Performance
+
+TBD — to be filled.
+
+For benchmark commands, see
+[Performance Testing on Ascend NPU](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing).
+
+<Warning>
+Decode in this configuration is **CPU-bound**: the offloaded experts are read from host memory every token. On a shared
+host, CPU contention from other tenants has been observed to change measured decode throughput by a factor of 5–6.
+Benchmark on an otherwise idle host, and report the host's load alongside any number.
+</Warning>
+
+## Known limitations
+
+These are stated as measured, not as expected behaviour:
+
+- **NPU graph (graph mode) is not verified.** Keep `--cuda-graph-backend-decode disabled` and
+  `--cuda-graph-backend-prefill disabled`. The graph host-callback path exists in the KT wrapper and the ACL `107011`
+  double-subscribe case is handled, but the end-to-end capture path has not been validated for this model.
+- **A 65536-token context is not verified.** Long-context behaviour, and the HBM headroom needed for it at a given
+  `--kt-num-gpu-experts`, have not been measured.
+- **Single request only.** `--max-running-requests 1`; concurrent serving is untested.
+- **Decode throughput is not reproducible across hosts** for the CPU-contention reason above.
+
+## FAQ
+
+**The server starts and answers, but my code changes have no effect.**
+You are running `/sgl-workspace/sglang`. See [The `PYTHONPATH` trap](#the-pythonpath-trap) and run the
+`import sglang; print(sglang.__file__)` check.
+
+**Startup fails with `NUMA node N not found` or `set_mempolicy` errors.**
+`--kt-threadpool-count` exceeds the host's NUMA node count. Lower it and scale `--kt-cpuinfer` to match.
+
+**The process aborts inside glibc during the first long prefill.**
+`--chunked-prefill-size` is `-1` or not a multiple of `--page-size`. Set it to a positive multiple of 128.
+
+**Startup fails with ACL error `107011`.**
+Two ACL report subscribers were attached to the same stream. Use the companion kt-kernel build, which honours
+`KT_EXTERNAL_NPU_REPORT_SUBSCRIBER=1`.
+
+**The server exits during warmup with `res=<Response [502]>`.**
+An HTTP proxy is set in the environment and intercepts the warmup request to the server's own port. Unset
+`http_proxy` / `https_proxy` / `all_proxy` and their uppercase variants.
+
+For common environment, installation and general parameter issues, see the
+[Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/faq).
