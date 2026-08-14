@@ -33,6 +33,7 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTEPWrapperMethod,
     create_kt_config_from_server_args,
 )
+from sglang.srt.layers.moe.kt_stream_prefill import maybe_streaming_forward
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
     AscendTPDispatcher,
@@ -1477,6 +1478,22 @@ class FusedMoE(torch.nn.Module):
         if self._dwdp_bound:
             dwdp_mgr = get_global_dwdp_manager()
             dwdp_mgr.wait_prefetch(self.layer_id)
+
+        # KT streaming prefill: on a long enough prefill chunk this streams the layer's whole
+        # expert set DDR->HBM and runs the MoE on the accelerator alone, replacing dispatch,
+        # expert compute and combine in one call.  It has to sit ahead of the dispatcher
+        # because Ascend dispatch already permutes and quantizes the hidden states, and
+        # because the KT pre-dispatch hook (CPU submit) must not run for a streamed layer.
+        # Returns None -- and this is a no-op -- unless KT_PREFILL_STREAM=1.
+        streamed_hidden_states = maybe_streaming_forward(
+            quant_method=self.quant_method,
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+            tp_reduce_needed=self.reduce_results
+            and (self.moe_tp_size > 1 or self.moe_ep_size > 1),
+        )
+        if streamed_hidden_states is not None:
+            return streamed_hidden_states[..., :origin_hidden_states_dim].contiguous()
 
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
