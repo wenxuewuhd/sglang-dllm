@@ -243,7 +243,7 @@ python -m sglang.launch_server \
     --kt-cpuinfer 128 \
     --kt-threadpool-count 8 \
     --max-running-requests 1 \
-    --chunked-prefill-size 8192 \
+    --chunked-prefill-size 32768 \
     --mem-fraction-static 0.81 \
     --host 0.0.0.0 \
     --port ${PORT}
@@ -262,7 +262,7 @@ Parameter notes:
 | `--kt-threadpool-count <numa>` | kt-kernel creates one sub-pool per value and binds sub-pool *i* to NUMA node *i*. Exceeding the host's NUMA node count fails at startup with `NUMA node N not found`. |
 | `--kt-cpuinfer <numa*16>` | Total CPU MoE threads, i.e. about 16 per NUMA node. Do not allocate every core — the spin threads, the NPU host callback and the OS need headroom. |
 | `--max-running-requests 1` | This configuration is validated for single-request serving only. |
-| `--chunked-prefill-size 8192` | Must be positive and a multiple of `--page-size`. Do **not** pass `-1`: the KT `LLAMAFILE` CPU MoE sizes its fp32 output buffer from the maximum chunk length, and `-1` collapses to 1, so any prefill longer than one token writes past the allocation and aborts in glibc. |
+| `--chunked-prefill-size 32768` | Must be positive and a multiple of `--page-size`, and at least as large as the longest prompt you intend to serve. Do **not** pass `-1`: the KT `LLAMAFILE` CPU MoE sizes its fp32 output buffer from the maximum chunk length, and `-1` collapses to 1, so any prefill longer than one token writes past the allocation and aborts in glibc. |
 | `--disable-radix-cache` | Prefix caching is not validated with the split expert set. |
 | *(no `--cuda-graph-backend-*` flag)* | NPU graph capture is on by default, and that is the recommended setting. Disabling it costs roughly 5× decode throughput; see [Performance](#performance). Turn it off only to isolate a capture problem. |
 
@@ -366,8 +366,8 @@ Prefill grows linearly with prompt length (roughly 2.3 s + 0.0107 s per token) b
 MoE cost.
 
 <Note>
-These prefill numbers were taken with `--chunked-prefill-size 8192`, which is smaller than the prompt for the last two
-rows. Raising it to cover the longest prompt is expected to help long prefills, and has not been measured here.
+These numbers were taken with `--chunked-prefill-size 32768`, which covers the longest prompt in the table. Smaller
+values than the prompt length have not been measured.
 </Note>
 
 For benchmark commands, see
