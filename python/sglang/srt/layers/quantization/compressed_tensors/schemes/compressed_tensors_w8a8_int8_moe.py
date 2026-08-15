@@ -119,6 +119,11 @@ class NPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
         layer.w13_input_scale = None
         layer.w2_input_scale = None
 
+        # Symmetric quantization has no zero point, so this scheme never
+        # creates offset parameters. The asymmetric schemes register them.
+        layer.w13_weight_offset = None
+        layer.w2_weight_offset = None
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.w13_kernel.process_weights_after_loading(layer, "w13")
         self.w2_kernel.process_weights_after_loading(layer, "w2")
@@ -147,11 +152,8 @@ class NPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
             w2_weight=layer.w2_weight,
             w13_weight_scale=layer.w13_weight_scale,
             w2_weight_scale=layer.w2_weight_scale,
-            # Symmetric W8A8 checkpoints do not have zero-point/offset
-            # tensors.  AscendQuantInfo already models these fields as
-            # optional, so keep them optional here as well.
-            w13_weight_offset=getattr(layer, "w13_weight_offset", None),
-            w2_weight_offset=getattr(layer, "w2_weight_offset", None),
+            w13_weight_offset=layer.w13_weight_offset,
+            w2_weight_offset=layer.w2_weight_offset,
             w13_weight_bias=getattr(layer, "w13_weight_bias", None),
             w2_weight_bias=getattr(layer, "w2_weight_bias", None),
             w13_scale_bias=getattr(layer, "w13_scale_bias", None),
