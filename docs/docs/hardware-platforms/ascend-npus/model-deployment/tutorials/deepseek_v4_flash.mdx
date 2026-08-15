@@ -310,7 +310,19 @@ For more request examples, see
 
 ## Accuracy evaluation
 
-TBD — to be filled. No accuracy evaluation has been run for this configuration yet, so no numbers are published here.
+GPQA-Diamond (198 questions), evaluated with evalscope against the launch command above, thinking disabled,
+`temperature=1`, `top_p=1`, `max_tokens=32768`, one question at a time:
+
+| Round | Score |
+|-------|-------|
+| 1     | 72.22% |
+| 2     | 71.72% |
+| 3     | 75.76% |
+| **Mean** | **73.23%** (sample SD 2.20 pp) |
+
+Report the multi-round mean, never a single round. With 198 questions at `temperature=1` the binomial standard error
+of one round is about ±3.2 pp, which is wider than the spread above — the three rounds are statistically
+indistinguishable from each other.
 
 For the general methodology and datasets, see
 [Accuracy Evaluation on Ascend NPU](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation).
@@ -335,6 +347,29 @@ absolute values move with CPU contention. The **ratio** is the reproducible part
 Capturing the decode graph costs about 6 s of startup time and about 0.26 GB of HBM — negligible against the benefit.
 The prefill graph is auto-disabled for this configuration; only the decode graph is captured.
 
+### Throughput across context lengths
+
+Same launch command, single 910B die, graph mode on, one request at a time, measured on an otherwise idle host.
+Decode is the median of the steady-state inter-token rate after a warmup run; prefill is the mean warmed prefill time.
+
+| Prompt tokens | Decode | Prefill |
+|---------------|--------|---------|
+| 118           | 16.84 tok/s | 2.0 s |
+| 801           | 16.86 tok/s | 10.9 s |
+| 3944          | 16.93 tok/s | 43.1 s |
+| 7823          | 16.76 tok/s | 85.1 s |
+| 15568         | 16.72 tok/s | 169.3 s |
+| 31540         | 16.57 tok/s | 343.9 s |
+
+Decode is flat across context length — it is dominated by the per-token host-side expert reads, not by KV growth.
+Prefill grows linearly with prompt length (roughly 2.3 s + 0.0107 s per token) because every chunk pays the full CPU
+MoE cost.
+
+<Note>
+These prefill numbers were taken with `--chunked-prefill-size 8192`, which is smaller than the prompt for the last two
+rows. Raising it to cover the longest prompt is expected to help long prefills, and has not been measured here.
+</Note>
+
 For benchmark commands, see
 [Performance Testing on Ascend NPU](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing).
 
@@ -348,9 +383,14 @@ Benchmark on an otherwise idle host, and report the host's load alongside any nu
 
 These are stated as measured, not as expected behaviour:
 
-- **A 65536-token context starts, but is not benchmarked.** The server comes up and serves at
-  `--context-length 65536`. Decode throughput across long sequence lengths, and the HBM headroom needed at a given
-  `--kt-num-gpu-experts`, have not been measured.
+- **Measured up to a 31540-token prompt**, not to the full 65536-token context. The server comes up and serves at
+  `--context-length 65536`; see [Throughput across context lengths](#throughput-across-context-lengths) for what was
+  measured. Prompts between 31540 and 65536 tokens are untested.
+- **The KV pool shrinks fast as resident experts grow.** Each additional `--kt-num-gpu-experts` costs about 1.0 GiB of
+  HBM, taken from the same static budget as the KV cache pool. The SWA sub-pool is a fixed 10% of the full pool, so it
+  is the first thing to run out: a prompt longer than the SWA pool cannot be scheduled, and the scheduler currently
+  spins instead of reporting the condition. If long prompts stall, lower `--kt-num-gpu-experts` and check the reported
+  `swa=` pool size against your longest prompt.
 - **Single request only.** `--max-running-requests 1`; concurrent serving is untested.
 - **Decode throughput is not reproducible across hosts** for the CPU-contention reason above.
 
