@@ -255,6 +255,14 @@ _enable_pcg_dsv2_dual_stream = (
 )
 
 
+
+def _swiglu_clamp_disabled() -> bool:
+    """Mirror of the NPU-side kill switch, imported lazily so non-NPU builds stay clean."""
+    import os
+
+    return os.environ.get("KT_DISABLE_SWIGLU_CLAMP", "") == "1"
+
+
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,
@@ -438,7 +446,11 @@ class DeepseekV2MLP(nn.Module):
                 )
 
         # Fallback: fused silu+clamp kernel (still faster than unfused)
-        elif self.swiglu_limit is not None:
+        # KT_DISABLE_SWIGLU_CLAMP must reach this site too: it is the SHARED expert, and
+        # leaving it clamped while every routed expert runs unclamped is exactly the
+        # NPU-vs-CPU split the switch exists to remove. See
+        # hardware_backend/npu/moe/activation.py: swiglu_clamp_disabled().
+        elif self.swiglu_limit is not None and not _swiglu_clamp_disabled():
             if _is_npu:
                 _g, _u = gate_up.chunk(2, dim=-1)
                 _lim = float(self.swiglu_limit)
