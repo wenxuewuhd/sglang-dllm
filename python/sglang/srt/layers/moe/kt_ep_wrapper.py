@@ -425,7 +425,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
                 method=self.kt_config.method,
                 max_deferred_experts_per_token=layer_max_deferred,
-                swiglu_limit=layer.moe_runner_config.swiglu_limit or 0.0,
+                # Upstream sgl-project semantics: the swiglu_limit clamp is applied
+                # ONLY to the shared expert (deepseek_v2.py). Upstream's NPU routed
+                # experts call torch.ops.npu.npu_swiglu bare, and upstream's
+                # kt_ep_wrapper passes no limit at all. Forwarding a limit here made
+                # the CPU offload experts the only routed experts that clamp, which
+                # is the asymmetry this experiment removes.
+                swiglu_limit=0.0,
             )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
