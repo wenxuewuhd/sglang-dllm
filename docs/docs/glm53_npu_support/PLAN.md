@@ -111,7 +111,7 @@
 | **`npu_clipped_swiglu` 的默认参数** | 四个默认值（`alpha=1.702, limit=7.0, bias=1.0, interleaved=True`）**对 GLM 全错**，只传部分错 109× |
 | **Hadamard-128 能不能删，取决于存什么** | 正交归一、q/k 同旋转、点积不变，所以**在 bf16 下确实可删**；**一旦量化就不能删** —— 它正是 int8 优于 fp8 的原因（旋转后 kurtosis≈3.0）。既然一期走 bf16，**保留它**（保留同样中性，且 3 个 kernel 里它本来就正常）；只有撞上 §4 那个 triton-ascend codegen 缺陷才删 |
 | **`ue8m0` scale 舍入** | 对浮点格式免费，对 int8 要付一个真实 bit（32k 重合 99.18% → 98.84%） |
-| **`npu_sparse_flash_attention` 的 sparse_indices 必须是「有效值在前」** | `[-1, 70]` 返回 **0.0** 而不是 70 号 token 的值，**不报错**。`0` 不是哨兵（它选 0 号 token），越界值（`-1`/`-2`/`kv_len`）才被忽略。kpool 的 `append_kpool_tail_to_topk` 产出的正好是前缀（history 占 `[0, history_len)`、tail 接在后面、其余 -1），所以这条链满足契约 —— 但任何自己拼索引的地方都要保证前缀性 |
+| **`npu_sparse_flash_attention` 的 sparse_indices 契约比「有效值在前」更严，失败方式也更坏** | 之前记的是「不是前缀就静默返回 0」。**实测在真实形状下不对**：decode@32k、2048 个有效索引时，把 `-1` 挪到 slot 0 得到的是 **rel 1.23e-1 的静默错误非零值**，不是 0。位置扫描显示 `-1` 落**偶数槽**会改变输出（rel 0.15–0.29，静默），落**奇数槽**则逐位相同。「静默返回 0」只在**第一个分块整块无效**时出现（小形状上复现）。所以契约是某种与**槽位奇偶 / 分块对齐**相关的东西，前缀恰好满足它。**我们的链路产出严格前缀所以安全**，但任何自己拼索引的地方风险比原记录高得多。机制**未查清**（要看 `aclnnSparseFlashAttention` 的 tiling 或问厂商）|
 | **Hadamard 在 bf16 里做** | CUDA kernel 把 bf16 读进 **fp32 寄存器**再变换（`hadamard_jit.cuh:150` 的 `float x_vals[..]`），Triton 的 `_hadamard128` 同样作用在 fp32 accumulator 上。在 bf16 里做要 round 7 次而它们 round 1 次，**不报错**，只是悄悄挪走一批 pool —— 32k 下选择重合掉 0.0006（实测）。这个 bug 我写过一次，被端到端对拍抓出来 |
 | **NPU 的 bf16 矩阵乘不是 batch-shape 不变的** | 同一份输入只改 M（4096 行 vs 4080 行），过 `wk`+`k_norm` 后 **5/4080 行**差 1 个 bf16 ulp，gate 差 6/4080（实测）。根因在 torch_npu 的 matmul tiling，不在业务代码。**后果：NPU 上任何 prefill-vs-decode 的逐位一致性断言都不成立**，包括 P4 打算用的 KL 一致性 —— 只能定阈值，不能要求 bit-exact |
 | **KDA prefill 的 Triton autotune** | `kda.py:214` 的 24-config `do_bench` 扫描挂死 AI core（die 4/6/8 上 3/3 复现）；单独钉住任一 config 都能跑。⚠ 实际服务未触发，列为**上线前须确认** |
@@ -256,9 +256,24 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
 - [x] **P3.2 mHC** —— `_mhc_pre_dispatch`/`_mhc_post_dispatch` 加 NPU 分支走 `npu_hc_pre/post`。
       **接线四坑**：kernel 内部已乘 2（外面不能再乘）、`norm_eps` 传 1e-5、输入必须 4-D、权重必须 fp32；
       `npu_hc_post` 的 `post` 必须 2-D
-- [ ] **P3.3 NoPE MLA** —— 已修 4 处 rope=0 早退（分流、`fused_split_qk_norm`、cos/sin 预取、rope 应用；
-      下游 `q_rope/k_rope` 传 `None`）。**剩余**：20+ 处 split 早退、KV buffer 二元组语义、
-      `trans_rope_weight(w,0)` 的静默损坏加 assert。**数值未对拍**
+- [x] **P3.3 NoPE MLA** —— **已对拍**（随 DSA 整层一起，见下）。原「剩余」三项逐条核实后
+      **都不需要做**：`trans_rope_weight(w,0)` 的 7 个调用点**全在** `mla_preprocess.py` 的
+      MLAPO 里，被默认关闭的 `SGLANG_NPU_USE_MLAPO` 门控且本机 `npu_mla_prolog_v3` MISS，
+      GLM 进不去（加 assert 也是死代码）；`fused_split_qk_norm` 被 `has_rope` 挡住；
+      「20+ 处 split 早退」**真实路径上只有 2 处**（`q.split([256,0])` 与
+      `latent_cache.split([512,0])`），两处都产出 0 宽张量并在交给算子前降成 `None`。
+      其余 split 全在 GLM 不走的分支里。**KV buffer 二元组语义是真问题**，见 §4
+- [x] **P3.5 DSA 整层（注意力本体）** —— **已对拍，注意力本体干净**。真实部署形状
+      （TP16 rank0：4 个 MLA 头、32 个 indexer 头、`o_proj` 部分和、page 64、context 32k、
+      decode batch 16）。参考先对 HF `Glm5NextTextAttention` 校准过（rel 1.2e-6，cos=1.0）。
+      **判据用受控对比**：把「选择差异」摘掉之后，30+ 个格子的 rel 全部落在噪声地板上
+      （ratio 0.97–1.05）；(a) 端到端与 (b) 受控之间的差距，完全能被单独量出的
+      「选择差异成本」解释 —— **问题在选择（bf16 索引存储的已知代价），不在注意力**。
+      KV cache 写入也验了（rel 2.56e-3，地板 1.66e-3）。
+      回归脚本：`layer_check/{tp_fixture,reference_mla_math,reference_dsa,check_dsa}.py`
+  - [ ] 未验：**不是真的 TP16**（形状真、但单 die、无 HCCL、`o_proj` 部分和未规约）；
+        只有 layer 3 一条 prompt；11 个 DSA 层共享一个 pool；NPU Graph；MTP；
+        radix 前缀复用；混合 batch
 - [x] **P3.4 kpool indexer** —— **端到端跑通并对齐**。形态见 §2.9，数值见 §2.8。
       回归脚本：`tools/golden_kpool_indexer.py`（CPU 出 fp32 参考）+
       `tools/check_kpool_indexer_e2e_npu.py`（真机跑真实 `IndexerKPool` + 真实
@@ -352,6 +367,23 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
       （`_kpool_write_tail_and_maybe_compress_kernel`）只在 `num_draft_tokens >= 3` 触发它。
       **一期不在关键路径上**：那是 MTP，一期不做；真撞上就删 Hadamard（bf16 下可删，见 §2.4）
 - [ ] `deep_ep` 的打包 bug 已用 `.pth` 绕过，可向上游反馈
+- [ ] **`get_kv_buffer()` 返回的二元组语义随 pool 类而变，而 `forward_sparse` 只按一种解读**
+      （源码）。`NPUMLATokenToKVPool:615` 返回 `(k[512宽], v[rope宽])` = (nope, rope)；
+      而 `NPUDSATokenToKVPool` 继承的是**共享的** `MLATokenToKVPool:4437`，返回
+      `(整块 [N,1,kv_cache_dim], 同一块的 [...,:kv_lora_rank] 切片)` = (融合, nope)。
+      **GLM 没事纯粹因为 `qk_rope_head_dim == 0`**——融合 buffer 恰好就是 512 宽，
+      而 `k_pe` 反正被零页替换。**换一个带 rope 的 DSA 模型走同一个 pool，
+      `key_rope` 会被喂进 nope 切片，宽度和内容都错且不报错。**
+      这不是 bug，是一个没写下来的跨类不变量；建议在 pool 基类上显式化，
+      或让 DSA pool 覆盖 `get_kv_buffer` 返回 `(nope, rope)`
+- [ ] **`do_cp_balance_attn`（`ascend_backend.py:937/959`）有与已修的 `forward_sparse`
+      完全相同的 3-D/PA_BSND 缺陷**：开 prefill CP 就会撞 `561002`。一期不开 CP，
+      驱动不了因此没改——**开 CP 前必须先修**
+- [ ] **`NPUMLATokenToKVPool.set_kv_buffer:679` 在检查 `cache_v is None` 之前就
+      `cache_v.to(...)`**（源码）。GLM 走的是共享实现所以碰不到，但这条路真被走到会
+      直接 `AttributeError`
+- [ ] **预热**：DSA 单层 decode 首次 45.3 ms、稳态 5.6 ms（实测），说明有明显的
+      tiling/编译预热。真实启动脚本带 `--skip-server-warmup`，**P4 起服务前复查**
 - [x] ~~能不能让 qk_rope=0 走非 yarn 分支~~ —— **问题是空的**：那条分支 GLM 根本进不去，
       不需要改条件。OP-3 已撤销（§2.5），**工单包清空**。已在
       `deepseek_v2_attention_mla_npu.py` 的分支上方留了一行说明这个跨文件不变量

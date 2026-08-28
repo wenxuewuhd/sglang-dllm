@@ -1068,6 +1068,24 @@ class AscendAttnBackend(AttentionBackend):
     #: 16, 32 and 128 all raise).
     NOPE_ROPE_WIDTH = 64
 
+    def _as_pa_bsnd(self, buf: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """View a paged KV buffer the way ``layout_kv="PA_BSND"`` wants it.
+
+        ``MLATokenToKVPool`` allocates ``[num_slots, 1, kv_cache_dim]`` and hands
+        that shape out of ``get_kv_buffer``; ``npu_sparse_flash_attention``
+        rejects it outright -- "When layoutKV is PA_BSND, kvDimNum must be 4"
+        (measured, error 561002) -- and wants ``[num_pages, page_size, N, D]``,
+        which is the same bytes with the page split made explicit.
+
+        Slots beyond the last whole page are dropped: a page id in the block
+        table can only address ``[p*page_size, (p+1)*page_size)``, so nothing
+        reachable lives there.
+        """
+        if buf is None or buf.dim() != 3:
+            return buf
+        n = buf.shape[0] // self.page_size * self.page_size
+        return buf[:n].view(-1, self.page_size, *buf.shape[1:])
+
     def _nope_zero_rope(self, q_nope: torch.Tensor, k_nope: torch.Tensor):
         """An all-zero rope for a NoPE model, which the operator insists on.
 
@@ -1136,6 +1154,8 @@ class AscendAttnBackend(AttentionBackend):
             )
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        k_nope = self._as_pa_bsnd(k_nope)
+        k_pe = self._as_pa_bsnd(k_pe)
         if q_pe is None or q_pe.shape[-1] == 0:
             q_pe, k_pe = self._nope_zero_rope(q_nope, k_nope)
 

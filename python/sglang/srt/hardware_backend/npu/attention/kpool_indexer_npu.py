@@ -301,8 +301,22 @@ class KPoolNPUIndexerMixin:
         positions: torch.Tensor,
         forward_batch,
         layer_id: int,
+        layer_scatter_modes=None,
+        dynamic_scale: torch.Tensor = None,
         return_indices: bool = True,
     ) -> torch.Tensor | None:
+        # Positions 6 and 7 exist to match the *NPU* indexer call convention:
+        # forward_dsa_prepare_npu passes (layer_scatter_modes, dynamic_scale)
+        # positionally, as DSANPUIndexerMixin.forward_npu declares them. The
+        # CUDA forward has `return_indices` in slot 6 instead, so it stays a
+        # keyword here; forward_mha_prepare_npu already passes it by keyword.
+        # Neither extra is usable on this path: the scatter modes only matter to
+        # the all-gather-after-qlora variant (not wired for kpool), and
+        # dynamic_scale is the MLAPO quantized-q scale, which a bf16 index cache
+        # has nothing to undo.
+        assert (
+            dynamic_scale is None
+        ), "kpool indexer reads a bf16 query; a dynamic_scale would be dropped"
         import torch.nn.functional as F
 
         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
