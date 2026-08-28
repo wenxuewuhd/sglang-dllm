@@ -200,3 +200,196 @@ def topk_from_pooled_selection(
     )
     padded[: result.shape[0]] = result
     return padded
+
+
+class KPoolNPUIndexerMixin:
+    """``forward_npu`` for :class:`IndexerKPool`.
+
+    Deliberately does not go through ``BaseIndexerMetadata``. On Ascend
+    ``get_indexer_metadata()`` returns ``None`` -- ``AscendAttnBackend`` does not
+    define it -- so none of the kpool metadata the CUDA forward reads exists, and
+    the backend that does build it cannot be selected or even constructed here.
+    The non-kpool DSA indexer already solved this the same way
+    (``dsa/dsa_npu_indexer.py``): read ``forward_metadata`` directly.
+
+    Two differences from the CUDA forward, both consequences of bf16 storage:
+    the query is not ``act_quant``-ed, so the head gate carries no ``q_scale``;
+    and the selection comes back from the operator instead of being computed from
+    logits, so the transform picks up at the expand.
+    """
+
+    def _kpool_head_gate_npu(self, x: torch.Tensor) -> torch.Tensor:
+        """The per-head gate, in fp32.
+
+        The CUDA path folds ``q_scale`` in here to undo ``act_quant``; with a bf16
+        query there is nothing to undo. Kept in fp32 because the operator accepts
+        fp32 and a bf16 gate moves a handful of near-tie pools for nothing --
+        ``weights_proj`` is an fp32 parameter to begin with.
+        """
+        weights, _ = self.weights_proj(x.float())
+        return (weights * self.n_heads**-0.5 * self.softmax_scale).contiguous()
+
+    def _kpool_compress_write_extend_npu(
+        self, key, gate_score, forward_batch, layer_id, block_tables, pool
+    ) -> None:
+        """Drain whole pools into the cache, and park the remainder in the tail."""
+        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+            compute_pooled_write_locs,
+        )
+
+        kpool, page_size = self.index_kpool, pool.page_size
+        offset = 0
+        for i in range(forward_batch.batch_size):
+            q_len = int(forward_batch.extend_seq_lens_cpu[i])
+            if q_len == 0:
+                continue
+            seq_len = int(forward_batch.seq_lens_cpu[i])
+            first_pos = seq_len - q_len
+            if first_pos % kpool != 0:
+                raise NotImplementedError(
+                    "index_kpool_compress extend requires kpool-aligned chunk "
+                    "starts. Set chunked_prefill_size % index_kpool == 0 and "
+                    "avoid non-aligned prefix reuse."
+                )
+            key_chunk = key[offset : offset + q_len]
+            score_chunk = gate_score[offset : offset + q_len]
+            n_pools = q_len // kpool
+            n_drain = n_pools * kpool
+            if n_pools > 0:
+                num_token_pages = (seq_len + page_size - 1) // page_size
+                pool_ids = first_pos // kpool + torch.arange(
+                    n_pools, dtype=torch.int64, device=key.device
+                )
+                write_locs = compute_pooled_write_locs(
+                    block_tables[i, :num_token_pages].contiguous(), pool_ids, kpool
+                )
+                pool.set_index_k_bf16(
+                    layer_id,
+                    write_locs,
+                    compress_pool_bf16(
+                        key_chunk[:n_drain].view(n_pools, kpool, self.head_dim),
+                        score_chunk[:n_drain].view(n_pools, kpool, self.head_dim),
+                        self.index_kpool_compress_ape,
+                    ),
+                )
+            pool.set_compress_tail_for_request(
+                layer_id=layer_id,
+                req_pool_idx=forward_batch.req_pool_indices[i].to(torch.long),
+                key_tail=key_chunk[n_drain:],
+                score_tail=score_chunk[n_drain:],
+                n_remain=q_len - n_drain,
+                dst_logical_start=first_pos + n_drain,
+            )
+            offset += q_len
+
+    def _kpool_extend_rows_npu(self, forward_batch, device):
+        """Per-query-row sequence length and owning request, for the segmentation."""
+        seq_lens, req_index = [], []
+        for i in range(forward_batch.batch_size):
+            q_len = int(forward_batch.extend_seq_lens_cpu[i])
+            if q_len == 0:
+                continue
+            seq_len = int(forward_batch.seq_lens_cpu[i])
+            seq_lens.append(torch.arange(seq_len - q_len + 1, seq_len + 1))
+            req_index.append(torch.full((q_len,), i))
+        return (
+            torch.cat(seq_lens).to(device=device, dtype=torch.int32),
+            torch.cat(req_index).to(device=device, dtype=torch.int32),
+        )
+
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch,
+        layer_id: int,
+        return_indices: bool = True,
+    ) -> torch.Tensor | None:
+        import torch.nn.functional as F
+
+        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+            build_pooled_page_table_64,
+        )
+        from sglang.srt.model_executor.forward_context import (
+            get_attn_backend,
+            get_token_to_kv_pool,
+        )
+
+        mode = forward_batch.forward_mode
+        out_cols = self.index_topk + self.index_kpool - 1
+        if mode.is_idle() or len(forward_batch.seq_lens_cpu) == 0:
+            return torch.full(
+                (x.shape[0], out_cols), -1, dtype=torch.int32, device=x.device
+            )
+        if not (mode.is_decode_or_idle() or mode.is_extend()):
+            raise NotImplementedError(
+                f"The Ascend kpool indexer supports decode and extend, got {mode}."
+            )
+
+        pool = get_token_to_kv_pool()
+        block_tables = get_attn_backend().forward_metadata.block_tables
+
+        query, key, gate_score = self._get_q_k_bf16(
+            q_lora, x, positions, enable_dual_stream=False, forward_batch=forward_batch
+        )
+        if gate_score is None:
+            gate_score = F.linear(x, self.index_kpool_compress_gate)
+
+        # Write the cache before scoring: a query sees every pool that closed at
+        # or before its own position, its own included.
+        if mode.is_decode_or_idle():
+            batch = key.shape[0]
+            pool.kpool_decode_update_index_cache(
+                layer_id=layer_id,
+                key=key,
+                slot_score=gate_score,
+                ape=self.index_kpool_compress_ape,
+                block_tables=block_tables,
+                req_pool_indices=forward_batch.req_pool_indices[:batch],
+                positions=positions[:batch],
+                seq_lens=forward_batch.seq_lens[:batch],
+                out_cache_loc=forward_batch.out_cache_loc[:batch],
+            )
+            seq_lens_row = forward_batch.seq_lens[:batch].to(torch.int32)
+            req_index_row = torch.arange(batch, device=x.device, dtype=torch.int32)
+        else:
+            self._kpool_compress_write_extend_npu(
+                key, gate_score, forward_batch, layer_id, block_tables, pool
+            )
+            seq_lens_row, req_index_row = self._kpool_extend_rows_npu(
+                forward_batch, x.device
+            )
+
+        if not return_indices:
+            return None
+
+        pool_lens_row = torch.div(
+            seq_lens_row, self.index_kpool, rounding_mode="floor"
+        ).to(torch.int32)
+        cu_seqlens_q, run_pool_lens, run_req = visible_pool_runs(
+            pool_lens_row, req_index_row
+        )
+        pooled_page_table = build_pooled_page_table_64(
+            block_tables, self.index_kpool
+        ).contiguous()
+
+        selected = select_pools(
+            query=query.contiguous(),
+            index_k_cache=pool.get_index_k_with_scale_buffer(layer_id),
+            weights=self._kpool_head_gate_npu(x),
+            cu_seqlens_q=cu_seqlens_q,
+            pool_lens=run_pool_lens,
+            block_table=pooled_page_table[run_req].contiguous(),
+            group_topk=self.index_topk // self.index_kpool,
+        )
+
+        # No page table and no offsets: that yields logical token positions, which
+        # is exactly what npu_sparse_flash_attention consumes downstream.
+        return topk_from_pooled_selection(
+            selected,
+            group_lengths=pool_lens_row,
+            pool_size=self.index_kpool,
+            topk=self.index_topk,
+            seq_lens=seq_lens_row,
+        )

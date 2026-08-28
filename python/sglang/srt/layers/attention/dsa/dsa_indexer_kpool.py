@@ -52,7 +52,17 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
 
-class IndexerKPool(MultiPlatformOp):
+if is_npu():
+    from sglang.srt.hardware_backend.npu.attention.kpool_indexer_npu import (
+        KPoolNPUIndexerMixin,
+    )
+else:
+
+    class KPoolNPUIndexerMixin:
+        pass
+
+
+class IndexerKPool(KPoolNPUIndexerMixin, MultiPlatformOp):
     def __init__(
         self,
         hidden_size: int,
