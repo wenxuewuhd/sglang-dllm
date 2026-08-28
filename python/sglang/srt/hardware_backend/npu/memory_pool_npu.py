@@ -808,8 +808,10 @@ class NPUBf16IndexKeyCache(IndexKeyCache):
     """
 
     def _buffer_shape(self, num_pages: int) -> tuple[int, ...]:
+        # One page beyond what the block table can address, reserved as a place
+        # for masked-off rows to write. See NPUDSATokenToKVPool.scratch_loc.
         pool = self.pool
-        return (num_pages, pool.page_size, 1, pool.index_head_dim)
+        return (num_pages + 1, pool.page_size, 1, pool.index_head_dim)
 
 
 class NPUDSATokenToKVPool(DSATokenToKVPool):
@@ -824,6 +826,36 @@ class NPUDSATokenToKVPool(DSATokenToKVPool):
 
     def _create_index_key_cache(self) -> "IndexKeyCache":
         return NPUBf16IndexKeyCache(self, self.index_buf_size)
+
+    def _init_kpool_compress_tail_buffers(self, *args, **kwargs) -> None:
+        """Add one spare request row to each tail ring.
+
+        The decode writer is branch-free so that it holds no host
+        synchronisation, which means masked-off rows still take part in the
+        scatter. Their request index is clamped into range and would otherwise
+        alias a live request -- a padded graph row usually carries
+        ``req_pool_indices == 0`` -- and a duplicated destination makes the
+        write order undefined, so the live row's update can be the one that
+        loses. A spare row gives them somewhere that collides with nothing.
+        """
+        super()._init_kpool_compress_tail_buffers(*args, **kwargs)
+        if not getattr(self, "kpool_use_compress", False):
+            return
+        pad = lambda t: (  # noqa: E731
+            t
+            if t.shape[0] == 0
+            else torch.cat([t, torch.zeros_like(t[:1])], dim=0)
+        )
+        self._tail_scratch_row = max(
+            (t.shape[0] for t in self._compress_tail_k), default=0
+        )
+        self._compress_tail_k = [pad(t) for t in self._compress_tail_k]
+        self._compress_tail_score = [pad(t) for t in self._compress_tail_score]
+
+    @property
+    def scratch_loc(self) -> int:
+        """An index-cache slot no block table can name -- see _buffer_shape."""
+        return (self.index_key_cache.buffer[0].shape[0] - 1) * self.page_size
 
     def set_index_k_bf16(
         self, layer_id: int, loc: torch.Tensor, index_k: torch.Tensor
@@ -893,37 +925,43 @@ class NPUDSATokenToKVPool(DSATokenToKVPool):
         safe_pos = pos.clamp(min=0)
 
         # A pool closes on its last slot; only then is there anything to compress.
-        closing = (valid & (safe_pos % pool_size == pool_size - 1)).nonzero(
-            as_tuple=True
-        )[0]
-        if closing.numel() > 0:
-            r, p = safe_req[closing], safe_pos[closing]
-            start = p - p % pool_size
-            phys = (
-                start.unsqueeze(1)
-                + torch.arange(pool_size, device=key.device).unsqueeze(0)
-            ) % tail_width
-            slot_k = tail_k[r.unsqueeze(1), phys].clone()
-            slot_s = tail_score[r.unsqueeze(1), phys].clone()
-            # The closing token is still in flight -- the ring is written below.
-            slot_k[:, pool_size - 1] = key[closing]
-            slot_s[:, pool_size - 1] = slot_score[closing]
+        # Every row is compressed and a mask decides what lands, rather than
+        # selecting the closing rows: `.nonzero()` would move the count to the
+        # host, which costs a synchronisation per layer per decode step and makes
+        # the path impossible to capture into a graph. The batch is at most
+        # max_running_requests, so compressing all of it is cheaper than the sync.
+        closing = (valid & (safe_pos % pool_size == pool_size - 1)).unsqueeze(1)
+        rows = torch.arange(batch, device=key.device)
 
-            pool_id = p // pool_size
-            page_col = ((pool_id // self.slots_per_page) * pool_size).clamp(
-                0, block_tables.shape[1] - 1
-            )
-            page = block_tables[closing, page_col].long()
-            loc = page * self.page_size + pool_id % self.slots_per_page
-            self.set_index_k_bf16(
-                layer_id, loc, compress_pool_bf16(slot_k, slot_s, ape)
-            )
+        start = safe_pos - safe_pos % pool_size
+        phys = (
+            start.unsqueeze(1) + torch.arange(pool_size, device=key.device).unsqueeze(0)
+        ) % tail_width
+        slot_k = tail_k[safe_req.unsqueeze(1), phys].clone()
+        slot_s = tail_score[safe_req.unsqueeze(1), phys].clone()
+        # The closing token is still in flight -- the ring is written below.
+        slot_k[:, pool_size - 1] = key
+        slot_s[:, pool_size - 1] = slot_score
 
-        keep = valid.nonzero(as_tuple=True)[0]
-        if keep.numel() > 0:
-            phys_slot = safe_pos[keep] % tail_width
-            tail_k[safe_req[keep], phys_slot] = key[keep]
-            tail_score[safe_req[keep], phys_slot] = slot_score[keep]
+        pool_id = safe_pos // pool_size
+        page_col = ((pool_id // self.slots_per_page) * pool_size).clamp(
+            0, block_tables.shape[1] - 1
+        )
+        page = block_tables[rows, page_col].long()
+        loc = torch.where(
+            closing.squeeze(1),
+            page * self.page_size + pool_id % self.slots_per_page,
+            torch.full_like(page, self.scratch_loc),
+        )
+        # A row that is not closing, or is invalid, is sent to the spare slot
+        # instead of being filtered out -- filtering needs the count on the host.
+        self.set_index_k_bf16(layer_id, loc, compress_pool_bf16(slot_k, slot_s, ape))
+
+        # Same for the ring.
+        dest = torch.where(valid, safe_req, self._tail_scratch_row)
+        phys_slot = safe_pos % tail_width
+        tail_k[dest, phys_slot] = key
+        tail_score[dest, phys_slot] = slot_score
 
     def set_index_k_scale_buffer(self, *args, **kwargs):
         raise NotImplementedError(

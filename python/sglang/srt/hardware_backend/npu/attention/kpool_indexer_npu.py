@@ -378,9 +378,19 @@ class KPoolNPUIndexerMixin:
         pool_lens_row = torch.div(
             seq_lens_row, self.index_kpool, rounding_mode="floor"
         ).to(torch.int32)
-        cu_seqlens_q, run_pool_lens, run_req = visible_pool_runs(
-            pool_lens_row, req_index_row
-        )
+        if mode.is_decode_or_idle():
+            # Decode has one query row per request, so every row is already its
+            # own run. Skipping the segmentation skips its `int(...max())` and
+            # its data-dependent output shape -- both fatal to graph capture, and
+            # decode is the mode that gets captured.
+            cu_seqlens_q = torch.arange(
+                1, pool_lens_row.shape[0] + 1, device=x.device, dtype=torch.int32
+            )
+            run_pool_lens, run_req = pool_lens_row, req_index_row.long()
+        else:
+            cu_seqlens_q, run_pool_lens, run_req = visible_pool_runs(
+                pool_lens_row, req_index_row
+            )
         pooled_page_table = build_pooled_page_table_64(
             block_tables, self.index_kpool
         ).contiguous()

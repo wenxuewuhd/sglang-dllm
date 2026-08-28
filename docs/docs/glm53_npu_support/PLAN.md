@@ -349,7 +349,15 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
       `expand_pooled_groups_to_topk` 中间物化了 `[4096, 512, 4]` 的 int64（67 MB）再 reshape，
       占 6.3 ms / 单层。11 个 DSA 层 → 每个 4096-token chunk 约 69 ms。**在共享代码里**
       （`kpool_fp8_index.py:379`），改动会影响 CUDA 路径，先 profiling 再决定
-- [ ] P6.6 NPU Graph
+- [ ] P6.6 NPU Graph —— **decode 路径已扫清 host 同步**（实测 `timing.count_syncs`：
+      kpool 的 decode 缓存更新 **0 次/调用**）。做法：decode 跳过 `visible_pool_runs`
+      （每行本来就自成一段），并把缓存更新改成无分支——**不过滤行，而是给被屏蔽的行
+      一个 scratch 目标**。⚠ 这里有个真陷阱：屏蔽行的 `req_pool_indices` 会被 clamp，
+      padding 行通常带 0，于是和真实请求 0 撞同一个槽位，**重复下标的写入顺序未定义，
+      真实行的写入可能被覆盖**——而这恰恰只在图捕获（padding batch）下发生。
+      所以索引缓存多分配一页、tail ring 多分配一行，专供屏蔽行落地。
+      **extend 仍有同步**（`visible_pool_runs` 里的 `int(...max())`、
+      `_kpool_extend_rows_npu` 的 host 侧构造），但 prefill 本来就不捕获，不需要动
 - ⚠ **所有性能数字目前都是静态推算**，端到端跑通后必须用 profiling 重排序
 
 ---
