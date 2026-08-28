@@ -1879,6 +1879,12 @@ class AscendAttnBackend(AttentionBackend):
                     query_rope=q_rope,
                     key_rope=k_rope.contiguous(),
                     num_heads=layer.tp_q_head_num,
+                    # Measured: under TND the num_key_value_heads default of 0
+                    # ("same as num_heads") is honoured in BSND but not here --
+                    # the output matches neither head count and is wrong by two
+                    # orders of magnitude, with no error raised. The decode call
+                    # below always passed it; this one has to as well.
+                    num_key_value_heads=layer.tp_k_head_num,
                     input_layout="TND",
                     atten_mask=self.fia_mask,
                     sparse_mode=3,

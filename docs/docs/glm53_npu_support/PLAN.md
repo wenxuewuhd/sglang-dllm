@@ -125,7 +125,7 @@
 | # | 算子 / 能力 | 结论 | 证据 |
 |---|---|---|---|
 | A1 | **NoPE MLA 的 attention core** | ✅ **实测可跑**。`npu_fused_infer_attention_score` 接受 `qk=256/v=256/N=64`（prefill 形态，→`[1,64,256,256]`）与 `kv_lora=512 + rope=0/N=64`（MLA-absorbed decode，→`[1,64,1,512]`） | 本机实跑，`probe/p0_6_shapes.py` |
-| A2 | **稀疏 attention 的 rope 可选** | ✅ 签名确认：`npu_sparse_flash_attention(..., Tensor? query_rope=None, Tensor? key_rope=None, ...)`。**rope=0 直接不传，不需要"传 64 维全零"的 workaround** | torch_npu 运行时 doc。⚠ **仍未实跑**——vendor 包现已可加载（24.04），实跑这一条已无障碍，待补 probe |
+| A2 | ~~稀疏 attention 的 rope 可选~~ | ❌ **2026-08-28 实跑推翻**。签名上是 Optional，**实际不接受缺省**：`attention_mode=0/1` 都报 `queryRope ... is required`；mode 0 还自相矛盾（既要求 rope 为空张量、又拒绝任何构造出来的空张量），mode 1 未实现。**只有 mode 2（MLA，`kv_head_num` 必须为 1）能跑，且要求非空 rope**。→ **「传全零 rope」的 workaround 是必需的**，实测它数值正确（0.93× 地板），因为零 rope 对分数贡献恰为 0 | 本机实跑（该算子的**首次执行**） |
 | A3 | **pooled-key 打分（KPool 的打分环节）** | ✅ **vendor 包已提供且我们已在用**：`torch.ops.custom.npu_quant_lightning_indexer(..., cmp_ratio=4, sparse_count=2048, sparse_mode=3)` 就在 DSv4 生产路径里 | `ascend_dsv4_backend.py:1002-1021` |
 | A4 | **KPool 的压缩写 cache** | ✅ vendor `torch.ops.custom.compressor` 已带 **fused norm + RoPE**，且 AscendC 实现（`AddApeToScore → ColumnSoftMax(逐 head-dim 列) → Mul → ColumnSum`）与 GLM 的 kernel **同构**。差异只有 norm 类型 → 见 B1 | `ascend_dsv4_backend.py:411-430`；AscendC `compressor/arch22/` |
 | A5 | **mHC pre / post** | ✅ 算子存在：`torch.ops.custom.npu_hc_pre` / `npu_hc_post`，DSv4 在用。GLM-5.3 侧只缺 dispatch 分支（**代码工作，非算子**） | `kernels/ops/layernorm/mhc.py:1605`；`models/deepseek_v4.py:1713` |
@@ -655,7 +655,7 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
 - [ ] P6.10 NPU Graph
 
 **已确认可以不做的**：
-- ~~零 RoPE64 适配~~（G1：`query_rope`/`key_rope` 本就是 Optional）
+- ⚠ ~~~~零 RoPE64 适配~~~~ **这条撤回**：实跑证明 `query_rope` 不能缺省，**必须传全零 rope**（见 §2.2 A2）。所幸零 rope 数值上贡献为 0，实测正确
 - ~~Hadamard-128 旋转~~（G2：正交归一，走 bf16 indexer 时数学等价）
 - ~~`aclnnMixedQuantSparseFlashMla` 路线~~（G7：`rope_head_dim` 只能是 64，且 arch35-only，A3 无二进制）
 
@@ -751,3 +751,9 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
 | 2026-08-28 | **OP-1 的真实缺口定位到 index-K cache 的 dtype**：kpool 用 fp8 存压缩索引键，A3 没有 fp8。**DSv4 在昇腾上早已改用 int8**（`ascend_dsv4_backend.py:685` 设 `li_kv_dtype="int8"`，int8 分支在 `:469-470`/`:597-598`）。GLM 能否照此办理是开工前要定的事 → OP-1 从「写新选择 kernel」缩成「换 cache dtype + 一个 int8 的 compress-quantize-write」 |
 | 2026-08-28 | Hadamard 的 codegen bug **对我们很可能无关**：A7 早已核实它是正交归一阵、q/k 同时旋转、点积不变，走 bf16 indexer 时可整体删掉。仍值得给 triton-ascend 报 bug |
 | 2026-08-28 | 新增 [`tools/logit_check.py`](./tools/logit_check.py)：teacher-forced logprob 对拍脚手架。参考算一次存盘、之后每次迭代秒级比对；`--ref-source` 可选 `hf-cpu`（真值）或 `server`（融合算子 vs torch 兜底，不需要 CPU 参考）。已用 4 层小模型验证 plumbing 与 teacher-forcing 下标 |
+| 2026-08-28 | **高风险算子对 golden 的数值验证完成**（一轮 agent，全部上机实跑）。**KDA 全线通过**：`causal_conv1d_fn/update_npu` **逐位精确**、gate 0.37× 地板、chunk kernel 链 0.30×、decode 0.73×、`o_norm` 通过；今日改的 `_flat_kda_gate` 在 prefill/decode 两种形状下均验证正确。FIA 的 BSND prefill 与 MLA-absorbed decode 通过；MoE 的 router（expert 集合 2048/2048 完全一致）与 `grouped_matmul` 通过 |
+| 2026-08-28 | ⚠ **两个「能跑但算错」**：① **FIA 在 TND 布局 + 省略 `num_key_value_heads` 时结果错 200×**（BSND 下默认值是对的，TND 下既不等于 64 头也不等于 1 头，无报错）。我们 `ascend_backend.py` 的 TND prefill 调用点**正是唯一没传这个参数的**（其余 8 处都传了）→ **已修**。② `npu_clipped_swiglu` **四个默认参数对 GLM 全错**，只传部分会错 109×，接线时必须四个全传 |
+| 2026-08-28 | ⚠ **A2 被实跑推翻**：`npu_sparse_flash_attention` 的 rope **签名 Optional 但实际不接受缺省**。只有 `attention_mode=2`（MLA，kv_head=1）可用且要求非空 rope → **「全零 rope」的 workaround 必需**（数值正确，因零 rope 贡献恰为 0）。P6 里「零 RoPE64 适配可以不做」**撤回** |
+| 2026-08-28 | ⚠ **`npu_quant_lightning_indexer` 无法表达 GLM 的 indexer**：其 metadata 算子**只接受 `num_heads_q=64`**，而 GLM 的 `index_n_heads=32`。这动摇了把 OP-1 的打分环节交给该算子的设想 |
+| 2026-08-28 | ⚠ **KDA prefill 在 Triton autotune 时挂死 AI core**（`kda.py:214` 的 24 config `do_bench` 扫描 → `aicore timeout` 507014，在 die 4/6/8 上 **3/3 复现**）。单独钉住任一 config 都能跑通 → 是 benchmark 扫描本身的问题。⚠ 但实际 TP16 服务跑过 KDA 层 0–2 没触发，**列为「上线前必须确认」而非已证实的阻塞** |
+| 2026-08-28 | `torch.ops.custom.compressor` 与 `npu_quant_lightning_indexer` 的 kernel **无法在独立 harness 里驱动**（都需要活的 pool/page-table），返回不透明错误 → **OP-2 的前提仍未验证**。`ascend_dsv4_backend.py:401` 调的是 `torch.ops.npu.compressor`，与 `torch.ops.custom.compressor` **不是同一个**（本 build 只有 custom 命名空间有） |
