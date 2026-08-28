@@ -194,7 +194,7 @@ DeepseekV2/V4 的 MoE 前向确认 `fused` 判定没变。
 
 这三处**没有改动**，记在这里是因为**都会影响 GLM 之外的东西**，改不改要先定。
 
-**①「图 padding 的填充值两边不一致」** —— `hybrid_linear_attn_backend.py:88` / `:750`
+**①「图 padding 的填充值两边不一致」—— ✅ 已按修法 A 修**（`ascend_kda_backend.py` 覆写 `get_cuda_graph_seq_len_fill_value` 返回 0，与 runner 实际填的值、以及 `AscendMambaAttnBackendBase:212` 的先例一致；NPU 树内，不动共享路径）。原始分析： —— `hybrid_linear_attn_backend.py:88` / `:750`
 对 `ascend_backend.py:792`。runner 按顶层 backend 报的填充值去填 padded `seq_lens`，
 而 `HybridLinearAttnBackend` 把这个问题**委托给全注意力那一半**（昇腾上是 **0**），
 `MambaAttnBackendBase` 自己却缓存成 **1**。CUDA 上两边碰巧都是 1，所以没暴露。

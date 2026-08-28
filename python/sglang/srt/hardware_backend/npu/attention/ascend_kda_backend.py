@@ -182,6 +182,24 @@ class AscendKDAAttnBackend(KDAAttnBackend):
 
     supports_speculative_conv_state_snapshots: bool = True
 
+    def get_cuda_graph_seq_len_fill_value(self):
+        # 0, not the base class's 1, because 0 is what the runner actually fills
+        # padded seq_lens with on Ascend. The runner asks the *top-level* backend
+        # (AscendHybridLinearAttnBackend -> HybridLinearAttnBackend:1119 -> the
+        # full-attention half -> AscendAttnBackend:792 -> 0), while this backend
+        # caches its own answer in _graph_seq_len_fill_value and compares against
+        # it when counting padded rows (hybrid_linear_attn_backend.py:580).
+        #
+        # That comparison is unreachable today -- build_replay_fb_view always
+        # passes an explicit num_padding -- but when it was forced to run it
+        # counted 0 padded rows out of 3, and the padded rows were then written
+        # to mamba slot 0 as though they were real. What kept that harmless was
+        # MambaSlotAllocator reserving slot 0, not anything here; a pool that
+        # ever handed slot 0 to a real request would lose its state silently.
+        #
+        # AscendMambaAttnBackendBase:212 already returns 0 for the same reason.
+        return 0
+
     def __init__(self, model_runner):
         super().__init__(model_runner)
         # The NPU pool is allocated directly as [pool, channels, window].

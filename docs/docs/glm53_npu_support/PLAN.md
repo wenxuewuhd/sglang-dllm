@@ -2,7 +2,33 @@
 
 > 活文档。**只记当前事实与计划，不记怎么走到这里的** —— 过程看 `git log`。
 > 每条结论都标了证据等级：**实测**（本机跑过）/ **源码**（读代码或头文件得出，未执行）/ **推断**。
-> 最后更新：2026-08-28
+> 最后更新：2026-08-29
+
+---
+
+## 现状（2026-08-29）
+
+**算子开发需求：0 项。** 五条推断出来的缺口逐条上机核实，**五条全部证伪**，
+`operator_handoff/` 已清空。详见 §2.5。
+
+| | 状态 |
+|---|---|
+| 环境 / 分支合流 / BF16 权重转换 | ✅ P0–P2 |
+| **五类层逐层对拍**（DSA / KDA / MoE / mHC / dense FFN） | ✅ **全部端到端已验**，真实 TP16 形状，回归脚本在 `layer_check/` |
+| **NPU Graph 捕获** | ✅ 五类层各自 + **两个完整 decoder 层捕进同一个图**（走真实 `NPUGraphRunner`）+ 多 bs 共池 + 2 卡 HCCL |
+| **整网** | ❌ **一次都没跑通过**。所有验证都是单 die、单层/双层、无 16 卡 HCCL |
+
+**当前门槛：P4.1 整网启动。** 不是技术问题，是**机器**问题 ——
+GLM BF16 只能 TP16（TP8 每卡要 74.9 GB，放不下），而 `bootstrap.py:339` 要求
+**每张卡空闲显存 ≥ 90%**，所以**必须独占整机**。
+
+**下一步的顺序**：整网 eager 跑通 → 开 graph → 在 graph 下重做性能。
+⚠ 现有的性能数字全是 eager 时代的，**开 graph 后要重测**：host 开销类的优化
+（`TASK_QUEUE_ENABLE`、减少 aten dispatch 次数）会被图吃掉，
+device 时间类的（AI_CPU 回退、int64 算术、标量瓶颈 kernel）才继续值钱。
+
+**欠账**在 `SHARED_CHANGES.md`：改到共享路径的每一处、谁受影响、还欠什么回归。
+其中 **DSv4 的 GPQA 回归**尚未跑（swiglu_limit 那条改动欠的）。
 
 ---
 
@@ -119,7 +145,7 @@
 | kpool 的 10 个 Triton kernel 中的 **7 个**（top-k、展开、尾部、plan/layout） | **逐位精确** |
 | `torch_npu.npu_lightning_indexer`（**bf16**，`n_heads=32`）prefill + decode | 对真实权重的 golden **落在噪声地板上**，见 §2.8 |
 
-### 2.3 确认要开发 / 要改
+### 2.3 曾经的三条「要开发」—— 两条已实现，一条已撤销（**没有待办**）
 
 | # | 项 | 结论 |
 |---|---|---|
@@ -209,26 +235,6 @@
 
 ---
 
-### 2.9 P3.4 的接线地形（调研结论）
-
-| 问题 | 结论 |
-|---|---|
-| 11 个 DSA 层由谁服务 | **`AscendAttnBackend`**，外面包 `AscendKDAHybridLinearAttnBackend`（`attention_registry.py:503-542`） |
-| `get_indexer_metadata()` | **返回 `None`** —— `AscendAttnBackend` 不定义它，落到 `base_attn_backend.py:302` 的 ABC 默认。**kpool 那套 metadata 在 NPU 上一个都不存在** |
-| 能不能改用 `DeepseekSparseAttnBackend` | 不能。① NPU 无条件把 `attention_backend` 钉成 `"ascend"`（`npu/utils.py:51-64`），DSA 那个 override 根本不触发；② 就算强行选上，`dsa_backend.py:615` 无条件调 `torch.cuda.get_device_capability()`，构造就死（实测）；③ 再修好也只拿到全零的 `kpool_write_plan`（`kpool_plan.py:741` 在 `not is_cuda()` 时直接 return）和一堆 `None` 的 `pooled_*`（`kpool_plan.py:586`） |
-| KV pool 是哪个 | `HybridLinearKVPool` 包一个**普通的** `DSATokenToKVPool`。GLM 是 mambaish，而配置器里每个 NPU 分支都带 `and not self.mambaish_config`，所以全被跳过（`kv_cache_configurator.py:992/1006/1033` → `:1059` 命中） |
-| 接口在哪加 | `memory_pool.py:3813` 的 `elif use_dsa:` —— 三个分支里**唯一没有 `_is_npu` 分支**的那个（MHA 在 `:3779`、MLA 在 `:3853` 都有）。这就是接缝 |
-| pool 的 9 个方法 | 全都存在。tail buffer（bf16）、`slots_per_page`、`page_size`、`_is_layer_owned` 直接可用；**只有 `set_index_k_scale_buffer` 和 `kpool_decode_update_index_cache` 因 fp8 不可用** |
-| 拿到 topk 之后谁做稀疏注意力 | `torch_npu.npu_sparse_flash_attention`（`ascend_backend.py:1146`）。契约（实测）：`[T, 1, K]` int32、**逻辑 token 位置**（不是物理槽位）、`-1` 补齐、**有效值必须在前**（见 §2.4）、不要求排序 |
-| 已有的先例 | `dsa/dsa_npu_indexer.py:24` 的 `DSANPUIndexerMixin.forward_npu` —— 非 kpool 的 DSA indexer 在 NPU 上早就跑通了，用的正是 `npu_lightning_indexer`，而且**完全不碰 `get_indexer_metadata`** |
-
-> 附带一个可能有用的观察（**未采用，记着**）：`npu_sparse_flash_attention` 的
-> `sparse_block_size` 是**选择粒度**（仓库一律传 1），索引 `j` 选逻辑区间
-> `[j*s, (j+1)*s)` 并按 `actual_seq_lengths_kv` 截尾。也就是说传 `sparse_block_size=index_kpool`
-> 就能**直接喂 pool id**，省掉展开这一步。尾部语义对不对没验，先不动。
-
----
-
 ### 2.8 P3.4 的数值门槛：已通过（实测）
 
 layer 3、真实权重、真实 hidden states（embed + layer 0–2 真跑）、32768 真实 token，
@@ -271,6 +277,26 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
 
 ---
 
+### 2.9 P3.4 的接线地形（调研结论）
+
+| 问题 | 结论 |
+|---|---|
+| 11 个 DSA 层由谁服务 | **`AscendAttnBackend`**，外面包 `AscendKDAHybridLinearAttnBackend`（`attention_registry.py:503-542`） |
+| `get_indexer_metadata()` | **返回 `None`** —— `AscendAttnBackend` 不定义它，落到 `base_attn_backend.py:302` 的 ABC 默认。**kpool 那套 metadata 在 NPU 上一个都不存在** |
+| 能不能改用 `DeepseekSparseAttnBackend` | 不能。① NPU 无条件把 `attention_backend` 钉成 `"ascend"`（`npu/utils.py:51-64`），DSA 那个 override 根本不触发；② 就算强行选上，`dsa_backend.py:615` 无条件调 `torch.cuda.get_device_capability()`，构造就死（实测）；③ 再修好也只拿到全零的 `kpool_write_plan`（`kpool_plan.py:741` 在 `not is_cuda()` 时直接 return）和一堆 `None` 的 `pooled_*`（`kpool_plan.py:586`） |
+| KV pool 是哪个 | `HybridLinearKVPool` 包一个**普通的** `DSATokenToKVPool`。GLM 是 mambaish，而配置器里每个 NPU 分支都带 `and not self.mambaish_config`，所以全被跳过（`kv_cache_configurator.py:992/1006/1033` → `:1059` 命中） |
+| 接口在哪加 | `memory_pool.py:3813` 的 `elif use_dsa:` —— 三个分支里**唯一没有 `_is_npu` 分支**的那个（MHA 在 `:3779`、MLA 在 `:3853` 都有）。这就是接缝 |
+| pool 的 9 个方法 | 全都存在。tail buffer（bf16）、`slots_per_page`、`page_size`、`_is_layer_owned` 直接可用；**只有 `set_index_k_scale_buffer` 和 `kpool_decode_update_index_cache` 因 fp8 不可用** |
+| 拿到 topk 之后谁做稀疏注意力 | `torch_npu.npu_sparse_flash_attention`（`ascend_backend.py:1146`）。契约（实测）：`[T, 1, K]` int32、**逻辑 token 位置**（不是物理槽位）、`-1` 补齐、**有效值必须在前**（见 §2.4）、不要求排序 |
+| 已有的先例 | `dsa/dsa_npu_indexer.py:24` 的 `DSANPUIndexerMixin.forward_npu` —— 非 kpool 的 DSA indexer 在 NPU 上早就跑通了，用的正是 `npu_lightning_indexer`，而且**完全不碰 `get_indexer_metadata`** |
+
+> 附带一个可能有用的观察（**未采用，记着**）：`npu_sparse_flash_attention` 的
+> `sparse_block_size` 是**选择粒度**（仓库一律传 1），索引 `j` 选逻辑区间
+> `[j*s, (j+1)*s)` 并按 `actual_seq_lengths_kv` 截尾。也就是说传 `sparse_block_size=index_kpool`
+> 就能**直接喂 pool id**，省掉展开这一步。尾部语义对不对没验，先不动。
+
+---
+
 ## 3. 阶段计划
 
 | 阶段 | 状态 | 出口结果 |
@@ -279,7 +305,7 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
 | **P1 分支合流** | ✅ | rebase 到 GPU 参考实现 **`033446bb05`**（tag `glm53-gpu-ref-033446bb`），19 commit / 2 冲突；回归 **GPQA 73.23%**（差 −0.50pp） |
 | **P2 BF16 权重** | ✅ | 62/62 shard → **599 GB**；首 shard **27.6 亿元素逐位比对 0 处不一致**；名称/形状/dtype 全量核对通过 |
 
-### P3 · 逐模块对拍 ☐
+### P3 · 逐模块对拍 ✅（五类层全部端到端已验）
 - [x] **P3.1 KDA** —— `attention_registry.py` 加 NPU 分支；`_flat_kda_gate` 修布局契约（Kimi 是 head-split，GLM 已 flat）。数值已验
 - [x] **P3.2 mHC** —— `_mhc_pre_dispatch`/`_mhc_post_dispatch` 加 NPU 分支走 `npu_hc_pre/post`。
       **接线四坑**：kernel 内部已乘 2（外面不能再乘）、`norm_eps` 传 1e-5、输入必须 4-D、权重必须 fp32；
@@ -343,7 +369,7 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
       （max|gate_up| = 2.17，limit 是 10），要验 clamp 必须放大输入
 - [ ] **P3.5 出口判据** —— 四模块逐层 golden 对齐
 
-### P4 · BF16 端到端 ☐
+### P4 · BF16 端到端 ☐ ← **当前战线，卡在机器不可独占**
 - [ ] P4.1 TP16 / 32K / 纯文本 / 关 NPU Graph 启动
       **关 graph 只是 bring-up 顺序，不是终态** —— 开 graph 是 P6.6，一定要做。
       P4 关掉的理由：捕获会把「算错」变成更难查的「算错」（静态 shape/地址、
