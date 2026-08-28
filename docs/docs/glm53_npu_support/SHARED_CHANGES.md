@@ -57,13 +57,74 @@ GLM 不受影响 —— 它的配方是 `none`，走不到这条分支。
 
 **为什么**（kernel 级 profiler 实测）：前者的 `aclnnAdd` 花 **5.73 ms** 产出
 `[8192,512,4]` 的 int64（134 MB），高于带宽下界 **43×**；后者 **4.73 ms**，
-`aiv_vec_ratio=0.027`、`aiv_mte2_ratio=0.0`，**既不算也不搬，是纯标量瓶颈**。
-两者合计占 DSA prefill 单层 50.8 ms 的 **21%**。
+`aiv_vec_ratio=0.027`、`aiv_mte2_ratio=0.0`，**既不算也不搬，是纯标量瓶颈**
+（后续实测：那 4.73 ms **全部来自被 clamp 的 gather load**，去掉即 **5.557 → 0.282 ms**）。
 
-**谁受影响**：⚠ **CUDA 直接受影响** —— 这是共享的 kpool 实现，不是 NPU 分支。
-token id 最大约 32768，int32 在数值上完全够；但 CUDA 侧的 kernel 与下游对 dtype 的假设要逐一核。
+---
 
-**回归**：待定。**这是本台账里 CUDA 风险最高的一条。**
+### CUDA 侧 dtype 契约核查（2026-08-28，纯源码，我们没有 CUDA 卡）
+
+**结论：int32 化不是放宽，是回到 CUDA 参考实现本来的做法。** 五条依据：
+
+**① 返回值 dtype 本来就是 int32，不变。**
+`expand_pooled_groups_to_topk` 的三个分支**全部**以 `.to(torch.int32)` 收尾，
+最后的 `torch.full_like(output, -1)` 也是 int32。**int64 纯粹是内部中间量**，
+从来没有出现在这个函数的对外契约里。
+
+**② CUDA 对同一个变换的融合实现，全程 int32。**
+`kernels/jit/csrc/dsa/kpool_topk_transform.cuh`：
+- `:277` / `:296` —— `const auto raw_token = group_id * pool_size + slot;`，
+  `group_id` 来自 int32 的 indices 数组，`pool_size` 是 `const int32_t`
+- `:230-241` —— `__device__ int32_t transform_kpool_token(int32_t raw_token,
+  const int32_t* page_table_entry, const int32_t* topk_indices_offset, int32_t offset)`，
+  三条分支（查页表 / 加偏移 / 原样）**输入输出都是 int32**
+- `:280` / `:299` —— 尾部拼接 `raw_token = length * pool_size + (col - history_len)`
+  同样是 int32
+
+**所以 torch 兜底用 int64 才是那个异类。**
+
+**③ 影响面比原先估计的窄得多。**
+`expand_pooled_groups_to_topk` 全仓只有两个调用点：
+- `kpool_fp8_index.py:638` —— `topk_from_pooled_history_logits` 的**非融合**分支
+- NPU 侧的 `hardware_backend/npu/attention/kpool_indexer_npu.py:199`
+
+而 `:593` 的分派是：`group_topk ∈ (128,160,192,224,256,512)` 走**融合 CUDA kernel**，
+只有 `group_topk == 2048` 才落到 `:638` 的 torch 路径。
+**GLM 的 `group_topk = 2048/4 = 512`，所以 CUDA 上的 GLM 走融合 kernel，根本到不了这个函数。**
+CUDA 侧会走到它的，只有 `index_topk / index_kpool == 2048` 的配置
+（即 `topk=4096, pool=2` 或 `topk=8192, pool=4` 这类）。
+
+**④ 数值范围安全。**
+`token_ids` 的最大值 = 最大 pool id × pool_size + (pool_size-1) ≈ **上下文长度**；
+`topk_offsets` 的量级 ≤ 一个 batch 的总 token 数（本机 `max_total_num_tokens=1195392`）。
+int32 上限 2.1e9，**要到 20 亿的上下文才会溢出**。
+
+**⑤ 逐位相同的论证，以及它的边界。**
+对 `+` 与 `*`，int32 回绕 ≡ int64 后截断；而结果**本来就要截断成 int32**，
+所以在不溢出的前提下**逐位相同**。
+⚠ **唯一的例外**：查页表那条分支现在是「int64 算 → clamp → 截断」，
+改成「int32 算 → clamp」之后，**若中间值溢出 int32，两者的 clamp 结果不同**
+（int64 会 clamp 到上界，int32 回绕后可能 clamp 到别处）。由 ④ 的界，
+上下文 < 2^31 时不可能发生。
+
+### 一个实现约束
+
+`torch.gather` 的 `index` **必须是 int64**，所以查页表那条分支仍要 `.to(torch.int64)`，
+**且必须放在 clamp 之后**（clamp 前转宽就白省了）。
+⚠ 也就是说**那条分支省不掉 int64 的物化**。
+好消息是 **NPU 路径不走它**：`topk_from_pooled_selection` 传的是
+`page_table=None, topk_offsets=None`，落在最后那条 `else`（纯 int32），
+而实测的 5.73 ms 正是在这条路上花掉的 —— **改动完整覆盖了被测到的开销**。
+
+### 有 CUDA 卡的人要跑什么才算闭环
+
+1. 找一个 `index_kpool > 1` 且 `index_topk / index_kpool == 2048` 的配置
+   （GLM 不满足，它走融合 kernel）
+2. 三条分支**各跑一次**：传 `page_table` / 传 `topk_offsets` / 两者都不传
+3. 比对改动前后的输出张量：**应当逐位相同**
+4. 顺带确认 `_append_kpool_tail_to_topk_kernel` 的改动（它是 Triton，CUDA/NPU 同一份代码）
+
+**回归状态**：❌ 未做（本机无 CUDA 卡）。
 
 ---
 
