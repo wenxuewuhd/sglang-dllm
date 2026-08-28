@@ -1,0 +1,55 @@
+#!/bin/bash
+# GLM-5.3-Flash BF16 bring-up（P3）。纯 TP16：GLM 的 64/64/32/288 都能被 16 整除，
+# 不需要 DSv4 那种 DP-attention（DSv4 是被 o_groups=8 逼的，GLM 没有那个字段）。
+set -x
+source $ROOT/env.sh
+export PYTHONNOUSERSITE=1
+export PYTHONPATH=$REPO/python:$PYTHONPATH
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+export INF_NAN_MODE_FORCE_DISABLE=1
+export TASK_QUEUE_ENABLE=1
+export SGLANG_SET_CPU_AFFINITY=1
+
+# ⚠ 下面四个开关是 mHC 接到昇腾融合算子（commit 1cc9eda1c5）**之前**的绕行。
+# 源码核查（2026-08-28）显示 GLM 在 NPU 上现在四条**都走不到**：
+#   DEEPGEMM_HC_PRENORM  消费点是 mhc_pre() / mhc_fused_post_pre()，而
+#                        _mhc_pre_dispatch / _mhc_post_dispatch 都在 _is_npu 上提前返回；
+#                        后者只被 deepseek_v4.py 引用
+#   FP8_WO_A_GEMM        消费点在 deepseek_v4.py:218 —— 那是 DSv4 的模型文件
+#   BF16_FP32_GEMM_ALGO  消费点 dsv4/gemm.py 在 GLM 的 NPU 路径上到不了；而且
+#                        "torch" **不是合法取值**，它落进 else 分支到
+#                        _linear_bf16_fp32_cublas，那个函数的非 CUDA 兜底恰好是
+#                        torch.mm(x.float(), ...)。能跑，但机制和名字不是一回事
+#   USE_FUSED_HASH_TOPK  消费点 hash_topk.py:232 本来就写着 and not _is_npu
+#
+# **仍然保留**：整网基线还没跑通过，不要在那次高成本的启动里同时引入新变量。
+# 基线跑通之后再逐个去掉验证 —— 那时失败的代价只是一次重启。
+#
+# 结构性问题：server_args.py 有 is_sm120_supported() 和 is_hip() 两个平台块自动设这些
+# 开关，**没有 is_npu() 块**，所以每个 NPU 部署都得在启动脚本里手工猜一遍。
+export SGLANG_OPT_DEEPGEMM_HC_PRENORM=False
+export SGLANG_OPT_FP8_WO_A_GEMM=0
+export SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
+export SGLANG_OPT_USE_FUSED_HASH_TOPK=False
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+ulimit -n 65536
+
+PORT=${PORT:-30003}
+exec $VENV/bin/python -m sglang.launch_server \
+    --model-path /mnt/workspace/models/GLM-5.3-Flash-BF16 \
+    --trust-remote-code \
+    --device npu \
+    --tp-size 16 \
+    --moe-a2a-backend none \
+    --dtype bfloat16 --kv-cache-dtype auto \
+    --page-size 64 \
+    --max-running-requests 16 \
+    --context-length 32768 \
+    --mem-fraction-static 0.85 \
+    --disable-radix-cache \
+    --disable-cuda-graph \
+    --disable-overlap-schedule --skip-server-warmup \
+    --watchdog-timeout 9000 \
+    --host 127.0.0.1 --port ${PORT}

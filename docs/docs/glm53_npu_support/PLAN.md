@@ -67,7 +67,20 @@
 ### 服务配置（踩过的）
 - **`--page-size` 必须是 64** —— DSA pool 有 `assert self.page_size == 64`。DSv4 用的是 128，照搬会启动失败
 - 纯 TP16 权重 **37.25 GB/die**（= 599/16，无复制）；DP-attention 会把 attention/dense 每 rank 各存一份
-- DSv4 的 TP16/DP16+DeepEP 配方见 `launch_dsv4_a3.sh.example`；GLM 的见 `$ROOT/run/launch_glm_bf16.sh`
+- DSv4 的 TP16/DP16+DeepEP 配方见 `launch_dsv4_a3.sh.example`；**GLM 的见 `launch_glm_bf16.sh.example`**（已进仓库）
+- **起服务要求整卡近乎全空**：`distributed/bootstrap.py:339` 检查「空闲显存 ≥ 总量 90%」，
+  不满足直接 raise。⚠ **停掉 agent 之后显存不是立刻回收的** —— 本项目因此失败过一次
+  （停完不到一分钟就起，每卡只有 51% 空闲）。而且 GLM BF16 只能 TP16
+  （TP8 每卡要 74.9 GB，放不下），所以**整网必须独占整机**
+- **启动脚本里那四个 `SGLANG_OPT_*=False` 现在都走不到**（源码核查，未经一次成功启动确认）：
+  它们是 mHC 接到昇腾融合算子（`1cc9eda1c5`）**之前**的绕行，修复把绕行变成了遗留。
+  逐条依据写在 `launch_glm_bf16.sh.example` 的注释里。**暂不删** —— 整网基线还没跑通，
+  不要在那次高成本启动里同时引入新变量。
+  ⚠ 其中 `SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch` 是**靠巧合工作的**：`"torch"` 不是合法取值，
+  它落进 `else` 到 `_linear_bf16_fp32_cublas`，而那个函数的非 CUDA 兜底恰好是
+  `torch.mm(x.float(), ...)`。哪天有人加了真的 `"torch"` 分支或取值校验，行为就变
+- **`server_args.py` 没有 `is_npu()` 平台块**（只有 `is_sm120_supported()` 和 `is_hip()`），
+  所以每个 NPU 部署都得在启动脚本里手工设这些开关。这四个眼下多余，但下一个真需要的开关会重演
 
 ### 权重
 - `/mnt/workspace/models/GLM-5.3-Flash`（FP8，62 shard）与 `-BF16`（转换产物）
