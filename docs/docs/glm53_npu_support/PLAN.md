@@ -491,12 +491,20 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
       - **不是算子能力问题**：`A_log` 是 `(1,1,local_num_heads,1)`，TP16 下 numel=4，切分正确；
         `head_k_dim=128` → 期望最后一维 512，GLM 给的正是 512，只是被 `flatten(-2)` 破坏了
       - 修法：让 Ascend 后端按最后一维是否已等于 `heads*head_dim` 决定要不要 flatten
-- [ ] P3.2 **mHC**：`_mhc_pre_dispatch`/`_mhc_post_dispatch` 加 NPU 分支。核对 `post_mult_value=2.0` 与 kernel 内部一致性、`(post_mix, comb_mix)` ↔ `(post, comb)` 映射
+- [x] **P3.2 接线完成**：`_mhc_pre_dispatch`/`_mhc_post_dispatch` 已加 NPU 分支。核对 `post_mult_value=2.0` 与 kernel 内部一致性、`(post_mix, comb_mix)` ↔ `(post, comb)` 映射
       - **实测确认了 D6**：不改的话第一次前向就炸在
         `mhc.py:1676 _mhc_pre_dispatch` → `mhc.py:850 mhc_pre` →
         `deep_gemm_wrapper/entrypoint.py:245` → `NameError: name 'deep_gemm' is not defined`
-      - **临时绕过**：`SGLANG_OPT_USE_TILELANG_MHC_PRE=False` + `..._MHC_POST=False`
-        + `SGLANG_OPT_DEEPGEMM_HC_PRENORM=False` → 走 `_mhc_pre_torch` 纯 torch 路径（正确但慢）
+      - ~~临时绕过 `SGLANG_OPT_USE_TILELANG_MHC_*=False`~~ → **已不需要，启动脚本里已删掉**
+      - **落地形态**：分支加在 `_mhc_pre_dispatch` / `_mhc_post_dispatch` 两个 dispatch 点，
+        不动 `glm5_next.py`。pre 分支带三个前置条件（`hc_post_mult_value == 2.0`、
+        `hc_pre_eps == hc_sinkhorn_eps`、非空 batch），不满足就退回原路径 —— kernel 只在这些
+        设定下等价于参考实现
+      - `npu_hc_post` 的 `post` **必须是 2-D `[s, n]`**；调用方一路携带的 `[s, n, 1]` 会被直接拒绝
+        （实测报 `post's dim num should be 2`）→ 分支里 `squeeze(-1)`
+      - **实测**：服务起得来，前向越过 mHC（报错前移到 `deepseek_v2_attention_mla_npu.py:457`
+        的 indexer，即 P3.4）。⚠ 这只证明**接线没崩**；
+        算子本身的数值正确性是**单独验的**（见下），端到端数值还要等 P3.4 通了才能验
       - **好消息**：`npu_hc_pre` 的封装**已经存在**（`mhc.py:1780`）且 **DSv4 已在用**
         （`deepseek_v4.py:1906` / `:2029`），P3.2 是把 GLM 接上，不是从零写
       - ⚠ **不能直接照搬**：GLM 的 `_hc_pre_fn` 多了 `post_mult_value=2.0` 和
@@ -735,3 +743,5 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
 | 2026-08-28 | **性能缺口第一名不是 kpool 而是 mHC**：`mhc.py` 的 flat 入口完全没有 `_is_npu` 分支，每次 forward **90 次调用 / 约 12,600 次 kernel launch**（含 19 轮 Sinkhorn 循环）。但 `npu_hc_pre`/`npu_hc_post` **已存在且 DSv4 已在用** —— **这是接线不是算子开发**，即 P3.2 |
 | 2026-08-28 | ⚠ **发现两个会挡住 P3 对拍的精度 bug**：① DeepEP routed 专家路径**静默丢掉 `swiglu_limit=10.0`**（`moe_runner/ascend.py:114-118` 只读 `gemm1_clamp_limit`，GLM 是 None），同一层里 shared 专家 clamp 而 routed 不 clamp；② NPU router GEMM 走 bf16（`deepseek_v2.py:567-568`），而 GLM 配置是 `moe_router_dtype: float32` |
 | 2026-08-28 | **P3.2 的可行性已用 golden 实测坐实**：DSv4 的 `npu_hc_pre` 对 GLM 真实权重与 HF golden 三个输出全部落在噪声地板内。**并判死了 ×2 的归属——kernel 内部已经乘了，外面不能再乘**。另记录 4 个接线坑（norm_eps 1e-5、输入必须 4-D、权重必须 fp32、norm 不折叠） |
+| 2026-08-28 | **P3.2 接线完成**：`_mhc_pre_dispatch`/`_mhc_post_dispatch` 加 NPU 分支走 `npu_hc_pre`/`npu_hc_post`，启动脚本里那两个 `SGLANG_OPT_USE_TILELANG_MHC_*=False` 绕过已删。`npu_hc_post` 的 `post` 必须 2-D（实测 `[s,n,1]` 被拒）。前向已越过 mHC |
+| 2026-08-28 | **profiling 的时机定了**：现在做不了 —— 端到端跑不通（卡 P3.4），采不到 trace。顺序是 **P3.2 接线 → P3.4 先用 torch 兜底跑通 → 再 profiling 重排序**。⚠ 目前性能清单里的数字（12,600 次 launch 等）**全是静态推算不是实测**，profiling 之后要回来核 |
