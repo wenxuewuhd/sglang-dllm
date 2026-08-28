@@ -31,18 +31,23 @@ source /mnt/workspace/y00359136/work/glm53_dev/env/env.sh   # 然后用 npy 代�
 
 【当前进度】
 P0 环境 / P1 分支合流 / P2 BF16 权重转换：全部完成，出口判据见 PLAN 表。
-P3 逐模块对拍进行中：KDA ✅、mHC ✅（已接线并验数值）、NoPE MLA 部分、**kpool 阻塞**。
+P3 逐模块对拍进行中：KDA ✅、mHC ✅（已接线并验数值）、NoPE MLA 部分、kpool **路线已定、待实现**。
 
 【下一步：P3.4 kpool】
-这是唯一的关键路径。缺口只剩两块（PLAN §2.3、§2.6）：
-  a) 索引缓存 fp8 → int8。A3 没有 fp8；规格与三个条件已定死，见
-     operator_handoff/specs/op1_kpool_topk_transform.md。
-  b) 昇腾侧由谁算 indexer logits —— **唯一真正开放的问题**。CUDA 侧是 deep_gemm
-     （CUDA 非 Triton，不会随 Triton 路径可用），npu_quant_lightning_indexer 用不了
-     （metadata 只接受 num_heads_q=64，GLM 是 32）。
-最快跑通的路径：int8 化缓存 + 用 torch 写一个 MQA-logits（慢但正确）。
+这是唯一的关键路径。**不需要新算子，也不需要 torch 兜底**——「昇腾侧由谁算 indexer
+logits」这个曾经唯一开放的问题已经关闭：答案是 torch_npu.npu_lightning_indexer
+（不是被排除的 npu_quant_lightning_indexer；DSv4 非 kpool 路径已在用）。它接受 GLM 的
+32 头、只吃 bf16 的 key、返回逻辑位置、并把 top-k 一起融了。实测见
+probe/p3_4_lightning_indexer.py，结论与用法见 PLAN §2.6。
+
+所以索引缓存是 fp8 → **bf16**（不是 int8：int8 确实比 fp8 准，但目前没有算子能读它，
+见 PLAN §2.7）。要做的四件事：
+  ① index cache 存 bf16，退掉打包的 fp32 scale 区（mem_cache/index_key_cache.py）
+  ② 加 IndexerKPool.forward_npu：decode 逐行、extend 按「可见 pool 数」分段
+  ③ 选择之后的展开与尾部拼接，复用已实测逐位精确的 7 个 Triton kernel
+  ④ 解掉 kpool_fp8_index.py:583/589、dsa_indexer_kpool.py:1766 的非 CUDA 硬拦
 kpool 的 10 个 Triton kernel 里 7 个已实测可在 triton-ascend 上跑且逐位精确，
-所以这不是"移植整个子系统"。
+所以这从来不是"移植整个子系统"。
 
 跑通之后按这个顺序验精度（快 → 慢）：
   tools/logit_check.py 的 teacher-forced logprob 对拍（秒级、无采样噪声、能定位）
@@ -59,8 +64,10 @@ kpool 的 10 个 Triton kernel 里 7 个已实测可在 triton-ascend 上跑且�
 - 涉及算子 handoff 的改动要主动 highlight。
 
 【一条血的教训】
-从源码或签名推断出来的"算子缺口"，本项目至今命中率 0/3 —— 三次都是算子本来就存在，
-只是被默认参数、同名算子或另一个模型的属性掩盖了。**派人力之前先花十分钟把算子跑一次。**
+从源码或签名推断出来的"算子缺口"，本项目至今命中率 0/4 —— 四次都是算子本来就存在，
+只是被默认参数、同名算子、另一个模型的属性，或者一个只差 quant_ 前缀的近名算子掩盖了
+（npu_lightning_indexer vs npu_quant_lightning_indexer）。
+**派人力之前先花十分钟把算子跑一次。**
 反过来，"能跑但算错"才是真危险：见 PLAN §2.4 的四个陷阱。
 
 【环境硬规则】
@@ -80,7 +87,7 @@ kpool 的 10 个 Triton kernel 里 7 个已实测可在 triton-ascend 上跑且�
 |---|---|---|
 | **[SETUP.md](./SETUP.md)** | 环境搭建复现文档 | **换机第一件事**。照着做到「算子可见性验收」通过 |
 | **[PLAN.md](./PLAN.md)** | 活的计划 + 全部核实结论 | 环境好了之后。§2 算子结论，§3 阶段计划 |
-| `probe/` | 探测脚本 | `p0_5_ops.py` 验环境；`p0_6_*.py` 验算子 shape |
+| `probe/` | 探测脚本 | `p0_5_ops.py` 验环境；`p0_6_*.py` 验算子 shape；`p3_4_lightning_indexer.py` 验 kpool 打分算子 |
 | `launch_dsv4_a3.sh.example` | DSv4-Flash 起服务脚本（A3 TP16/DP16+DeepEP） | 冒烟 / 精度回归 |
 | **[`operator_handoff/`](./operator_handoff/)** | **给算子团队的工单**：规格 + 纯 torch 参考 + pytest + 验收判据 | 派算子开发时 |
 | 算子清单的对外呈现页 | https://claude.ai/code/artifact/54dbfb20-667f-465d-84c1-ea7d0cc1a827 | 发给下游同事时。**内容来自本目录，仓库为准**；要更新必须带上这个 URL，否则会新建一个而不是更新它 |
@@ -88,7 +95,7 @@ kpool 的 10 个 Triton kernel 里 7 个已实测可在 triton-ascend 上跑且�
 | `tools/golden_kda.py` / `golden_mhc.py` | 从 HF 参考实现生成 CPU golden | 模块级数值对拍 |
 | `tools/logit_check.py` | teacher-forced logprob 对拍（参考存盘、迭代秒级） | 改完接线快速验精度 |
 | `env.sh.example` | 环境变量模板 | 复制到 `$ROOT/env.sh` |
-| `GLM53_flash_ascend_support_assessment.html` | 最初的评估报告 | 参考。**若干判断已被推翻，见 PLAN.md §2.8** |
+| `GLM53_flash_ascend_support_assessment.html` | 最初的评估报告 | 参考。**若干判断已被推翻，见 PLAN.md §2.5** |
 
 ## 30 秒背景
 
@@ -106,10 +113,11 @@ GPU 参考实现在 `upstream/xinyuan/glm-5.3-flash-support @ 0b9c38484e`（本�
 | P0 环境 / 算子可见性 / DSv4 冒烟与精度 | ✅ GPQA 73.74%（对标 73.23%） |
 | P1 分支合流（rebase 到 `033446bb05`） | ✅ 回归 GPQA 73.23% |
 | P2 FP8 → BF16 权重转换 | ✅ 599 GB，全量比对通过 |
-| P3 逐模块对拍 | 进行中：KDA ✅ / mHC ✅ / NoPE MLA 部分 / **kpool 阻塞** |
+| P3 逐模块对拍 | 进行中：KDA ✅ / mHC ✅ / NoPE MLA 部分 / kpool 路线已定、待实现 |
 | P4 端到端 · P5 W8A8 · P6 性能 | 未开始 |
 
-**当前阻塞点**：P3.4 kpool —— A3 无 fp8，索引缓存要改 int8。详见 PLAN §2.3。
+**当前关键路径**：P3.4 kpool —— 已无阻塞。A3 无 fp8，索引缓存改存 **bf16**
+（不是 int8，理由见 PLAN §2.7），打分交给 `npu_lightning_indexer`。详见 PLAN §2.3、§2.6。
 
-**给算子团队的工单**在 [`operator_handoff/`](./operator_handoff/) —— 四个原始需求里
-三个已撤销（算子本就存在），只剩 `kv_rmsnorm_rope_cache` 支持 rope=0 与 index cache 的 int8 化。
+**给算子团队的工单**在 [`operator_handoff/`](./operator_handoff/) —— 四个原始需求
+**全部撤销**（算子本就存在），只剩 `kv_rmsnorm_rope_cache` 支持 rope=0 这一项。

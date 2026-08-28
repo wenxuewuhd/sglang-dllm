@@ -90,12 +90,13 @@
 | FIA `npu_fused_infer_attention_score`：BSND prefill + MLA-absorbed decode | 通过 |
 | MoE `npu_moe_gating_top_k`（expert 集合 2048/2048 一致）、`npu_grouped_matmul` | 通过 |
 | kpool 的 10 个 Triton kernel 中的 **7 个**（top-k、展开、尾部、plan/layout） | **逐位精确** |
+| `torch_npu.npu_lightning_indexer`（**bf16**，`n_heads=32`）prefill + decode | top-k 集合与 torch 参考**完全一致** |
 
 ### 2.3 确认要开发 / 要改
 
 | # | 项 | 结论 |
 |---|---|---|
-| **1** | **kpool index-K cache: fp8 → int8** | A3 无 fp8，4 个 compress-write Triton kernel 因此无法编译。**int8 实测比 fp8 更准**（键误差 4.2× 更低；32k 下选择重合 99.18% vs 96.53%）。三个条件见 `operator_handoff/specs/op1_*.md` |
+| **1** | **kpool index-K cache: fp8 → bf16** | A3 无 fp8，4 个 compress-write Triton kernel 因此无法编译。改存 **bf16** 后其中 3 个可编译且全程对得上（第 4 个见 §2.4）。选 bf16 不是折中：它既是精度天花板，**也是唯一能被消费的格式**（§2.7）。纯仓库侧改动，**不需要厂商算子** |
 | **2** | **`npu_kv_rmsnorm_rope_cache` 支持 rope=0** | 实测（2.7.1 与 2.10 两版）v1/v2 在 rope=0 时**双双 RuntimeError**。这是唯一一个从头到尾站得住的算子需求 |
 | **3** | **全零 rope 的 workaround** | `npu_sparse_flash_attention` 签名 Optional 但**实际不接受缺省**；只有 `attention_mode=2`（MLA，kv_head=1）可用且要求非空 rope。传全零 rope 数值正确（零 rope 贡献恰为 0） |
 
@@ -105,7 +106,7 @@
 |---|---|
 | **FIA 在 TND 布局省略 `num_key_value_heads`** | 错 **200×**，**不报错**。BSND 下同一默认值却是对的。已修 `ascend_backend.py` 的 prefill 调用点（全文件唯一漏传的） |
 | **`npu_clipped_swiglu` 的默认参数** | 四个默认值（`alpha=1.702, limit=7.0, bias=1.0, interleaved=True`）**对 GLM 全错**，只传部分错 109× |
-| **Hadamard-128 不能删** | A7 曾判它可删（正交归一、q/k 同旋转、点积不变）。**该结论只对 bf16 indexer 成立** —— 一旦量化，它正是 int8 优于 fp8 的原因（旋转后 kurtosis≈3.0） |
+| **Hadamard-128 能不能删，取决于存什么** | 正交归一、q/k 同旋转、点积不变，所以**在 bf16 下确实可删**；**一旦量化就不能删** —— 它正是 int8 优于 fp8 的原因（旋转后 kurtosis≈3.0）。既然一期走 bf16，**保留它**（保留同样中性，且 3 个 kernel 里它本来就正常）；只有撞上 §4 那个 triton-ascend codegen 缺陷才删 |
 | **`ue8m0` scale 舍入** | 对浮点格式免费，对 int8 要付一个真实 bit（32k 重合 99.18% → 98.84%） |
 | **KDA prefill 的 Triton autotune** | `kda.py:214` 的 24-config `do_bench` 扫描挂死 AI core（die 4/6/8 上 3/3 复现）；单独钉住任一 config 都能跑。⚠ 实际服务未触发，列为**上线前须确认** |
 
@@ -120,15 +121,49 @@
 | bf16 输出的 `DequantSwigluClampQuant` | 同上，不需要 |
 | `aclnnMixedQuantSparseFlashMla` | `rope_head_dim` 只能是 64；且 AscendC 只有 arch35，**A3 无二进制** |
 | `MlaPrologV3` 走 rope=0 | `ropeSin/ropeCos/krCache/queryRopeOut` 全部非 Optional |
+| `npu_quant_lightning_indexer` 用于 GLM | metadata **只接受 `num_heads_q=64`**，GLM 是 32（64 OK；16/32/128 全 FAIL，两轮独立实测）。这堵死了 int8 索引缓存的消费者，见 §2.7 |
 
 ### 2.6 仍未验证
 
 - **`torch.ops.custom.compressor`** 与 **`npu_quant_lightning_indexer`** 的 kernel —— 都需要活的 pool/page-table，
   独立 harness 驱动不了，返回不透明错误
-- **`npu_quant_lightning_indexer` 无法表达 GLM 的 indexer**：metadata 算子**只接受 `num_heads_q=64`**，GLM 是 32（实测）
 - `npu_sparse_attn_sharedkv` 的 kernel（metadata 能建，kernel 需活 pool）
-- **昇腾侧由谁计算 indexer logits** —— CUDA 侧是 `deep_gemm.fp8_paged_mqa_logits`（CUDA 非 Triton，不会随 Triton 路径可用）。
-  **这是目前唯一真正开放的算子问题**
+- `npu_lightning_indexer` 在 **NPU Graph 捕获**下能否用；以及它相对 CUDA fp8 路径的**性能**（都未测）
+
+> **已关闭：昇腾侧由谁计算 indexer logits。** 答案是 `torch_npu.npu_lightning_indexer`
+> —— 不是被排除的 `npu_quant_lightning_indexer`，是 DSv4 非 kpool 路径已在用的那个 bf16 算子
+> （`dsa/dsa_npu_indexer.py:25`）。它接受 GLM 的 32 头，算的正是 `Σ_h w_h·relu(q_h·k_j)`，
+> 并把 top-k 一起融了。全部实测，探针见 `probe/p3_4_lightning_indexer.py`：
+> - `num_heads_q`：16/32/64 OK，128 FAIL
+> - key dtype：**只收 bf16**；fp16 和 int8 都被拒（**算子文档写「支持 bfloat16 和 float16」，与实现不符**）
+> - 返回的是**逻辑序列位置**（用打乱的 block_table 验证），正是 kpool 展开步骤要的
+> - `actual_seq_lengths_key < sparse_count` 时用 `-1` 补齐
+> - prefill 的可见性斜率是 1/4（`floor(seq_len/kpool)` 个 pool），`sparse_mode=3`（rightDownCausal，
+>   斜率 1）表达不了；把「可见 pool 数相同」的连续 query 行分成一段、每段一个 TND batch、配
+>   `sparse_mode=0`，逐行精确。4096 query × 8192 pool 用 3.6 ms
+
+---
+
+### 2.7 int8 索引缓存：更准，但目前没有消费者
+
+上一轮实测（CPU 仿真，真实权重、真实 hidden states、真的 `float8_e4m3fn` 对照）：
+**int8 比它要取代的 fp8 更准** —— 键重构误差低 4.2×，32k 下选择重合 99.18% vs 96.53%，
+11 个 DSA 层无一例外。这个结论**没有被推翻**，回答的是「必须存量化格式时选哪一种」。
+
+但一期不走 int8，因为**没有算子能读它**（两条都实测）：
+
+| 候选消费者 | 结论 |
+|---|---|
+| `npu_lightning_indexer` | 只收 bf16，int8 被拒 |
+| `npu_quant_lightning_indexer` | metadata 只接受 `num_heads_q=64`，GLM 是 32 |
+
+唯一的绕法是每层每次前向把整个 cache 反量化成 bf16 —— 多一份全尺寸 buffer、多一趟 dequant，
+精度还不如直接存 bf16（那张表里 overlap=1.0 的基准**就是 bf16**）。
+
+**int8 降级为 P5 显存预案**：bf16 每槽 256 B，int8 128 B（约 704 vs 352 B/token，
+按 11 个 DSA 层折算，**推断**，未在活服务上量过）。真要启用，
+`operator_handoff/specs/op1_kpool_topk_transform.md` §3 那三个条件依然成立，
+但**先要解决消费者**。
 
 ---
 
@@ -148,8 +183,22 @@
 - [ ] **P3.3 NoPE MLA** —— 已修 4 处 rope=0 早退（分流、`fused_split_qk_norm`、cos/sin 预取、rope 应用；
       下游 `q_rope/k_rope` 传 `None`）。**剩余**：20+ 处 split 早退、KV buffer 二元组语义、
       `trans_rope_weight(w,0)` 的静默损坏加 assert。**数值未对拍**
-- [ ] **P3.4 kpool indexer** —— **当前阻塞点**。整个子系统是 Triton/CUDA，纯 torch 兜底等于移植子系统。
-      路线：int8 化 index cache（见 §2.3）+ 解掉 `dsa/kpool_fp8_index.py:583/589`、`dsa/dsa_indexer_kpool.py:1766` 的非 CUDA 硬拦
+- [ ] **P3.4 kpool indexer** —— 路线已定，**不需要纯 torch 兜底**，也**不需要新算子**。
+      **不改共享的打包 cache，而是照 DSv4 的 NPU 先例在旁边加一份 NPU 布局的 buffer**
+      （`npu/dsv4/dsv4_memory_pool.py:148` 的 `NPUDeepSeekV4IndexerPool` 就是这么做的：
+      基类的打包 buffer 留着，另加 int8 K + fp16 scale 的 PA_ND buffer，用
+      `npu_scatter_nd_update_` 写、给厂商算子读）。这样 CUDA 路径一行不动，
+      也绕开了那 4 个编不出来的 fp8 写入 kernel。
+      ① 加 `NPUDSATokenToKVPool`：bf16 的 `[pages, page_size, 1, 128]` PA_BSND buffer，
+         按 pool 槽位写；`index_k_with_scale_buffer_dtype` 已经是类属性，是现成的接缝；
+      ② 压缩写入（4-池化 + APE + softmax 加权 + Hadamard）在 NPU 侧用 torch/bf16 算，
+         **绕开那 4 个 fp8 kernel**，不去改它们。快不快是 P6 的事，不是 P3.4 的事；
+      ③ 加 `IndexerKPool.forward_npu`：q/k 走 bf16（没有 `act_quant`，所以
+         `_get_logits_head_gate` 里的 `q_scale` 因子要去掉 —— **是否为 weights 侧唯一差异，待确认**），
+         decode 逐行、extend 按可见-pool 分段调 `npu_lightning_indexer`（§2.6）；
+      ④ 选择之后的 pool→token 展开与尾部拼接，复用已实测逐位精确的 7 个 Triton kernel；
+      ⑤ 解掉 `dsa/kpool_fp8_index.py:583/589`、`dsa/dsa_indexer_kpool.py:1766` 的非 CUDA 硬拦
+      **前置门槛：先做数值对齐**（layer 3 对 HF golden，bf16/int8/fp8 同轴对比），过了再动内存池
 - [ ] **P3.5 出口判据** —— 四模块逐层 golden 对齐
 
 ### P4 · BF16 端到端 ☐
@@ -183,6 +232,10 @@
 ## 4. 待决与已知缺陷
 
 - [ ] **P5 的磁盘**：BF16(643) + W8A8(333) = 976/984 GB → 必须先删 FP8 源
+- [ ] **索引缓存改 bf16 后显存翻倍**：每槽 256 B（打包 fp8 是 128+4=132 B）。
+      按 11 个 DSA 层折算约 704 vs 363 B/token，相对 MLA KV 的约 11.3 KB/token 是 +3% 量级。
+      **这是从 `mem_cache/index_key_cache.py:33-38` 的 buffer 形状推算的，未实测**；
+      P4 起服务时量一次。真顶不住的退路见 §2.7
 - [ ] **两个会挡住对拍的精度缺陷**（发现但未修）：
       ① DeepEP routed 专家路径**静默丢掉 `swiglu_limit=10.0`**（`moe_runner/ascend.py:114-118` 只读
       `gemm1_clamp_limit`，GLM 为 None）→ 同层内 shared 专家 clamp 而 routed 不 clamp；
@@ -190,5 +243,7 @@
 - [ ] **DSv4 的一处潜在 bug**：bf16 fallback 读 int8 buffer 却**不施加 scale**（`ascend_dsv4_backend.py:637-641`），
       仅因 `:685` 无条件强制 int8 而不可达
 - [ ] **triton-ascend 的 `_hadamard128` codegen 缺陷**（UB 越界，上下文相关）—— 值得上报。
-      在三个 compress kernel 内部正常，独立跑必挂
+      在三个 compress kernel 内部正常，独立跑必挂；第 4 个 kernel
+      （`_kpool_write_tail_and_maybe_compress_kernel`）只在 `num_draft_tokens >= 3` 触发它。
+      **一期不在关键路径上**：那是 MTP，一期不做；真撞上就删 Hadamard（bf16 下可删，见 §2.4）
 - [ ] `deep_ep` 的打包 bug 已用 `.pth` 绕过，可向上游反馈

@@ -1,7 +1,20 @@
-# OP-1 — kpool index-K cache: move from fp8 to int8
+# OP-1 — kpool index-K cache (WITHDRAWN)
 
-**Status: this is the request. It replaces the fused-top-k operator this document
-originally specified.**
+**Status: WITHDRAWN. No operator work is requested.**
+
+The open question this request rested on — §5, *what computes the indexer logits on
+Ascend* — has an answer: `torch_npu.npu_lightning_indexer`, which takes GLM's 32 index
+heads and ships in the target runtime. It reads **bf16** keys, so the index cache moves
+fp8 → **bf16**, which is a repo-side dtype change behind no vendor operator at all.
+See §5 and `../../PLAN.md` §2.6.
+
+The int8 measurements in §2 stand and are not retracted — int8 really is more accurate
+than the fp8 it would have replaced. They are kept as the fallback record for P5 memory
+pressure (`PLAN.md` §2.7). What retired them from phase 1 is that **nothing on Ascend can
+read an int8 index cache**: `npu_lightning_indexer` rejects int8, and
+`npu_quant_lightning_indexer` cannot express 32 query heads.
+
+**Everything below is the withdrawn request, kept for the record.**
 
 Reference implementation: [`../reference/kpool_topk_transform.py`](../reference/kpool_topk_transform.py)
 Tests: [`../tests/test_op1_kpool_topk_transform.py`](../tests/test_op1_kpool_topk_transform.py)
@@ -99,22 +112,37 @@ DeepSeek-V4 on Ascend uses two buffers with an fp16 scale
 (`npu/dsv4/dsv4_memory_pool.py:169-178` and `:180-190`). Following DeepSeek-V4 retires the
 packed page and with it rows 3 through 6 of that table, rather than porting them.
 
-## 5. The part that is still open
+## 5. This section was the open question — it is now closed
 
-**Whether any existing Ascend operator can serve kpool's scoring.**
-`npu_quant_lightning_indexer` was the candidate, and two findings argue against it:
+**What computes kpool's scoring on Ascend: `torch_npu.npu_lightning_indexer`.**
 
-- Its metadata op **only accepts `num_heads_q=64`**; GLM's `index_n_heads` is **32**, so
-  GLM's indexer cannot be expressed to it at all (measured — 16, 32 and 128 all fail).
-- It is invoked for DeepSeek-V4's *compressor* compression (ratio-4 with overlap/coff).
-  kpool's compression is a different object: a per-channel softmax-weighted pool of 4 plus
-  a bf16 tail ring that is always selected and expanded separately.
+The candidate considered here was `npu_quant_lightning_indexer`, and it is indeed
+unusable: its metadata op **only accepts `num_heads_q=64`** while GLM's `index_n_heads`
+is **32** (measured twice, independently — 16, 32 and 128 all fail). That remains true.
 
-The scoring itself is `deep_gemm.fp8_paged_mqa_logits` / a tilelang variant on the CUDA
-side — CUDA, not Triton, so it does not come along with the rest.
+What the search missed is that `npu_lightning_indexer` — no `quant_` — is a *different*
+operator, already used by DeepSeek-V4's non-kpool path at
+`srt/layers/attention/dsa/dsa_npu_indexer.py:25`. Measured on target, probe at
+`../../probe/p3_4_lightning_indexer.py`:
 
-**This, not the dtype, is the open operator question.** int8 is settled and accuracy-safe;
-what is not settled is what computes the logits on Ascend.
+- accepts `num_heads_q` ∈ {16, 32, 64}; 128 fails
+- computes exactly `Σ_h w_h · relu(q_h · k_j)` — top-k sets identical to a torch
+  reference at `n_heads=32`, prefill and decode
+- keys are **bf16 only**: fp16 and int8 are both rejected, *despite the operator doc
+  claiming float16 support*
+- returns **logical** sequence positions, not physical cache slots (verified against a
+  shuffled block table) — which is what kpool's pool→token expand consumes
+- pads with `-1` when `actual_seq_lengths_key < sparse_count`
+- fuses the top-k, so kpool's pooled selection kernel is not needed either
+
+kpool's visibility grows at 1/4 the query rate (`floor(seq_len/kpool)` pools), which
+`sparse_mode=3` (rightDownCausal, slope 1) cannot express. Expressing it as **runs of
+query rows sharing one visible-pool count**, one TND batch per run, with `sparse_mode=0`,
+is exact — verified at 256/1024/4096-token chunks; 4096 query rows against 8192 pools in
+3.6 ms.
+
+This closes the request: the dtype question dissolves with it, because the operator's
+input dtype decides the storage format, and it is bf16.
 
 ## 6. Verification
 
