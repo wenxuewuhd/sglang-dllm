@@ -128,7 +128,11 @@ def _flat_kda_gate(gate: torch.Tensor, layer) -> torch.Tensor:
     GLM, so key off the width the kernel actually expects. Both branches are
     views, not copies.
     """
-    if gate.shape[-1] == layer.A_log.numel() * layer.head_k_dim:
+    flat_width = layer.A_log.numel() * layer.head_k_dim
+    # With one head per rank the two layouts have the same trailing width and
+    # cannot be told apart by shape; flatten then, which is what the head-split
+    # callers have always done and what keeps the output rank unchanged.
+    if gate.shape[-1] == flat_width and flat_width != layer.head_k_dim:
         return gate
     return gate.flatten(-2)
 
