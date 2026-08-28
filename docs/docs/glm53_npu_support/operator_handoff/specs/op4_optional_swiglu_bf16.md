@@ -1,7 +1,21 @@
-# OP-4 (OPTIONAL) — bf16-output variant of `DequantSwigluClampQuant`
+# OP-4 (WITHDRAWN) — bf16-output variant of `DequantSwigluClampQuant`
 
-**Status:** OPTIONAL optimisation. **This is explicitly NOT a blocker.** GLM-5.3-Flash
-runs correctly today without it. Do OP-1, OP-2 and OP-3 first.
+**Status: WITHDRAWN — do not build this.**
+
+`torch_npu.npu_clipped_swiglu` already ships in the target runtime (torch_npu
+2.10.0.post4), supports A3, and takes bf16 in and bf16 out. Measured on device with
+`alpha=1.0, limit=10.0, bias=0.0, interleaved=False`, it is **bit-exact** with
+[`../reference/swiglu_clamp.py`](../reference/swiglu_clamp.py) — max absolute difference
+0.0 on every probe, and the same call at its default parameters differs by 156, which is
+what made the defaults look like a different operator. The defaults are gpt-oss values
+(`alpha=1.702, limit=7.0, bias=1.0, interleaved=True`); every one of them is a parameter.
+
+So the bf16 gap this document was written to close does not exist. What remains is
+repo-side wiring, not kernel work: call `npu_clipped_swiglu` with GLM's parameters instead
+of the current clamp-then-swiglu pair.
+
+The sections below are kept only as a record of what the vendor `DequantSwigluClampQuant`
+does, which is still accurate and still relevant to the int8 path.
 
 Reference implementation: [`../reference/swiglu_clamp.py`](../reference/swiglu_clamp.py)
 Tests: [`../tests/test_op4_swiglu_clamp_bf16.py`](../tests/test_op4_swiglu_clamp_bf16.py)

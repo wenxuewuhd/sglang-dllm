@@ -51,6 +51,27 @@ def test_layer_norm_mode(rows, dim):
     assert_within_floor(got, ref32, ref16, what=f"layernorm rows={rows} dim={dim}")
 
 
+@pytest.mark.parametrize("scale", [1e-2, 1e-3])
+@pytest.mark.parametrize("rows", [1, 64])
+def test_layer_norm_small_variance_pins_eps_placement(rows, scale):
+    """Rows whose variance approaches eps, where eps placement stops being cosmetic.
+
+    ``centered / (sqrt(var) + eps)`` and ``centered / sqrt(var + eps)`` agree to ~5e-7 at
+    unit variance, which is under the bf16 floor, so unit-variance cases accept either.
+    They diverge as var falls toward eps, and eps is applied per row, so a single narrow
+    row is enough to separate them.
+    """
+    x32, w, b = _inputs(rows, GLM_HEAD_DIM, seed=int(rows * 977 + 1 / scale), dtype=torch.float32)
+    x32 = x32 * scale
+    x16 = x32.to(torch.bfloat16)
+
+    ref32 = fused_norm_ref(x32, w, b, EPS, NORM_MODE_LAYER)
+    ref16 = fused_norm_ref(x16, w, b, EPS, NORM_MODE_LAYER)
+
+    got = backend.fused_norm(x16, w, b, EPS, NORM_MODE_LAYER)
+    assert_within_floor(got, ref32, ref16, what=f"layernorm var~{scale**2:g} rows={rows}")
+
+
 @pytest.mark.parametrize("rows", [1, 64])
 def test_layer_norm_matches_f_layer_norm(rows):
     """Cross-check the reference against torch's own F.layer_norm (biased variance)."""

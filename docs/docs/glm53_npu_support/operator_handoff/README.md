@@ -1,7 +1,7 @@
 # GLM-5.3-Flash on Ascend — operator handoff package
 
 This directory is a **self-contained work order for an Ascend kernel team**. It
-specifies three operators (plus one optional optimisation), gives a pure-torch reference
+specifies two operators, gives a pure-torch reference
 implementation of each that *is* the definition of correct, ships an executable test
 suite, and states the acceptance criteria. It is meant to be implementable without
 asking us anything.
@@ -47,17 +47,45 @@ qk_nope_head_dim = 256   qk_rope_head_dim = 0     v_head_dim = 256
 kv_lora_rank = 512       hidden_size = 4096       45 layers (34 linear + 11 DSA)
 ```
 
-## 2. The three operators
+## 2. The operators
 
 | # | Operator | Kind | Priority | One-line rationale |
 |---|---|---|---|---|
-| **1** | [kpool fused group-top-k + pool→raw expand + tail append](specs/op1_kpool_topk_transform.md) | **NEW kernel** | **highest** | The DSA indexer's inner loop. 11 layers, every decode step. No NPU equivalent; splitting it costs a 2048-wide top-k plus two gather passes per layer per step. |
+| **1** | [kpool pool→raw expand + tail append (the top-k epilogue)](specs/op1_kpool_topk_transform.md) | **NEW kernel** | **highest** | The DSA indexer's inner loop. 11 layers, every decode step. **Scope narrowed — read §2a below before starting:** the pooled scoring and the group top-k already exist on Ascend and are in DeepSeek-V4 production. What is missing is the epilogue. |
 | **2** | [`compressor` with a LayerNorm variant](specs/op2_compressor_layernorm.md) | extend a vendor op | high | The vendor op fuses RMSNorm only; GLM's index-K norm is a true LayerNorm. Blocks the compressed index-K path on the same 11 layers. |
-| **3** | [`npu_kv_rmsnorm_rope_cache` accepting rope width 0](specs/op3_kv_norm_rope_cache_rope0.md) | extend a torch_npu op | medium | GLM has no rotary half. Measured: rope=0 raises on both v1 and v2. A software fallback exists but costs an extra kernel + an extra pass over `[T,512]` on all 45 layers. |
-| 4 | [bf16-output `DequantSwigluClampQuant`](specs/op4_optional_swiglu_bf16.md) | extend a vendor op | **OPTIONAL — not a blocker** | The op's `swiglu_mode=1` already matches GLM's clamped SwiGLU exactly, but its output is unconditionally int8, so the bf16 path keeps a separate pre-clamp pass. Pure optimisation. |
+| **3** | [`npu_kv_rmsnorm_rope_cache` accepting rope width 0](specs/op3_kv_norm_rope_cache_rope0.md) | extend a torch_npu op | medium | GLM has no rotary half. Measured: rope=0 raises on both v1 and v2. A software fallback exists but costs an extra kernel + an extra pass over `[T,512]` on the 11 sparse-attention layers. |
+| ~~4~~ | ~~bf16-output `DequantSwigluClampQuant`~~ | — | **WITHDRAWN — do not build** | `torch_npu.npu_clipped_swiglu` already ships in the target runtime, supports A3, and takes bf16 in → bf16 out. Measured on device: with `alpha=1.0, limit=10.0, bias=0.0, interleaved=False` it is **bit-exact** with the reference. Its defaults are gpt-oss values, but every one is a parameter. See [`specs/op4_optional_swiglu_bf16.md`](specs/op4_optional_swiglu_bf16.md). |
 
-**Do them in that order.** OP-1 is most of the value and all of the novelty; OP-2 and
-OP-3 are small deltas on code that already exists; OP-4 is a nice-to-have.
+**Do them in that order.** OP-1 is most of the value; OP-2 and OP-3 are small deltas on
+code that already exists.
+
+### 2a. OP-1's scope is narrower than a from-scratch top-k
+
+`torch.ops.custom.npu_quant_lightning_indexer(..., cmp_ratio=4, sparse_count=..., sparse_mode=3)`
+is already in DeepSeek-V4 production (`ascend_dsv4_backend.py:729-750`), and
+`aclnnQuantLightningIndexer` exposes `cmpRatio` / `sparseCount` / `sparseIndicesOut` /
+`sparseValuesOut`. Its own bf16 reference path (`ascend_dsv4_backend.py:618-682`) scores
+over `seq // ratio` pooled entries and calls `.topk(min(index_topk, seq // ratio))`, then
+pads with `-1`. So **at `cmp_ratio=4` the pooled MQA scoring and the group top-k both
+already exist on Ascend and return pool-level indices with `-1` padding.**
+
+What is genuinely missing is the **epilogue**: expand each selected pool by `index_kpool`
+in slot order, truncate to `min(length * P, topk)`, append the visible tail, apply the
+page-table / offset map, and fill with `-1`. Scope the work as that epilogue and as
+composing it with the existing indexer — not as a new radix-select top-k.
+
+Two consequences the spec body has not yet been rewritten for:
+
+- The score tensor that the current OP-1 interface takes as input is produced today only
+  by CUDA-only kernels (`deep_gemm.fp8_paged_mqa_logits` / the tilelang variant,
+  `dsa_indexer_kpool.py:895-920`). On Ascend there is no producer for it, and the Ascend
+  op that *could* produce it fuses scoring and selection and emits indices rather than
+  scores. **Settle the composition with us before implementing to the current signature.**
+- On the decode path the logits are passed **uncleaned** (`clean_logits=False`,
+  `dsa_indexer_kpool.py:907` and `:918`; extend passes `True`). Values outside
+  `[row_starts[b], row_starts[b] + lengths[b])` are garbage and may be NaN. Any
+  implementation that vectorises to an aligned tile **must not let the padding reach a
+  max-reduction or a mask**.
 
 ## 3. How the pieces fit together
 
@@ -85,11 +113,9 @@ OP-3 are small deltas on code that already exists; OP-4 is a nice-to-have.
                        │   sparse attention gathers exactly these keys             │
                        └───────────────────────────────────────────────────────────┘
 
-   separately, on all 45 layers:
+   separately, on the 11 sparse-attention layers:
         MLA latent cache write ──► OP-3: RMSNorm + RoPE + scatter, fused.
                                    GLM's rope half is 0 wide; the op rejects that.
-   separately, in the MoE experts:
-        gate/up ──► OP-4 (optional): clamped SwiGLU with a bf16 output.
 ```
 
 OP-1's output is consumed directly by sparse attention as a gather index list, which is

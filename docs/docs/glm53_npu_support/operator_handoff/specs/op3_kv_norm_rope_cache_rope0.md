@@ -136,7 +136,7 @@ There is a software fallback, already scoped as work item D2/P3.3 in
 `docs/docs/glm53_npu_support/PLAN.md:229` and `:492`: split the call into
 `torch_npu.npu_rms_norm` plus a hand-written scatter (`reshape_and_cache` /
 `index_copy_`). It costs an extra kernel launch and an extra pass over the
-`[T, 512]` tensor per layer per step across all 45 layers. That is why this is a
+`[T, 512]` tensor per layer per step across the 11 sparse-attention layers. That is why this is a
 "medium" and not a "low": the fallback is real but it is not free.
 
 ## 8. Not pinned down

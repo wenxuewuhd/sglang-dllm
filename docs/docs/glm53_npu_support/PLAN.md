@@ -137,7 +137,7 @@
 | # | 算子 | 结论 | 证据 |
 |---|---|---|---|
 | B1 | **compressor 的 LayerNorm 变体** | 需要开发，但**范围很小**：vendor `compressor` 的 fused norm 是 **RMSNorm**（DSv4 用），GLM 的 index-K norm 是**真 LayerNorm（减均值 + bias）**。是"给已有算子扩一个 norm 类型" | `layers/layernorm.py:974-1014` GLM 走 `F.layer_norm(bias=True)`；`ascend_dsv4_backend.py:411` 传 `_fused_norm_weight_fp32` |
-| B2 | ~~**GLM 版 clipped SwiGLU（非对称 clamp）**~~ | ❌ **2026-08-28 撤销：不需要开发**。上机核实 GLM 与 DeepSeek-V4 的 clamp **语义逐字相同**（同公式、同 `L=10.0`），DSv4 的昇腾路径已在生产跑，GLM 复用即可，**只差把 `swiglu_limit` 从 `text_config` 接进 `MoeRunnerConfig`**。详见 §2.3.1 | `glm5_next.py:139-144` vs `npu/moe/activation.py:78-120`；两边 `swiglu_limit` 均为 10.0 |
+| B2 | ~~**GLM 版 clipped SwiGLU（非对称 clamp）**~~ | ❌ **不需要开发**。而且比第一次撤销时以为的还简单：**`torch_npu.npu_clipped_swiglu` 直接可用**——`alpha=1.0, limit=10.0, bias=0.0, interleaved=False` 下与 GLM 公式**逐位相同**（两次独立上机验证；用默认参数则差 156，这正是当初误判「gpt-oss 语义不可复用」的来源：**默认值是 gpt-oss 的，但每个都是参数**）。bf16 进 bf16 出，A3 支持。详见 §2.3.1 | 本机实测；`glm5_next.py:139-144` |
 | B3 | **KPool 的 pool→raw 展开 + 尾部追加** | 需要开发（或用 torch 实现）。这部分是 GLM 特有的索引后处理，`compressor` / `lightning_indexer` 都不负责 | `kpool_fp8_index.py:379-401 expand_pooled_groups_to_topk`、`:421+ append_kpool_tail_to_topk` |
 
 #### 2.3.1 B2 撤销的经过（2026-08-28 上机核实）
@@ -160,6 +160,15 @@
 - ⚠ 未消解：`group_index` 的约定（逐组计数 vs 前缀和）没能区分开，集成时要确认
 - 已修正 `npu/moe/activation.py` 里那两处会误导人的注释
 
+**二次更正（同日，独立复核）**：上面「撤销」的方向仍然对，但**落点错了**——
+不该转向 `npu_dequant_swiglu_clamp_quant`（它输出恒为 int8，bf16 用不了），
+而应该转回 **`torch_npu.npu_clipped_swiglu`**。实测：
+`npu_clipped_swiglu(x, alpha=1.0, limit=10.0, bias=0.0, interleaved=False)`
+与 GLM 公式**逐位相同**，bf16 进 bf16 出，A3 支持。
+初版判「gpt-oss 语义不可复用」是把**默认参数**当成了**能力上限**——
+默认 `alpha=1.702, limit=7.0, bias=1.0, interleaved=True` 确实是 gpt-oss 的，
+但**每一个都是可传参数**。→ 交接包里的 OP-4 已标为 WITHDRAWN。
+
 ### 2.4 不确定项的消解结果（2026-08-27 二次核实）
 
 **消解手段**：C1/C2 靠**读 wheel 里的 Python/Triton 源码**（不需要执行）；C4 靠**运行时实跑**（torch_npu 2.10 已可用）；
@@ -172,7 +181,7 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
 | C4 | `npu_kv_rmsnorm_rope_cache_v2` 支持 rope=0 吗 | ❌ **不支持，解决**。**实跑验证**：`rope=64` 时 v1/v2 都 [OK]；`rope=0`（cos/sin/k_cache 传 0 宽）时 v1/v2 **都 RuntimeError**。→ D2 拆 `rmsnorm + reshape_and_cache` 是确定要做的活 | `probe`，`aclnnKvRmsNormRopeCache*` 报错 |
 | C3 | `MlaPreprocess` 的 `rope_dim=0` 是否合法 | ⏸ **仍不确定，但已降级**。`mla_preprocess` **不在 `torch.ops.npu` 里**（torch_npu 2.10 无此绑定），它来自 vendor 包 → 被 GLIBC 挡住，现在探不了。**但它是性能项**（`SGLANG_NPU_USE_MLAPO` 默认关），不阻塞 BF16 打通。
 ⚠ 2026-08-28：GLIBC 障碍已消失，vendor 包可加载，这条**现在可以探了** | `torch.ops.npu` 无 `mla_preprocess`；`mla_preprocess.py:386` 调 `torch.ops.npu.mla_preprocess` |
-| C5 | 分组 top-k 是否要自研 | ⏸ **很可能不用，但要跑起来才能确认**。`aclnnQuantLightningIndexer` 有 `cmpRatio` + `sparseCount` + `sparseIndicesOut/sparseValuesOut`，且我们 DSv4 路径已用 `cmp_ratio=4`。**未确证的一点**：`cmp_ratio=4` 时 `sparseIndicesOut` 返回的是 **pool 下标**还是 **raw token 下标**。DSv4 是 compress-then-attend（拿到就直接喂 `cmp_ratio=4` 的 sparse attn，不展开），GLM 是 pool-score-then-expand（要展开回 raw token） | `aclnn_quant_lightning_indexer.h`；`ascend_dsv4_backend.py:1013-1021` |
+| C5 | 分组 top-k 是否要自研 | ✅ **已消解：不用自研**。`cmp_ratio=4` 时 `npu_quant_lightning_indexer` 返回的是 **pool 级下标 + `-1` 填充**——依据是它自己的 bf16 参考路径 `ascend_dsv4_backend.py:618-682`，在 `seq//ratio` 个 pooled 条目上算分并 `.topk(min(index_topk, seq//ratio))`，再 `F.pad(value=-1)`。**即 pooled 打分与分组 top-k 在昇腾侧都已存在且在 DSv4 生产中**；真正缺的只是 §2.3 的 B3（展开+尾部+页表映射）。原判断： |`aclnnQuantLightningIndexer` 有 `cmpRatio` + `sparseCount` + `sparseIndicesOut/sparseValuesOut`，且我们 DSv4 路径已用 `cmp_ratio=4`。**未确证的一点**：`cmp_ratio=4` 时 `sparseIndicesOut` 返回的是 **pool 下标**还是 **raw token 下标**。DSv4 是 compress-then-attend（拿到就直接喂 `cmp_ratio=4` 的 sparse attn，不展开），GLM 是 pool-score-then-expand（要展开回 raw token） | `aclnn_quant_lightning_indexer.h`；`ascend_dsv4_backend.py:1013-1021` |
 
 ### 2.4.1 vendor 包的算子分布（2026-08-27 实测解包）
 
@@ -560,7 +569,12 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
 > **P3.4 的做法（已与用户确认）**：不移植那个 fused CUDA kernel，而是
 > **在 NPU 上把 `group_topk=512` 路由到 `kpool_fp8_index.py` 里已存在的拆解路径**：
 > ragged top-k（自写 torch，替 `fast_topk_v2`——它硬断言 `topk==2048`）
-> → `expand_pooled_groups_to_topk` → `append_kpool_tail_to_topk`，**后两个是纯 torch，原样可用**。
+> → `expand_pooled_groups_to_topk` → `append_kpool_tail_to_topk`。
+> ⚠ **更正**：只有 `expand_pooled_groups_to_topk` 是纯 torch。
+> **`append_kpool_tail_to_topk` 是 Triton kernel**（`kpool_fp8_index.py:466` 启动
+> `_append_kpool_tail_to_topk_kernel`，定义在 `:490`）。我先前判它「纯 torch」是因为
+> 用 awk 取函数体时结束模式把起始行本身匹配掉了，等于没扫。
+> 好消息是我们有 triton-ascend 3.2.2（带 `cann` 后端），**它未必不能跑** —— 待验。
 > HF 的 `Glm5NextTextIndexer` 做的正是同一套（`topk(select_k)` → `flatten(-2)` 展开 → `append_visible_tail`），
 > 是对这条路线的独立佐证。
 >
@@ -697,3 +711,8 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
 | 2026-08-28 | **P3.1 完成并实测通过**：`_flat_kda_gate` 修掉 Kimi/GLM 的 gate 布局契约不匹配（不改算子、零额外运算）。GLM BF16 前向现已越过 KDA，**最前沿阻塞点前移到 P3.3 的 NoPE MLA**（`deepseek_v2_attention_mla_npu.py:368` 假设 rope 存在） |
 | 2026-08-28 | **P3.3 第一批修完并实测**：NoPE（rope=0）在 NPU MLA 路径上的 4 处假设已早退，前向越过 MLA。**P3 的四个模块按 PLAN 预测的顺序逐个暴露：KDA → mHC → NoPE MLA → kpool**，现在停在 P3.4 |
 | 2026-08-28 | 走到这里为止，**PLAN §2.6「BF16 打通不被任何算子硬卡住」仍然成立**：暴露的全部是框架接线问题（page_size、mHC dispatch、KDA gate 布局、rope=0 空指针），**没有一个是缺算子** |
+| 2026-08-28 | **算子交接包完成并经独立 review**：`operator_handoff/`（4 份规格 + 纯 torch 参考实现 + 可执行 pytest + 环境 + 验收判据），`./run_tests.sh` 64 passed / 1 skipped。review 结论见 `operator_handoff/REVIEW.md` |
+| 2026-08-28 | **两处我先前的错误结论被独立复核推翻**：① `torch_npu.npu_clipped_swiglu` **可用且逐位相同**（我把默认参数当成了能力上限）；② `append_kpool_tail_to_topk` **是 Triton kernel 不是纯 torch**（我的扫描方法有缺陷）。两条都已更正 |
+| 2026-08-28 | **C5 消解**：`npu_quant_lightning_indexer` 在 `cmp_ratio=4` 下返回 pool 级下标 + `-1` 填充，**pooled 打分与分组 top-k 昇腾侧都已有**，缺的只是 B3 的展开/尾部/页表映射 → OP-1 的工作量比原估计小得多 |
+| 2026-08-28 | **性能缺口第一名不是 kpool 而是 mHC**：`mhc.py` 的 flat 入口完全没有 `_is_npu` 分支，每次 forward **90 次调用 / 约 12,600 次 kernel launch**（含 19 轮 Sinkhorn 循环）。但 `npu_hc_pre`/`npu_hc_post` **已存在且 DSv4 已在用** —— **这是接线不是算子开发**，即 P3.2 |
+| 2026-08-28 | ⚠ **发现两个会挡住 P3 对拍的精度 bug**：① DeepEP routed 专家路径**静默丢掉 `swiglu_limit=10.0`**（`moe_runner/ascend.py:114-118` 只读 `gemm1_clamp_limit`，GLM 是 None），同一层里 shared 专家 clamp 而 routed 不 clamp；② NPU router GEMM 走 bf16（`deepseek_v2.py:567-568`），而 GLM 配置是 `moe_router_dtype: float32` |
