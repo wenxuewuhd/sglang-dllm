@@ -403,6 +403,41 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
         构成正好对上模型结构：`hc_attn_base/scale`+`hc_ffn_base/scale` 各 45（mHC）、
         `mlp.gate.e_score_correction_bias` 43（MoE 层数）、`self_attn.A_log`+`dt_bias` 各 34（KDA 层数）
 
+
+#### 哪些权重真的被转换了（2026-08-28 实测）
+
+**按层**（45 层正文 + 1 层 MTP = 46）
+
+| 层类型 | 层号 | 层数 | 转 BF16 | 直通 |
+|---|---|---:|---:|---:|
+| `linear_attention` + dense FFN | 0–2 | 3 | 9 | 69 |
+| `linear_attention` + MoE | 4,5,6,8,… | 31 | 26877 | 775 |
+| `deepseek_sparse_attention` + MoE | 3,7,11,…,43 | 11 | 9581 | 220 |
+| MTP / NextN | 45 | 1 | 871 | 18 |
+| `model.visual`（ViT） | — | — | **0** | 347 |
+| `lm_head` / embed / 顶层 norm | — | — | **0** | 3 |
+| **合计** | | **46** | **37338** | **1432** |
+
+**层内部**
+
+| 模块 | fp8 → BF16？ |
+|---|---|
+| MoE `experts.N.{gate,up,down}_proj`（每层 288×3） | ✅ 转 |
+| `shared_experts.{gate,up,down}_proj`（每层 3） | ✅ 转 |
+| dense FFN `mlp.{gate,up,down}_proj`（仅 0–2 层） | ✅ 转 |
+| DSA `q_a_proj` / `q_b_proj` / `kv_a_proj_with_mqa` / `o_proj` | ✅ 转 |
+| DSA `kv_b_proj` | ❌ 本来就是 BF16 |
+| **KDA 全部 `self_attn.*`**（q/k/v_proj、`*_conv1d`、f/g_proj、`A_log`、`dt_bias`、`o_norm`、`o_proj`） | ❌ 本来就是 BF16/F32 |
+| **indexer 全套**（`wq_b`/`wk`/`weights_proj`/`k_norm.{weight,bias}`/`index_kpool_compress_{ape,gate}`） | ❌ 本来就是 BF16 |
+| **mHC 全部 `hc_*`**（`_base`/`_fn`/`_scale`） | ❌ 本来就是 BF16/F32 |
+| 所有 norm、`mlp.gate.weight`、`e_score_correction_bias` | ❌ 本来就是 BF16/F32 |
+
+> **对 P3 的推论（重要）**：官方 FP8 量化排除掉的，**恰好就是我们要移植的三块** ——
+> KDA、indexer、mHC **全程没被量化过**，BF16 转换对它们是逐位直通。
+> 所以 P3 若在这三块上测出数值偏差，**可以直接排除"权重转换引入的"**，
+> 只可能来自我们的实现或算子。唯一被转换动过的是 MoE 专家 + dense FFN + DSA 的四个投影，
+> 而那部分有首个 shard 的 27.6 亿元素逐位验证兜底。
+
 > **计划变更（2026-08-28）**：原方案是"转完即删源 shard"，因为当时磁盘只剩 66 GB。
 > 删掉 DSv4 后可用 668 GB，BF16 需 643 GB → **改为全程保留 FP8 源**，结束时余 ~25 GB。
 > 这让整个 P2 变成**可逆**的：转换若有隐蔽 bug，不必重下 306 GB。
