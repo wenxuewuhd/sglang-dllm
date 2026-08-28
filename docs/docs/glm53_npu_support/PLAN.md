@@ -162,7 +162,8 @@
 - **`torch.ops.custom.compressor`** 与 **`npu_quant_lightning_indexer`** 的 kernel —— 都需要活的 pool/page-table，
   独立 harness 驱动不了，返回不透明错误
 - `npu_sparse_attn_sharedkv` 的 kernel（metadata 能建，kernel 需活 pool）
-- `npu_lightning_indexer` 在 **NPU Graph 捕获**下能否用；以及它相对 CUDA fp8 路径的**性能**（都未测）
+- ~~`npu_lightning_indexer` 在 **NPU Graph 捕获**下能否用~~ —— **已验，可用**（P6.6，实测）。
+  `npu_sparse_flash_attention` 同样可用。**性能**仍未测
 
 > **已关闭：昇腾侧由谁计算 indexer logits。** 答案是 `torch_npu.npu_lightning_indexer`
 > —— 不是被排除的 `npu_quant_lightning_indexer`，是 DSv4 非 kpool 路径已在用的那个 bf16 算子
@@ -326,7 +327,9 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
         **有效值严格是前缀**、有效个数 == `min(pool_len,512)*4 + seq_len%4` 逐行精确
   - [x] `append_kpool_tail_to_topk` 这个 Triton kernel 在 Ascend 上**真的跑起来了**
         —— 事先怀疑会炸，实际没有。又一次"推断出的缺口"落空
-  - [ ] **仍未验证**：ACL/graph capture（§2.9 有 host sync，**推断**会失败）；
+  - [x] ~~ACL/graph capture（§2.9 有 host sync，**推断**会失败）~~ —— **推断错了**：decode 整条链
+        （indexer + 稀疏注意力 + 缓存写入）捕获成功且逐位可复现，见 P6.6。§2.9 的 host sync 全在 extend 侧
+  - [ ] **仍未验证**：
         TP>1；多 DSA 层共享 pool；未对齐 chunk 起点与 radix 前缀复用；
         overlap scheduler 下 `seq_lens_cpu` 领先设备张量一步的场景；只测了 layer 3、一条 prompt
   - [ ] **接 spec decode 前必须先解决**：`kpool_decode_update_index_cache` 假设每请求一行，
@@ -384,7 +387,52 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
       `expand_pooled_groups_to_topk` 中间物化了 `[4096, 512, 4]` 的 int64（67 MB）再 reshape，
       占 6.3 ms / 单层。11 个 DSA 层 → 每个 4096-token chunk 约 69 ms。**在共享代码里**
       （`kpool_fp8_index.py:379`），改动会影响 CUDA 路径，先 profiling 再决定
-- [ ] P6.6 NPU Graph —— **decode 路径已扫清 host 同步**（实测 `timing.count_syncs`：
+- [x] **P6.6 NPU Graph —— 四类层单层捕获全部跑通并验过数值**（实测，die 14/15）。
+      回归脚本 `layer_check/graph_capture/`，判据是三问：能不能捕获 / replay 还跟不跟设备输入走 /
+      从图里读出来的数还对不对（双参考法）。**逐位**是这里的常态，不是巧合 ——
+      replay 与 eager 在同一批输入上逐位相同，所以 `check_*.py` 已经给过的 golden 结论直接迁移。
+
+      | 层 | 捕获 | 换输入后 replay vs eager | 图内输出对 golden |
+      |---|---|---|---|
+      | DSA（layer 3，TP16 rank0，16 条 ragged 到 32k，真实 decode 形状）| ✅ | 逐位（换 x、换 seq_lens 两种）| 16/16 在预算内，受控比 0.97–1.05×，重合 0.992–1.000 |
+      | KDA（TP16 rank0，bs=16，走 runner 的图 metadata 契约）| ✅ | 逐位（out + conv + ssm）| 迁移自 `check_kda.py` 的 6/6（最差 0.31×）|
+      | MoE（288 专家 top-8，`--moe-a2a-backend none` 即部署配方）| ✅ | 逐位 | 4/4 在预算内（最差 0.28×），**16 个 rank 的和全部由同一个图 replay 出来** |
+      | mHC（layer 20 两个站点）| ✅ | 逐位 | 4/4 在预算内（最差 0.33×）|
+      | dense FFN（layer 2，TP16 rank0）| ✅ | 逐位 | 3/3 在预算内（最差 0.20×），TP16 求和同样全部来自 replay |
+
+      顺带证伪/确认的机制事实（实测）：捕获期间 `.item()`/`.cpu()`/`.tolist()` **会抛** 107027，
+      不会静默通过；`nonzero`/`unique_consecutive` 因动态输出形状被拒；`cumsum` 可捕获；
+      **AI CPU 回落的算子可以捕获**（`aclnnIndex` 在图里正常跑）—— 这条原先被推断成阻塞项，现已证伪。
+      `npu_lightning_indexer` 与 `npu_sparse_flash_attention` 在捕获下均可用（§2.6 的未决项之一，已关闭）。
+
+  - [ ] **P6.6 没覆盖的（全部还是未知，不要当成已验）**：
+        ① **整网捕获从没做过** —— 45 层一个图、11 个 DSA 层共享一个 pool、KDA 与 DSA 交替、
+        多个 bs 的图共用一个 memory pool。这里做的全是**单层单 die**，P4.1 整网启动本身还没跑过
+        ② **HCCL 本身已经不是阻塞了**（实测，die 14+15 两卡，`graph_capture/cap_hccl.py`）：
+        `dist.all_reduce` 捕获成功、replay 逐位正确，而且**只改对端的输入**时 replay 也跟着变
+        —— 说明集合通信是真的在重放，不是把结果烘死了。⚠ **只测了 2 卡**：TP16 的 16 卡、
+        每层一次、45 层叠加，仍未验
+        ③ `enable_torch_compile` + `npugraph_ex` 那条路（`patch_model_npu`）没碰
+        ④ MTP / spec decode 下的捕获（`kpool_decode_update_index_cache` 每请求一行的假设在那里不成立，
+        见 P3.4）；DeepEP-normal 的 MoE（部署配方是 `--moe-a2a-backend none`，走的是已验的 TP dispatcher）
+        ⑤ 耗时**一个都没测** —— 机器上有别人的训练任务，这轮只判功能
+
+- [x] **P6.6a padding batch 踩坏 KDA 状态 —— 已修**（`ascend_kda_backend.py` 的 `_causal_conv1d_decode`）。
+      图宽度固定，raw_bs 小于捕获 bs 时 runner 补齐尾部行并传 `num_padding`
+      （`decode_cuda_graph_runner.py:188`），`_replay_metadata` 于是把这些行的 mamba 下标置成
+      **-1**（`PAD_SLOT_ID`）。GLM 的 conv 权重是 fp32、conv cache 是 bf16，所以走的是
+      fp32 工作集那条分支 —— 它用 `index_select` / `index_copy_` 直接吃 `cache_indices`，
+      而这两个算子**不接受负下标，在昇腾上也不报错，是把 AI core 打挂**（507011 aivec error）。
+      另一条分支没事，因为 `causal_conv1d_update_npu` 自己带 `pad_slot_id`。
+      **34 个 KDA 层，只要有一次 padding decode 就必挂**，等于图模式对 GLM 整个不可用。
+      修法：把负下标 clamp 到 mamba 槽 0 —— `MambaSlotAllocator` 正是为此保留了它
+      （`mem_cache/allocator/mamba.py`，`free_slots = arange(1, size+1)`）。
+      验证 `layer_check/graph_capture/cap_kda.py`：bs=15 / 3 真实行 / 12 padding 行，
+      真实行的 out 与 slots 1.. 的 conv+ssm 对未 padding 的 eager **逐位相同**，
+      **只有保留槽 0 被动过**；`check_kda.py` 全量回归仍是 6/6、数字不变（clamp 对非负下标是恒等）。
+      ⚠ 这条测试**必须把真实请求从 0 号槽挪开**，否则请求 0 坐在保留槽上，测不出任何东西。
+
+- [ ] P6.6 原条目 —— **decode 路径已扫清 host 同步**（实测 `timing.count_syncs`：
       kpool 的 decode 缓存更新 **0 次/调用**）。做法：decode 跳过 `visible_pool_runs`
       （每行本来就自成一段），并把缓存更新改成无分支——**不过滤行，而是给被屏蔽的行
       一个 scratch 目标**。⚠ 这里有个真陷阱：屏蔽行的 `req_pool_indices` 会被 clamp，

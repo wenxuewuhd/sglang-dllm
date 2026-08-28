@@ -380,7 +380,22 @@ class AscendKDAAttnBackend(KDAAttnBackend):
                 activation="silu",
                 conv_state_indices=cache_indices,
             )
-        rows = cache_indices.to(torch.int64)
+        # A padded cuda-graph replay carries PAD_SLOT_ID (-1) in the tail rows of
+        # cache_indices (hybrid_linear_attn_backend.py `_replay_metadata`, which
+        # the decode runner always reaches because it passes an explicit
+        # num_padding). The branch above is safe -- `causal_conv1d_update_npu`
+        # takes pad_slot_id and skips those rows itself -- but index_select /
+        # index_copy_ do not accept negative indices, and on Ascend they do not
+        # raise: they trap the AI core (507011 aivec error). Send the padded rows
+        # to mamba slot 0, which MambaSlotAllocator reserves for exactly this
+        # (mem_cache/allocator/mamba.py: free_slots = arange(1, size + 1), "Slot 0
+        # is reserved as a dummy write target for padded tokens"). Several padded
+        # rows then share slot 0, so the write order among them is undefined --
+        # which is fine, because nothing reads it.
+        # Out-of-place clamp: `.to(torch.int64)` is a no-op when cache_indices is
+        # already int64, and clamping in place would corrupt the backend's
+        # state_indices_list buffer.
+        rows = torch.clamp(cache_indices.to(torch.int64), min=0)
         local_indices = torch.arange(
             cache_indices.shape[0],
             device=cache_indices.device,

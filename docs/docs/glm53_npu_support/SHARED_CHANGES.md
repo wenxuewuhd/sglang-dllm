@@ -128,6 +128,31 @@ int32 上限 2.1e9，**要到 20 亿的上下文才会溢出**。
 
 ---
 
+## 待决：三处只报告、没改的问题（图捕获那一轮发现）
+
+这三处**没有改动**，记在这里是因为**都会影响 GLM 之外的东西**，改不改要先定。
+
+**①「图 padding 的填充值两边不一致」** —— `hybrid_linear_attn_backend.py:88` / `:750`
+对 `ascend_backend.py:792`。runner 按顶层 backend 报的填充值去填 padded `seq_lens`，
+而 `HybridLinearAttnBackend` 把这个问题**委托给全注意力那一半**（昇腾上是 **0**），
+`MambaAttnBackendBase` 自己却缓存成 **1**。CUDA 上两边碰巧都是 1，所以没暴露。
+**今天不炸**（decode runner 显式传 `num_padding`，那个比较是死代码），但任何不传
+`num_padding` 的路径会**静默把 padding 当真实行**。
+修法 A：`AscendKDAAttnBackend` 覆写返回 0（NPU 树内，2 行）；
+修法 B：改共享 `_replay_metadata` 去问顶层 backend（**动共享 CUDA 路径**）。
+
+**②「`seq_lens_cpu_list` 在捕获时被永久烘死」** —— `ascend_backend.py:645` 算一次，
+`_apply_cuda_graph_metadata` 从不刷新，然后 `forward_decode_graph` 把它当
+`actual_seq_lengths_kv` 喂给 FIA。**GLM 逃过一劫**：DSA 在 `:2607` 就短路进
+`forward_sparse`，到不了 `:2620`。但**对任何走 FIA 的非 DSA 昇腾模型是活的 bug**，
+而且是那种「不报错、数值悄悄错」的。在 NPU 树内可改，但会影响其他昇腾模型。
+
+**③「MoE 的 `group_list` 会被烘死」** —— `layers/moe/moe_runner/ascend.py:277` 把每步都变的
+host list 物化成设备张量喂 `npu_grouped_matmul`。**GLM 的部署配方
+（`--moe-a2a-backend none`）走不到**，`--deepep-mode normal` 就活了。**共享代码。**
+
+---
+
 ## 关于 DSv4 回归
 
 多条改动都指向「需要跑一次 DSv4 GPQA」。基线在 PLAN §3：**73.74%**（P0，三轮 74.24/75.25/71.72），
