@@ -83,6 +83,7 @@ kpool 的 10 个 Triton kernel 里 7 个已实测可在 triton-ascend 上跑且�
 | `probe/` | 探测脚本 | `p0_5_ops.py` 验环境；`p0_6_*.py` 验算子 shape |
 | `launch_dsv4_a3.sh.example` | DSv4-Flash 起服务脚本（A3 TP16/DP16+DeepEP） | 冒烟 / 精度回归 |
 | **[`operator_handoff/`](./operator_handoff/)** | **给算子团队的工单**：规格 + 纯 torch 参考 + pytest + 验收判据 | 派算子开发时 |
+| 算子清单的对外呈现页 | https://claude.ai/code/artifact/54dbfb20-667f-465d-84c1-ea7d0cc1a827 | 发给下游同事时。**内容来自本目录，仓库为准**；要更新必须带上这个 URL，否则会新建一个而不是更新它 |
 | `tools/fp8_to_bf16.py` | FP8 blockwise → BF16 逐 shard 反量化 | 换权重版本要重转时 |
 | `tools/golden_kda.py` / `golden_mhc.py` | 从 HF 参考实现生成 CPU golden | 模块级数值对拍 |
 | `tools/logit_check.py` | teacher-forced logprob 对拍（参考存盘、迭代秒级） | 改完接线快速验精度 |
