@@ -56,8 +56,10 @@ tracing 用短 prompt（128 token 量级）就够，不要用 32k。
 | KDA 线性注意力 | 34 层 | ⚠ 只有**模块级** golden（`../tools/golden_kda.py`），**没走 Ascend backend 的真实路径** |
 | mHC | 每层 | ⚠ 同上，模块级验过（`../tools/golden_mhc.py`） |
 | MoE（288 专家） | 42 层 | ❌ **未验**，且 PLAN §4 记着**两个已知未修的精度缺陷** |
-| Dense FFN | 前 3 层 | ❌ 未验 |
-| 整网逐层 trace | — | 框架就位，stage A/B 未写 |
+| Dense FFN | 前 3 层 | ✅ **端到端已验**（layer 2，真实 TP16 形状：每卡 gate_up `[M,1536]`、down `[M,768]`；M=1/16/8192），最差 0.66× 预算。反向对照 `KT_DISABLE_SWIGLU_CLAMP=1` 时 `act` 失败 52–95×，说明检查有牙。⚠ **真实输入下 clamp 从不触发**（max\|gate_up\|=2.17 vs limit 10），要验 clamp 必须 `--scale-input 48` |
+| 整网逐层 trace | 45 层 | ⚠ **stage A 已跑通**（`trace_reference.py`，CPU 流式建模，128 token 3.5 min / 峰值 RSS 646 GB / 输出 755 MB）。stage B 只有**格式与 hook 定义**，真实抓取等 P4.1。**只在浅层有牙**，见下一行 |
+| ⚠ 整网 fp32-vs-bf16 的**路由翻转** | layer 3 起 | 📌 **实测**：MoE 的 top-8 集合在两种精度下会不同 —— layer 3 就有 12.5% 的 token，最深处 **63.3%**。**从第一个 MoE 层起，噪声地板就由离散的路由差异主导，而不是舍入**。地板从 layer 0 的 9.5e-3 涨到 layer 26+ 的 **1.8e-1**。后果：注入 5% 误差实测**只有 layer 7–25 能被检出**，layer 26 起 err/floor≈1.03–1.09 落在预算内、测不出来。**深层的宽地板不能当成「宽误差可接受」的依据** |
+| 计时口径 | — | `timing.py`：冷调用单独报 / 稳态 p50 / Event 分段 / **host 同步计数** / 强制免责声明。dense FFN 实测冷:稳 = **971–1022×**（M=1/16），**每次调用 0 次 host 同步** |
 
 ⚠ **不要写逐位一致性断言。** NPU 的 bf16 矩阵乘不是 batch-shape 不变的：同一输入把 M
 从 4096 改成 4080，5/4080 行会差 1 个 bf16 ulp（实测，见 PLAN §2.4）。

@@ -113,6 +113,7 @@
 | **`ue8m0` scale 舍入** | 对浮点格式免费，对 int8 要付一个真实 bit（32k 重合 99.18% → 98.84%） |
 | **`npu_sparse_flash_attention` 的 sparse_indices 契约比「有效值在前」更严，失败方式也更坏** | 之前记的是「不是前缀就静默返回 0」。**实测在真实形状下不对**：decode@32k、2048 个有效索引时，把 `-1` 挪到 slot 0 得到的是 **rel 1.23e-1 的静默错误非零值**，不是 0。位置扫描显示 `-1` 落**偶数槽**会改变输出（rel 0.15–0.29，静默），落**奇数槽**则逐位相同。「静默返回 0」只在**第一个分块整块无效**时出现（小形状上复现）。所以契约是某种与**槽位奇偶 / 分块对齐**相关的东西，前缀恰好满足它。**我们的链路产出严格前缀所以安全**，但任何自己拼索引的地方风险比原记录高得多。机制**未查清**（要看 `aclnnSparseFlashAttention` 的 tiling 或问厂商）|
 | **Hadamard 在 bf16 里做** | CUDA kernel 把 bf16 读进 **fp32 寄存器**再变换（`hadamard_jit.cuh:150` 的 `float x_vals[..]`），Triton 的 `_hadamard128` 同样作用在 fp32 accumulator 上。在 bf16 里做要 round 7 次而它们 round 1 次，**不报错**，只是悄悄挪走一批 pool —— 32k 下选择重合掉 0.0006（实测）。这个 bug 我写过一次，被端到端对拍抓出来 |
+| **MoE 的路由在 fp32 与 bf16 之间会翻，从 layer 3 就开始** | 实测：top-8 集合不同的 token 占比 layer 3 为 12.5%、layer 41 达 **63.3%**。后果不是"精度差一点"，而是**双参考法的地板从第一个 MoE 层起就由离散的路由差异主导，不再是舍入**——地板从 9.5e-3 涨到 1.8e-1。**深层的宽地板不能当成"宽误差可接受"的依据**；注入 5% 误差实测只有 layer 7–25 测得出来，layer 26+ 测不出。这是**验收方法本身的边界**，不是某个算子的问题 |
 | **NPU 的 bf16 矩阵乘不是 batch-shape 不变的** | 同一份输入只改 M（4096 行 vs 4080 行），过 `wk`+`k_norm` 后 **5/4080 行**差 1 个 bf16 ulp，gate 差 6/4080（实测）。根因在 torch_npu 的 matmul tiling，不在业务代码。**后果：NPU 上任何 prefill-vs-decode 的逐位一致性断言都不成立**，包括 P4 打算用的 KL 一致性 —— 只能定阈值，不能要求 bit-exact |
 | **KDA prefill 的 Triton autotune** | `kda.py:214` 的 24-config `do_bench` 扫描挂死 AI core（die 4/6/8 上 3/3 复现）；单独钉住任一 config 都能跑。⚠ 实际服务未触发，列为**上线前须确认** |
 
@@ -307,6 +308,10 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
         共享 CUDA kernel 有 `kpool_max_closed_pools` 那套多 token 逻辑，NPU 这条没有
   - [ ] DSA 注意力本体还缺全零 rope 的接线（§2.3 第 3 条），否则拿到 topk 也跑不出注意力
 
+- [x] **Dense FFN** —— 端到端已验（真实 TP16 每卡形状，M=1/16/8192），最差 0.66× 预算。
+      两处与预期不同：dense FFN **根本不调 `npu_clipped_swiglu`**（走 `chunk`+`clamp`+`npu_swiglu`），
+      所以那个 109× 的默认参数陷阱在这条路上不适用；而且**真实输入下 clamp 从不触发**
+      （max|gate_up| = 2.17，limit 是 10），要验 clamp 必须放大输入
 - [ ] **P3.5 出口判据** —— 四模块逐层 golden 对齐
 
 ### P4 · BF16 端到端 ☐
