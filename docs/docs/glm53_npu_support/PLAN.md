@@ -90,7 +90,7 @@
 | FIA `npu_fused_infer_attention_score`：BSND prefill + MLA-absorbed decode | 通过 |
 | MoE `npu_moe_gating_top_k`（expert 集合 2048/2048 一致）、`npu_grouped_matmul` | 通过 |
 | kpool 的 10 个 Triton kernel 中的 **7 个**（top-k、展开、尾部、plan/layout） | **逐位精确** |
-| `torch_npu.npu_lightning_indexer`（**bf16**，`n_heads=32`）prefill + decode | top-k 集合与 torch 参考**完全一致** |
+| `torch_npu.npu_lightning_indexer`（**bf16**，`n_heads=32`）prefill + decode | 对真实权重的 golden **落在噪声地板上**，见 §2.8 |
 
 ### 2.3 确认要开发 / 要改
 
@@ -146,9 +146,9 @@
 
 ### 2.7 int8 索引缓存：更准，但目前没有消费者
 
-上一轮实测（CPU 仿真，真实权重、真实 hidden states、真的 `float8_e4m3fn` 对照）：
-**int8 比它要取代的 fp8 更准** —— 键重构误差低 4.2×，32k 下选择重合 99.18% vs 96.53%，
-11 个 DSA 层无一例外。这个结论**没有被推翻**，回答的是「必须存量化格式时选哪一种」。
+**int8 比它要取代的 fp8 更准**，这个结论**没有被推翻**，两轮都复现：键重构误差
+低 4.2×（0.0067 vs 0.0267）。它回答的是「必须存量化格式时选哪一种」。
+§2.8 那张表把 bf16/int8/fp8 放在同一根轴上，bf16 又比 int8 好 1.7×。
 
 但一期不走 int8，因为**没有算子能读它**（两条都实测）：
 
@@ -171,6 +171,48 @@
 按 11 个 DSA 层折算，**推断**，未在活服务上量过）。真要启用，
 `operator_handoff/specs/op1_kpool_topk_transform.md` §3 那三个条件依然成立，
 但**先要解决消费者**。
+
+---
+
+### 2.8 P3.4 的数值门槛：已通过（实测）
+
+layer 3、真实权重、真实 hidden states（embed + layer 0–2 真跑）、32768 真实 token，
+每个长度取最后 512 个 query 行，只比 pooled 部分（尾部不在范围内）。
+**参考先对 HF 校准过**：seq=4096 的第 4095 行（1024 pool，k=512，选择真正起作用），
+本地 fp32 流水线选出的 pool 集合与 `Glm5NextTextIndexer.forward` **完全一致**（overlap 1.000000）。
+
+选中 pool 集合与 **fp32 参考**的重合率（按行取均值）：
+
+| seq_len | pool 数 | **bf16（真算子）** | int8 absmax/127 | int8+ue8m0 | fp8 e4m3+ue8m0 |
+|---|---|---|---|---|---|
+| 2048 | 512 | 1.00000 | 1.00000 | 1.00000 | 1.00000 |
+| 4096 | 1024 | **0.99816** | 0.99538 | 0.99384 | 0.98267 |
+| 8192 | 2048 | **0.99738** | 0.99302 | 0.99124 | 0.97375 |
+| 32768 | 8192 | **0.99641** | 0.99021 | 0.98791 | 0.96181 |
+| 32768 | score mass | **0.999995** | 0.999954 | 0.999923 | 0.999252 |
+| 32768 | 被丢掉的最差 pool 距 top-k 分数跨度 | **0.0045** | 0.0198 | 0.0258 | 0.0889 |
+
+> ⚠ 这里的基准是 **fp32**，OP-1 §2 那张表的基准是 **bf16**，所以同一个 fp8 在两张表里
+> 是 0.9618 和 0.9653 —— 不矛盾，是分母不同。2048 处选择不起作用（512 pool 选 512）。
+
+**按 ACCEPTANCE §A 的双参考法**：R32 = fp32 未旋转、fp32 算；R16 = bf16 旋转后的 q 与 pooled key、
+fp32 累加、纯 torch。候选**正好落在地板上，SLACK = 1.0**：
+
+| seq_len | 地板 logits rel-L2 | 地板 选择重合 | 候选（真算子） |
+|---|---|---|---|
+| 2048 | 3.21e-3 | 1.00000 | 1.00000 |
+| 4096 | 3.85e-3 | 0.99816 | 0.99816 |
+| 8192 | 3.70e-3 | 0.99738 | 0.99738 |
+| 32768 | 3.16e-3 | 0.99641 | 0.99641 |
+
+比表面看到的更强：**同样的 bf16 输入下，算子的选择与 fp32-torch 参考逐行逐位相同** ——
+四个长度、512 行、共 262144 个选中槽位，**0 行有差异**。算子在 bf16 存储之上没有再引入误差。
+**decode 与 prefill 在全部 32 个格子里选择完全相同**，说明「按可见-pool 分段」这个 prefill
+写法在真实数据上也是精确的。
+
+**没验的**：只有 layer 3、只有一个 prompt、只有每个长度最后 512 行；尾部不在范围内；
+int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），量的是量化误差而非真实 int8 缓存；
+用的是单位 block table，没有活的 pool；**没有端到端精度**。
 
 ---
 
@@ -205,7 +247,16 @@
          decode 逐行、extend 按可见-pool 分段调 `npu_lightning_indexer`（§2.6）；
       ④ 选择之后的 pool→token 展开与尾部拼接，复用已实测逐位精确的 7 个 Triton kernel；
       ⑤ 解掉 `dsa/kpool_fp8_index.py:583/589`、`dsa/dsa_indexer_kpool.py:1766` 的非 CUDA 硬拦
-      **前置门槛：先做数值对齐**（layer 3 对 HF golden，bf16/int8/fp8 同轴对比），过了再动内存池
+      **前置门槛已通过**（§2.8）。这一轮还带出两件必须做的事：
+      ⑥ **`weights` 传 fp32，不要传 bf16**。算子收 fp32。传 bf16 时 32k 下 146/512 行会与
+         fp32-torch 参考差 1–2 个近似并列的 pool；传 fp32 则 0 行。DSv4 现在传的是 bf16
+         （`dsa_npu_indexer.py:103,108,136,141`）—— 对重合率影响在噪声内，但这是免费的；
+      ⑦ **`rotate_activation` 在 NPU 上没有实现**。`_get_q_k_bf16` 对 query 调它，它落到
+         `kernels/ops/quantization/hadamard.py` 的 CUDA JIT kernel，非 CUDA 张量直接 raise，
+         本机也没有 nvcc 编不出来。需要一个 torch 版（7 行）。**已验证**：torch 版正交
+         （2.2e-16），且与 Sylvester H128/√128 以及 Triton 侧 key 用的 `_hadamard128`
+         **逐位相同**（max|d| = 0）。这也是为什么选「保留 Hadamard」而不是「删掉」——
+         key 侧的 Triton 实现已经在算它，两侧必须一致
 - [ ] **P3.5 出口判据** —— 四模块逐层 golden 对齐
 
 ### P4 · BF16 端到端 ☐

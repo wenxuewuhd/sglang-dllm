@@ -31,7 +31,8 @@ source /mnt/workspace/y00359136/work/glm53_dev/env/env.sh   # 然后用 npy 代�
 
 【当前进度】
 P0 环境 / P1 分支合流 / P2 BF16 权重转换：全部完成，出口判据见 PLAN 表。
-P3 逐模块对拍进行中：KDA ✅、mHC ✅（已接线并验数值）、NoPE MLA 部分、kpool **路线已定、待实现**。
+P3 逐模块对拍进行中：KDA ✅、mHC ✅（已接线并验数值）、NoPE MLA 部分、
+kpool **数值门槛已过（PLAN §2.8）、待接线**。
 
 【下一步：P3.4 kpool】
 这是唯一的关键路径。**不需要新算子，也不需要 torch 兜底**——「昇腾侧由谁算 indexer
@@ -93,6 +94,7 @@ kpool 的 10 个 Triton kernel 里 7 个已实测可在 triton-ascend 上跑且�
 | 算子清单的对外呈现页 | https://claude.ai/code/artifact/54dbfb20-667f-465d-84c1-ea7d0cc1a827 | 发给下游同事时。**内容来自本目录，仓库为准**；要更新必须带上这个 URL，否则会新建一个而不是更新它 |
 | `tools/fp8_to_bf16.py` | FP8 blockwise → BF16 逐 shard 反量化 | 换权重版本要重转时 |
 | `tools/golden_kda.py` / `golden_mhc.py` | 从 HF 参考实现生成 CPU golden | 模块级数值对拍 |
+| `tools/golden_kpool_indexer.py` + `check_kpool_indexer_npu.py` | kpool indexer 的两段式对拍：CPU 出 fp32 参考，NPU 跑真算子比选择集合 | 改完 kpool 接线后回归 |
 | `tools/logit_check.py` | teacher-forced logprob 对拍（参考存盘、迭代秒级） | 改完接线快速验精度 |
 | `env.sh.example` | 环境变量模板 | 复制到 `$ROOT/env.sh` |
 | `GLM53_flash_ascend_support_assessment.html` | 最初的评估报告 | 参考。**若干判断已被推翻，见 PLAN.md §2.5** |
@@ -113,11 +115,13 @@ GPU 参考实现在 `upstream/xinyuan/glm-5.3-flash-support @ 0b9c38484e`（本�
 | P0 环境 / 算子可见性 / DSv4 冒烟与精度 | ✅ GPQA 73.74%（对标 73.23%） |
 | P1 分支合流（rebase 到 `033446bb05`） | ✅ 回归 GPQA 73.23% |
 | P2 FP8 → BF16 权重转换 | ✅ 599 GB，全量比对通过 |
-| P3 逐模块对拍 | 进行中：KDA ✅ / mHC ✅ / NoPE MLA 部分 / kpool 路线已定、待实现 |
+| P3 逐模块对拍 | 进行中：KDA ✅ / mHC ✅ / NoPE MLA 部分 / kpool 数值门槛已过、待接线 |
 | P4 端到端 · P5 W8A8 · P6 性能 | 未开始 |
 
-**当前关键路径**：P3.4 kpool —— 已无阻塞。A3 无 fp8，索引缓存改存 **bf16**
-（不是 int8，理由见 PLAN §2.7），打分交给 `npu_lightning_indexer`。详见 PLAN §2.3、§2.6。
+**当前关键路径**：P3.4 kpool —— 已无阻塞，**数值门槛已通过**。A3 无 fp8，索引缓存改存 **bf16**
+（不是 int8，理由见 PLAN §2.7），打分交给 `npu_lightning_indexer`。对真实权重的 golden，
+候选**正好落在噪声地板上**（SLACK 1.0），同样 bf16 输入下与 fp32-torch 参考逐位相同。
+详见 PLAN §2.3、§2.6、**§2.8**。
 
 **给算子团队的工单**在 [`operator_handoff/`](./operator_handoff/) —— 四个原始需求
 **全部撤销**（算子本就存在），只剩 `kv_rmsnorm_rope_cache` 支持 rope=0 这一项。
