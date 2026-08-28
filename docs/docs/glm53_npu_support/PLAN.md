@@ -27,7 +27,10 @@
 - 16 die × 64 GB HBM；CPU 320 核 / 内存 1.8 TB
 - **Ubuntu 24.04.3 / glibc 2.39** → SETUP 附录 B 的 glibc 绕行**整段不需要**
 - **A3 没有 fp8**：`bishengir-compile` 无法 lower e4m3（`unsupported datatype for arith::TruncFOp`），
-  torch 侧 `x.to(torch.float8_e4m3fn)` 直接触发 device 异常
+  torch 侧 `x.to(torch.float8_e4m3fn)` 直接触发 device 异常。
+  **连分配都不行**：`torch.zeros(4, dtype=torch.float8_e4m3fn, device="npu")` →
+  `aclnnInplaceZero failed, 161002`（实测）。所以这不只是 kernel 语言问题，
+  任何**实体化** fp8 张量的路径都会死，跟 triton 无关
 
 ### 软件栈
 - CANN **组件实为 9.1.0**（外层包名标 9.2.0，不可信）；toolkit 在 `/home/developer/Ascend/ascend-toolkit/`
@@ -108,6 +111,7 @@
 | **`npu_clipped_swiglu` 的默认参数** | 四个默认值（`alpha=1.702, limit=7.0, bias=1.0, interleaved=True`）**对 GLM 全错**，只传部分错 109× |
 | **Hadamard-128 能不能删，取决于存什么** | 正交归一、q/k 同旋转、点积不变，所以**在 bf16 下确实可删**；**一旦量化就不能删** —— 它正是 int8 优于 fp8 的原因（旋转后 kurtosis≈3.0）。既然一期走 bf16，**保留它**（保留同样中性，且 3 个 kernel 里它本来就正常）；只有撞上 §4 那个 triton-ascend codegen 缺陷才删 |
 | **`ue8m0` scale 舍入** | 对浮点格式免费，对 int8 要付一个真实 bit（32k 重合 99.18% → 98.84%） |
+| **`npu_sparse_flash_attention` 的 sparse_indices 必须是「有效值在前」** | `[-1, 70]` 返回 **0.0** 而不是 70 号 token 的值，**不报错**。`0` 不是哨兵（它选 0 号 token），越界值（`-1`/`-2`/`kv_len`）才被忽略。kpool 的 `append_kpool_tail_to_topk` 产出的正好是前缀（history 占 `[0, history_len)`、tail 接在后面、其余 -1），所以这条链满足契约 —— 但任何自己拼索引的地方都要保证前缀性 |
 | **KDA prefill 的 Triton autotune** | `kda.py:214` 的 24-config `do_bench` 扫描挂死 AI core（die 4/6/8 上 3/3 复现）；单独钉住任一 config 都能跑。⚠ 实际服务未触发，列为**上线前须确认** |
 
 ### 2.5 已排除（不要再做）
@@ -174,6 +178,26 @@
 
 ---
 
+### 2.9 P3.4 的接线地形（调研结论）
+
+| 问题 | 结论 |
+|---|---|
+| 11 个 DSA 层由谁服务 | **`AscendAttnBackend`**，外面包 `AscendKDAHybridLinearAttnBackend`（`attention_registry.py:503-542`） |
+| `get_indexer_metadata()` | **返回 `None`** —— `AscendAttnBackend` 不定义它，落到 `base_attn_backend.py:302` 的 ABC 默认。**kpool 那套 metadata 在 NPU 上一个都不存在** |
+| 能不能改用 `DeepseekSparseAttnBackend` | 不能。① NPU 无条件把 `attention_backend` 钉成 `"ascend"`（`npu/utils.py:51-64`），DSA 那个 override 根本不触发；② 就算强行选上，`dsa_backend.py:615` 无条件调 `torch.cuda.get_device_capability()`，构造就死（实测）；③ 再修好也只拿到全零的 `kpool_write_plan`（`kpool_plan.py:741` 在 `not is_cuda()` 时直接 return）和一堆 `None` 的 `pooled_*`（`kpool_plan.py:586`） |
+| KV pool 是哪个 | `HybridLinearKVPool` 包一个**普通的** `DSATokenToKVPool`。GLM 是 mambaish，而配置器里每个 NPU 分支都带 `and not self.mambaish_config`，所以全被跳过（`kv_cache_configurator.py:992/1006/1033` → `:1059` 命中） |
+| 接口在哪加 | `memory_pool.py:3813` 的 `elif use_dsa:` —— 三个分支里**唯一没有 `_is_npu` 分支**的那个（MHA 在 `:3779`、MLA 在 `:3853` 都有）。这就是接缝 |
+| pool 的 9 个方法 | 全都存在。tail buffer（bf16）、`slots_per_page`、`page_size`、`_is_layer_owned` 直接可用；**只有 `set_index_k_scale_buffer` 和 `kpool_decode_update_index_cache` 因 fp8 不可用** |
+| 拿到 topk 之后谁做稀疏注意力 | `torch_npu.npu_sparse_flash_attention`（`ascend_backend.py:1146`）。契约（实测）：`[T, 1, K]` int32、**逻辑 token 位置**（不是物理槽位）、`-1` 补齐、**有效值必须在前**（见 §2.4）、不要求排序 |
+| 已有的先例 | `dsa/dsa_npu_indexer.py:24` 的 `DSANPUIndexerMixin.forward_npu` —— 非 kpool 的 DSA indexer 在 NPU 上早就跑通了，用的正是 `npu_lightning_indexer`，而且**完全不碰 `get_indexer_metadata`** |
+
+> 附带一个可能有用的观察（**未采用，记着**）：`npu_sparse_flash_attention` 的
+> `sparse_block_size` 是**选择粒度**（仓库一律传 1），索引 `j` 选逻辑区间
+> `[j*s, (j+1)*s)` 并按 `actual_seq_lengths_kv` 截尾。也就是说传 `sparse_block_size=index_kpool`
+> 就能**直接喂 pool id**，省掉展开这一步。尾部语义对不对没验，先不动。
+
+---
+
 ### 2.8 P3.4 的数值门槛：已通过（实测）
 
 layer 3、真实权重、真实 hidden states（embed + layer 0–2 真跑）、32768 真实 token，
@@ -233,7 +257,11 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
       下游 `q_rope/k_rope` 传 `None`）。**剩余**：20+ 处 split 早退、KV buffer 二元组语义、
       `trans_rope_weight(w,0)` 的静默损坏加 assert。**数值未对拍**
 - [ ] **P3.4 kpool indexer** —— 路线已定，**不需要纯 torch 兜底**，也**不需要新算子**。
-      **不改共享的打包 cache，而是照 DSv4 的 NPU 先例在旁边加一份 NPU 布局的 buffer**
+      **接线形态由调研定死了（详见 §2.9）：照 `DSANPUIndexerMixin` 的先例，绕开
+      `BaseIndexerMetadata`**，直接读 `get_attn_backend().forward_metadata`。
+      原因是 NPU 上 `get_indexer_metadata()` 返回 `None`（`AscendAttnBackend` 不定义它，
+      落到 ABC 默认），kpool 那套 metadata 一个都没有。
+      存储上**不改共享的打包 cache，而是照 DSv4 的 NPU 先例在旁边加一份 NPU 布局的 buffer**
       （`npu/dsv4/dsv4_memory_pool.py:148` 的 `NPUDeepSeekV4IndexerPool` 就是这么做的：
       基类的打包 buffer 留着，另加 int8 K + fp16 scale 的 PA_ND buffer，用
       `npu_scatter_nd_update_` 写、给厂商算子读）。这样 CUDA 路径一行不动，
@@ -246,7 +274,10 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
          `_get_logits_head_gate` 里的 `q_scale` 因子要去掉 —— **是否为 weights 侧唯一差异，待确认**），
          decode 逐行、extend 按可见-pool 分段调 `npu_lightning_indexer`（§2.6）；
       ④ 选择之后的 pool→token 展开与尾部拼接，复用已实测逐位精确的 7 个 Triton kernel；
-      ⑤ 解掉 `dsa/kpool_fp8_index.py:583/589`、`dsa/dsa_indexer_kpool.py:1766` 的非 CUDA 硬拦
+      ⑤ ~~解掉 `dsa_indexer_kpool.py:1766` 的硬拦~~ —— **那行在 NPU 上根本到不了**（实测）。
+         `IndexerKPool` 只定义了 `forward_cuda`，NPU 上 dispatch 落到
+         `MultiPlatformOp.forward_npu` → `forward_native` → 裸 `NotImplementedError`。
+         别把 :1766 那句话当症状追
       **前置门槛已通过**（§2.8）。这一轮还带出两件必须做的事：
       ⑥ **`weights` 传 fp32，不要传 bf16**。算子收 fp32。传 bf16 时 32k 下 146/512 行会与
          fp32-torch 参考差 1–2 个近似并列的 pool；传 fp32 则 0 行。DSv4 现在传的是 bf16
