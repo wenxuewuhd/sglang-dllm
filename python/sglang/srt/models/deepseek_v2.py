@@ -565,7 +565,19 @@ class MoEGate(nn.Module):
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
             elif not _is_cuda:
-                logits = F.linear(hidden_states, self.weight, None)
+                # fp32, like every CUDA branch above: they each go out of their
+                # way for an fp32 result, and this one is the only path that
+                # stops at bf16. It matters more than the magnitude suggests --
+                # the loss lands on a top-k, so it shows up as a discrete wrong
+                # expert rather than a small error. Measured on Ascend at layer
+                # 3 / 8192 tokens: bf16 logits give 0.9929 top-8 set overlap,
+                # 5.65% of tokens picking a different expert set and the worst
+                # of them 34% off; fp32 restores the overlap exactly to the
+                # bf16-input noise floor. Costs +36us at decode bs=16 and
+                # +383us on an 8192 prefill chunk.
+                logits = F.linear(
+                    hidden_states.float(), self.weight.float(), None
+                )
             else:
                 # cuBLAS bf16 x bf16 -> fp32 GEMM (torch.mm's out_dtype kwarg is CUDA-only)
                 from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32

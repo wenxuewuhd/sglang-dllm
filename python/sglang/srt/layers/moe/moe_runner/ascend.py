@@ -111,10 +111,17 @@ class AscendRunnerCore(MoeRunnerCore):
                     linear_beta=config.gemm1_clamp_limit,
                 )
             else:
+                # swiglu_limit is the model's own clamp (DeepSeek-V4 and GLM-5.3 both
+                # set 10.0 for routed *and* shared experts); gemm1_alpha /
+                # gemm1_clamp_limit are the gpt-oss knobs and are None for this family.
+                # Forwarding only the latter left DeepEP routed experts unclamped while
+                # the shared expert and every ascend_tp routed path clamped -- see
+                # NPUSwigluDeepEPKernel's docstring.
                 self.activation = NPUSwigluDeepEPKernel(
                     need_quant=is_quant_kernel,
                     alpha=config.gemm1_alpha,
                     limit=config.gemm1_clamp_limit,
+                    swiglu_limit=config.swiglu_limit,
                 )
         else:
             # Non‑DeepEP (ascend_tp) path

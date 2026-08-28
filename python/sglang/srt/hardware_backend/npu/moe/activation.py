@@ -177,17 +177,40 @@ class NPUSwigluDeepEPKernel(BaseActivation):
     """DeepEP grouped SwiGLU for the Ascend MoE runner; picks ``swiglu_quant`` vs the MiniMax
     SwiGLU-OAI variant (``swiglu_oai_quant``: ``gate*sigmoid(gate*alpha)*(up+1)`` w/ clamping)
     based on whether ``alpha``/``limit`` are given. The runner must forward
-    ``gemm1_alpha``/``gemm1_clamp_limit`` here or experts fall back to wrong SwiGLU."""
+    ``gemm1_alpha``/``gemm1_clamp_limit`` here or experts fall back to wrong SwiGLU.
+
+    ``swiglu_limit`` is the *model's own* clamp (DeepSeek-V4 / GLM-5.3 set 10.0) and is a
+    different knob from the gpt-oss style ``gemm1_clamp_limit``, which this family leaves
+    unset. Without it the routed experts on DeepEP ran unclamped while the shared expert
+    (models/deepseek_v2.py: DeepseekV2MLP.forward) and every non-DeepEP routed path
+    (NPUSwiglu / NPUSwigluQuant above) clamped -- the same split KT_DISABLE_SWIGLU_CLAMP
+    exists to avoid, only silent. The ``swiglu_quant`` kernel has taken ``do_limit`` /
+    ``limit`` all along; nothing was passing them.
+
+    One semantic difference, recorded rather than glossed: the kernel bounds
+    ``silu(gate)``, while the model definition (and ``apply_swiglu_limit_`` above) bounds
+    ``gate`` *before* the silu. The two agree except for ``gate > limit``, where they
+    differ by at most ``limit - silu(limit)`` = 4.5e-4 at limit=10 -- a 4.5e-5 relative
+    difference against a bf16 relative ulp of 3.9e-3, so it is below the output
+    resolution on all but a small fraction of the affected elements. Measured on a real
+    layer-3 gmm1 output (65536x256 rows, 37 elements past the limit): this kernel and
+    ``NPUSwiglu``'s exact pre-silu clamp both land 1.659e-3 from the fp32 reference,
+    against a bf16 noise floor of 2.35e-3; unclamped is 1.335e-2.
+    """
 
     def __init__(
         self,
         need_quant: bool = True,
         alpha: Optional[float] = None,
         limit: Optional[float] = None,
+        swiglu_limit: Optional[float] = None,
     ):
         self.need_quant = need_quant
         self.alpha = alpha
         self.limit = limit
+        self.swiglu_limit = (
+            None if swiglu_clamp_disabled() or not swiglu_limit else float(swiglu_limit)
+        )
         self._use_oai = alpha is not None and limit is not None
         if self._use_oai:
             from sgl_kernel_npu.activation.swiglu_oai_quant import (
@@ -199,6 +222,9 @@ class NPUSwigluDeepEPKernel(BaseActivation):
             from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
 
             self._kernel = swiglu_quant
+            _log_swiglu_limit_once(
+                -1.0 if swiglu_clamp_disabled() else (self.swiglu_limit or 0.0)
+            )
 
     def _apply_activation(
         self,
@@ -214,6 +240,15 @@ class NPUSwigluDeepEPKernel(BaseActivation):
                 need_quant=self.need_quant,
                 group_list=group_list,
                 group_list_type=group_list_type,
+            )
+        elif self.swiglu_limit is not None:
+            hidden_states, per_token_scale = self._kernel(
+                hidden_states,
+                group_list,
+                group_list_type,
+                need_quant=self.need_quant,
+                do_limit=True,
+                limit=self.swiglu_limit,
             )
         else:
             hidden_states, per_token_scale = self._kernel(

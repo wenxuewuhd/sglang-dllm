@@ -369,10 +369,23 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
       按 11 个 DSA 层折算约 704 vs 363 B/token，相对 MLA KV 的约 11.3 KB/token 是 +3% 量级。
       **这是从 `mem_cache/index_key_cache.py:33-38` 的 buffer 形状推算的，未实测**；
       P4 起服务时量一次。真顶不住的退路见 §2.7
-- [ ] **两个会挡住对拍的精度缺陷**（发现但未修）：
-      ① DeepEP routed 专家路径**静默丢掉 `swiglu_limit=10.0`**（`moe_runner/ascend.py:114-118` 只读
-      `gemm1_clamp_limit`，GLM 为 None）→ 同层内 shared 专家 clamp 而 routed 不 clamp；
-      ② NPU router GEMM 走 bf16（`deepseek_v2.py:567-568`），而 GLM 配置是 `moe_router_dtype: float32`
+- [x] **两个精度缺陷，都已量化**（原「发现但未修」）：
+      ① **DeepEP routed 专家丢 `swiglu_limit=10.0`** —— 缺陷是真的，但 **GLM 的出厂配方走不到**：
+      `--moe-a2a-backend none` → `AscendTPDispatcher` → `NPUSwiglu(swiglu_limit=10.0)`，
+      clamp 本来就在（实测构造过对象）。只有 DSv4 的 `--moe-a2a-backend deepep` 才命中。
+      已修（`npu/moe/activation.py` + `moe_runner/ascend.py`）：`swiglu_quant` kernel
+      **一直有 `do_limit`/`limit`，只是没人传**。真实 gmm1 输出上修前 2.85× budget 判失败、
+      修后 0.35×，与出厂 `NPUSwiglu` 同数。**影响分层**：layer 3 有 912/2.7e8 个预激活越界
+      （19% 的 token 受影响、最差偏 32%），**layer 40 一个都不越界**——只测一层会得出错误结论。
+      ⚠ **这个改动会改变 DSv4 的数值**（给它的 routed 专家加上本就该有的 clamp），
+      **合入前需要单跑一次 DSv4 GPQA 回归**，本轮没跑
+      ② **router GEMM 走 bf16** —— **已修**。看清楚了：`deepseek_v2.py` 里 CUDA 的**每一条**分支
+      都特意把 logits 累加到 fp32（最后一条还专门写注释解释），**只有 `elif not _is_cuda`
+      停在 bf16**。所以这不是改共享行为，是让非 CUDA 分支跟上。
+      代价是**离散的选专家错误，rel-L2 抓不到**：layer 3@8192 的 top-8 集合重合率 0.99291
+      （463/8192 = 5.65% 的 token 选错，最差那个输出偏 34%），**同一块 die 上换 fp32
+      精确恢复到地板**。耗时 decode +36 µs、prefill 8192 +383 µs（整层的 8%）。
+      顺带一条：**`moe_router_dtype` 这个配置项在 sglang 全仓没有任何消费者**
 - [ ] **DSv4 的一处潜在 bug**：bf16 fallback 读 int8 buffer 却**不施加 scale**（`ascend_dsv4_backend.py:637-641`），
       仅因 `:685` 无条件强制 int8 而不可达
 - [ ] **triton-ascend 的 `_hadamard128` codegen 缺陷**（UB 越界，上下文相关）—— 值得上报。
