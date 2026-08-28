@@ -25,22 +25,21 @@
 GLM53_flash_ascend_support_assessment.html 是最初的评估报告，其中若干判断
 **已被代码核实推翻**，以 PLAN.md §2.8 为准，不要照抄那份 html。
 
-【当前状态】
-- 上一轮在 Ubuntu 20.04 上做到 P0.5（算子可见性验收）通过。
-- 现在换到了 Ubuntu 24.04 新镜像，环境需要照 SETUP.md 重建一遍。
-- 24.04 是 glibc 2.39 / libstdc++ 13，**SETUP.md 附录 B 的 glibc 绕行整段跳过**，
-  但要先 `ldd --version` 和 `strings /usr/lib/aarch64-linux-gnu/libstdc++.so.6 | grep GLIBCXX_3.4.29`
-  确认一下再跳。
-- 权重需要重新下载（GLM-5.3-Flash FP8 官方权重 + DeepSeek-V4-Flash W8A8 冒烟用）。
+【当前状态（2026-08-28）】
+- **环境已在 Ubuntu 24.04 上重建完毕，P0.1–P0.6 + P0.8 全部 PASS**。
+  `source /mnt/workspace/y00359136/work/glm53_dev/env/env.sh` 之后用 `npy` 代替 `python` 即可干活。
+- 24.04（glibc 2.39）**确认不需要 SETUP.md 附录 B 的 glibc 绕行**；vendor `.so` 全部正常加载。
+- 两个模型权重都已下齐：`/mnt/workspace/models/{GLM-5.3-Flash, DeepSeek-V4-Flash-W8A8}`。
+- 下一步是 **P0.7a**。
 
 【接下来做什么】
-1. 照 SETUP.md 重建环境，跑通 probe/p0_5_ops.py（期望输出在 SETUP.md §7）。
-   同时复跑 probe/p0_6_shapes.py 和 p0_6_rope0.py —— 上一轮是在 torch_npu 2.7.1 上
-   跑的，2.10.0 上要重新确认。
-2. P0.7a 冒烟：DeepSeek-V4-Flash W8A8 起服务 + 单条推理。
-3. P0.7b 精度：GPQA-Diamond，non-thinking，repeat 3，多 batch 并发加速。
-   通过后 DSv4 权重可删（回收 275 GB）。
-4. 然后按 PLAN.md §3 往下走 P1 → P2 → P3 …
+✅ P0、P1 都已完成（环境 / 算子 / DSv4 冒烟 / GPQA 精度闭环 / rebase 到 `033446bb05`）。
+现在从 **P2 BF16 权重转换**开始，按 PLAN.md §3 往下走 P2 → P3 → P4 …
+
+⚠ 磁盘：DSv4 权重（275 GB）**决定保留**（它是唯一的端到端回归基准，P1.2 用的就是它）。
+P2 转完 BF16 后是 918 GB / 984 GB，**只剩 66 GB，转换期间要盯 `df`**。
+
+（若又换机重建环境：照 SETUP.md 走一遍，24.04 的差异集中在附录 D。）
 
 【工作方式（用户明确要求）】
 - **PLAN.md 是活文档**：每完成一步就在对应条目标 [x] PASS 或 [!] FAIL，
@@ -76,6 +75,7 @@ PLAN.md §2.6 的结论是：BF16 首次打通**不被任何算子硬卡住** �
 | **[SETUP.md](./SETUP.md)** | 环境搭建复现文档 | **换机第一件事**。照着做到「算子可见性验收」通过 |
 | **[PLAN.md](./PLAN.md)** | 活的计划 + 全部核实结论 | 环境好了之后。§2 算子结论，§3 阶段计划 |
 | `probe/` | 探测脚本 | `p0_5_ops.py` 验环境；`p0_6_*.py` 验算子 shape |
+| `launch_dsv4_a3.sh.example` | DSv4-Flash 起服务脚本（A3 TP16/DP16+DeepEP） | P0.7 冒烟 / 精度回归 |
 | `env.sh.example` | 环境变量模板 | 复制到 `$ROOT/env.sh` |
 | `GLM53_flash_ascend_support_assessment.html` | 最初的评估报告 | 参考。**若干判断已被推翻，见 PLAN.md §2.8** |
 
@@ -88,9 +88,13 @@ GPU 参考实现在 `upstream/xinyuan/glm-5.3-flash-support @ 0b9c38484e`（本�
 一期目标：**A3 单节点 TP16 / 纯文本 / BF16 打通 → W8A8(compressed-tensors) 闭环精度**。
 多模态、MTP、长上下文 CP 一期都不做。
 
-## 当前状态（2026-08-27）
+## 当前状态（2026-08-28）
 
-- **P0 环境**：Ubuntu 20.04 上验证到 P0.5 通过；**正在换 Ubuntu 24.04 重建**
-- **P0.7 冒烟 + GPQA 精度**：未做
+- **P0 环境**：✅ **Ubuntu 24.04 上重建完成，P0.1–P0.6 + P0.8 全 PASS**（glibc 绕行已不需要）
+- **P0.7a 冒烟**：✅ **PASS** —— DSv4-Flash W8A8 在 A3 TP16/DP16 + DeepEP 起服务并推理成功
+- **P0.7b GPQA 精度**：✅ **PASS** —— non-thinking 三轮 74.24 / 75.25 / 71.72，**均值 73.74%**（对标 73.23%）
+- **P1 分支合流**：✅ **完成** —— `glm53_dev` 已 rebase 到 GPU 参考实现 `033446bb05`（19 commit，2 处冲突），
+  rebase 后 GPQA 均值 73.23%（基线 73.74%，差 −0.50pp）
+- **→ 下一步 P2 BF16 权重转换**
 - **算子结论**：确认要开发 4 项、仍不确定 2 项、已排除 3 条路线 —— 详见 PLAN.md §2
 - **关键判断**：BF16 首次打通**不被任何算子硬卡住**（PLAN.md §2.6 决策表）

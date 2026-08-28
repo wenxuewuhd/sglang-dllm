@@ -1,0 +1,60 @@
+#!/bin/bash
+# P0.7a 冒烟：DeepSeek-V4-Flash W8A8，A3 单节点 TP16/DP16 + DeepEP
+# 权重是 compressed-tensors（config.json 自述），**不是** PR 里的 modelslim —— 已改。
+# 配方来自上游 PR sgl-project/sglang#25144（[NPU] Add Ascend NPU support for DeepSeek-V4），
+# 已按本机路径改写（toolkit 在 /home/developer，vendor 装在 $ROOT/opp_custom）。
+set -x
+source /mnt/workspace/y00359136/work/glm53_dev/env/env.sh
+
+export PYTHONNOUSERSITE=1
+export PYTHONPATH=$REPO/python:$PYTHONPATH
+
+# --- NPU runtime ---
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+export INF_NAN_MODE_FORCE_DISABLE=1            # 必须：否则 W8A8 溢出会产生 NaN
+export TASK_QUEUE_ENABLE=1
+export SGLANG_SET_CPU_AFFINITY=1
+
+# --- DeepEP ---
+export HCCL_BUFFSIZE=2000
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
+
+# --- DSV4 ---
+export IS_DEEPSEEK_V4=1
+export USE_FUSED_HC_PRE_ASCENDC=1
+export SGLANG_DSV4_NPU_FUSED_COMPRESSOR=1
+export SGLANG_DSV4_NPU_FUSED_COMPRESSOR_PREFILL=0
+
+# --- 跳过 GPU-only 分支（W8A8 权重没有 blockwise-FP8 scale）---
+export SGLANG_OPT_FP8_WO_A_GEMM=0
+export SGLANG_OPT_USE_OVERLAP_STORE_CACHE=False
+export FORCE_DRAFT_MODEL_NON_QUANT=1
+export SGLANG_DSV4_FP4_EXPERTS=False
+export SGLANG_OPT_FUSE_WQA_WKV=0
+export SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
+export SGLANG_OPT_USE_FUSED_HASH_TOPK=False
+export SGLANG_OPT_USE_TILELANG_MHC_PRE=False
+export SGLANG_OPT_DEEPGEMM_HC_PRENORM=False
+export SGLANG_OPT_USE_TILELANG_MHC_POST=False
+
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+ulimit -n 65536
+
+PORT=${PORT:-30000}
+
+exec $VENV/bin/python -m sglang.launch_server \
+    --model-path /mnt/workspace/models/DeepSeek-V4-Flash-W8A8 \
+    --trust-remote-code \
+    --device npu --attention-backend dsv4 \
+    --quantization compressed-tensors --kv-cache-dtype auto \
+    --tp-size 16 --dp-size 16 --enable-dp-attention --enable-dp-lm-head \
+    --moe-a2a-backend deepep --deepep-mode auto \
+    --page-size 128 --max-running-requests 16 \
+    --mem-fraction-static 0.65 \
+    --disable-radix-cache --chunked-prefill-size -1 \
+    --disable-overlap-schedule --skip-server-warmup \
+    --watchdog-timeout 9000 \
+    --cuda-graph-bs 1 2 4 \
+    --host 127.0.0.1 --port ${PORT}

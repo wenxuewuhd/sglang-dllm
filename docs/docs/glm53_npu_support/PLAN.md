@@ -1,7 +1,7 @@
 # GLM-5.3-Flash 昇腾 (Atlas A3 / Ascend910_9362) 适配计划
 
 > 活文档。每完成一步就在对应条目标 `[x] PASS` 或 `[!] FAIL`，FAIL 的直接在本文件改计划。
-> 最后更新：2026-08-27
+> 最后更新：2026-08-28
 
 ---
 
@@ -17,6 +17,7 @@
 | 多模态 (ViT/video) | 一期**不做** | 2026-08-27 |
 | MTP / NextN | 一期**不做** | 2026-08-27 |
 | 长上下文 CP | 一期**不做**，只承诺 32K | 2026-08-27 |
+| DSv4 权重何时删 | **保留到 P1.2 做完再删**（保住端到端回归判据） | 2026-08-28 |
 
 ---
 
@@ -28,8 +29,10 @@
   - ⚠ 2026-08-27 修正：初版按 A2/910B 判断，错误。所有 sgl-kernel-npu 包必须选 **a3** 档
 - **16 × Ascend910 die**（npu-smi: 8 NPU × 2 chip），每 die **64 GB HBM** → 合计 1024 GB
 - CPU **320 核**，内存 **1.8 TB**
-- 磁盘 `/mnt/workspace` 984 GB 总量 / **677 GB 可用**（306 GB 已被 FP8 权重占用）
-  - 其他挂载：`/usr/.devenv` 465 GB 可用、`/home` 179 GB 可用
+- **OS：Ubuntu 24.04.3 / glibc 2.39 / libstdc++ 13**（2026-08-28 换镜像，此前是 20.04 / glibc 2.31）
+- 磁盘 `/mnt/workspace` 984 GB 总量 / **402 GB 可用**（GLM FP8 306 GB + DSv4 W8A8 275 GB 已占）
+  - P0.7b 通过删掉 DSv4 后回收到 **677 GB**，够 P2 的 BF16（643 GB）
+  - 其他挂载：`/usr/.devenv` 466 GB 可用、`/home` 182 GB 可用
 
 ### CANN（关键：标称与实际不一致）
 - `ascend_toolkit_install.info` 写 `version=9.2.0`，路径 `/home/developer/Ascend/cann-9.2.0`
@@ -38,10 +41,10 @@
 - → **本机等价于 CANN 9.1.0。"9.2 还是 9.1" 这个问题不存在，我们就在 9.1.0 上。**
 - driver 在 `/usr/local/Ascend/driver`；toolkit 在 `/home/developer/Ascend/ascend-toolkit/`
 - **`opp/vendors/` 初始为空** → `torch.ops.custom.*` 全部缺失。已通过 `--install-path` 装到独立目录 `opp_custom/` 解决（不污染共享 toolkit）
-- ⚠ **glibc 门槛**：sgl-kernel-npu 的预编译 `.so` 需 **GLIBC ≥ 2.34 + GLIBCXX ≥ 3.4.29**（CI 用 Ubuntu 22.04 编）。
-  - 与 CANN 版本**无关** —— `cann9.0.0` 档实测同样需要 2.32/2.34
-  - Ubuntu 20.04（glibc 2.31）上需附录 B 的独立 loader 绕行（已验证可行）
-  - **Ubuntu 24.04（glibc 2.39 / libstdc++ 13）无此问题**
+- ✅ **glibc 门槛已消失**：sgl-kernel-npu 的预编译 `.so` 需 **GLIBC ≥ 2.34 + GLIBCXX ≥ 3.4.29**（CI 用 Ubuntu 22.04 编）。
+  - 20.04（glibc 2.31）上需 SETUP.md 附录 B 的独立 loader 绕行（已验证可行）
+  - **2026-08-28 实测：24.04（glibc 2.39）上整段不需要** —— 两个 `.run` 直接 SUCCESS（无 `--force`），
+    `.so` 全部正常 dlopen，`import attentions` 也由 FAIL 变 OK
 - ⚠ 修正：系统 python3.11 里**已装 torch 2.7.1+cpu / torch_npu 2.7.1.post4**，`source /home/developer/Ascend/ascend-toolkit/set_env.sh` 后可 import，`device_count=16`。
   → **现在就能做运行时算子探测**，不必等新 venv。（初版写"torch_npu 未安装"，是漏了 set_env.sh）
 
@@ -71,8 +74,9 @@
   - 与我们 18 个文件的**重叠只有 10 个** → rebase 可行
 - commit message 标注：verified on 4×GB300 (TP4/EP4) 与 8×H100 (TP8/EP8)
 
-### 权重
+### 权重（2026-08-28 已重新下载完毕，两个模型 shard 数与 index.json 全对得上）
 `/mnt/workspace/models/GLM-5.3-Flash`，62 个 safetensors，306 GiB
+`/mnt/workspace/models/DeepSeek-V4-Flash-W8A8`，46 个 safetensors，275 GiB（P0.7 冒烟/精度用，通过后删）
 
 | dtype | 体积 | tensor 数 |
 |---|---|---|
@@ -100,7 +104,8 @@
 > 本章只讲算子。每条给**明确结论**；证据不足的一律标 **❓不确定**，并写清用什么动作消解。
 > 证据来源：CANN 9.1.0 组件的 aclnn 头 / op-info json / AscendC 源码 / `libopapi_transformer.so` 字符串表；
 > `torch_npu 2.7.1.post4` 运行时签名与实跑；本仓库昇腾代码；GPU 参考实现 `0b9c38484e`。
-> ⚠ 运行时探测跑在 torch_npu **2.7.1**，目标是 **2.10.0**。P0 venv 建好后需复跑。
+> ✅ 2026-08-28：`probe/p0_5_ops.py` / `p0_6_shapes.py` / `p0_6_rope0.py` 已在目标环境
+> **torch_npu 2.10.0.post4 + Ubuntu 24.04** 上复跑，A1 / C4 结论与 2.7.1 一致，无变化。
 
 ### 2.1 一条方法论前提（影响很多结论）
 
@@ -108,9 +113,9 @@
 
 | 来源 | 命名空间 | 本机状态 |
 |---|---|---|
-| torch_npu 原生 | `torch_npu.npu_*` | ✅ 已装（2.7.1.post4） |
-| CANN vendor 自定义算子包 | `torch.ops.custom.*` | ❌ **未装**（`opp/vendors/` 空）→ P0.3 |
-| sgl-kernel-npu python 包 | `sgl_kernel_npu.*` | ❌ **未装** → P0.3 |
+| torch_npu 原生 | `torch_npu.npu_*` | ✅ 已装（**2.10.0.post4**） |
+| CANN vendor 自定义算子包 | `torch.ops.custom.*` | ✅ 已装到 `$ROOT/opp_custom/vendors/`（P0.3 PASS） |
+| sgl-kernel-npu python 包 | `sgl_kernel_npu.*` | ✅ 已装（2026.6.1，P0.3 PASS） |
 
 **本仓库的昇腾 KDA / DSA 路径主要走后两者，不走 torch_npu 原生。**
 所以"某个 `torch_npu.npu_xxx` 不支持某特性"**不能**直接推出"这是缺口"。
@@ -120,7 +125,7 @@
 | # | 算子 / 能力 | 结论 | 证据 |
 |---|---|---|---|
 | A1 | **NoPE MLA 的 attention core** | ✅ **实测可跑**。`npu_fused_infer_attention_score` 接受 `qk=256/v=256/N=64`（prefill 形态，→`[1,64,256,256]`）与 `kv_lora=512 + rope=0/N=64`（MLA-absorbed decode，→`[1,64,1,512]`） | 本机实跑，`probe/p0_6_shapes.py` |
-| A2 | **稀疏 attention 的 rope 可选** | ✅ 签名确认：`npu_sparse_flash_attention(..., Tensor? query_rope=None, Tensor? key_rope=None, ...)`。**rope=0 直接不传，不需要"传 64 维全零"的 workaround** | torch_npu 运行时 doc。⚠ 实现在 vendor 包，**尚未实跑** |
+| A2 | **稀疏 attention 的 rope 可选** | ✅ 签名确认：`npu_sparse_flash_attention(..., Tensor? query_rope=None, Tensor? key_rope=None, ...)`。**rope=0 直接不传，不需要"传 64 维全零"的 workaround** | torch_npu 运行时 doc。⚠ **仍未实跑**——vendor 包现已可加载（24.04），实跑这一条已无障碍，待补 probe |
 | A3 | **pooled-key 打分（KPool 的打分环节）** | ✅ **vendor 包已提供且我们已在用**：`torch.ops.custom.npu_quant_lightning_indexer(..., cmp_ratio=4, sparse_count=2048, sparse_mode=3)` 就在 DSv4 生产路径里 | `ascend_dsv4_backend.py:1002-1021` |
 | A4 | **KPool 的压缩写 cache** | ✅ vendor `torch.ops.custom.compressor` 已带 **fused norm + RoPE**，且 AscendC 实现（`AddApeToScore → ColumnSoftMax(逐 head-dim 列) → Mul → ColumnSum`）与 GLM 的 kernel **同构**。差异只有 norm 类型 → 见 B1 | `ascend_dsv4_backend.py:411-430`；AscendC `compressor/arch22/` |
 | A5 | **mHC pre / post** | ✅ 算子存在：`torch.ops.custom.npu_hc_pre` / `npu_hc_post`，DSv4 在用。GLM-5.3 侧只缺 dispatch 分支（**代码工作，非算子**） | `kernels/ops/layernorm/mhc.py:1605`；`models/deepseek_v4.py:1713` |
@@ -138,14 +143,15 @@
 ### 2.4 不确定项的消解结果（2026-08-27 二次核实）
 
 **消解手段**：C1/C2 靠**读 wheel 里的 Python/Triton 源码**（不需要执行）；C4 靠**运行时实跑**（torch_npu 2.10 已可用）；
-C3/C5 依赖 vendor 包，被 GLIBC 挡住（见 §1 环境）。
+C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可加载 → 两条都已具备实跑条件**（尚未跑）。
 
 | # | 问题 | **结论** | 证据 |
 |---|---|---|---|
 | C1 | K=4 stateful causal conv1d 缺不缺 | ✅ **不缺，解决**。`sgl_kernel_npu.mamba.causal_conv1d` 是 **triton-ascend** kernel，`KERNEL_WIDTH` 是 `tl.constexpr`，**1/2/3/4/5/6 全有显式分支**（`==4` 在 363-400 与 444-458 两处），`width, _ = weight.shape` 从权重读，非硬编码 | `sgl_kernel_npu/mamba/causal_conv1d.py:66,387,449,550` |
 | C2 | featurewise-gate KDA 缺不缺 | ✅ **不缺，解决**。`fused_kda_gate_npu(gate, A_log, head_dim, gate_bias, lower_bound)`：`gate` 是 `[tokens, heads*head_dim]` 的**逐通道** gate（`heads=A_log.numel()`，`heads*head_dim==hidden` 有断言），`gate_bias.numel()==hidden` 也是逐通道，且**带 `lower_bound` 参数**。与 GLM 的 `f_b_proj→[T,64*128]` + `dt_bias[8192]` + `gate_lower_bound=-5.0` 完全对得上。prefill 侧 `chunk_gla_fwd_o_gk_npu` 的 `gk` 也是逐通道命名 | `sgl_kernel_npu/fla/kda_gate.py:74-94`、`fla/kda_prefill.py:295` |
 | C4 | `npu_kv_rmsnorm_rope_cache_v2` 支持 rope=0 吗 | ❌ **不支持，解决**。**实跑验证**：`rope=64` 时 v1/v2 都 [OK]；`rope=0`（cos/sin/k_cache 传 0 宽）时 v1/v2 **都 RuntimeError**。→ D2 拆 `rmsnorm + reshape_and_cache` 是确定要做的活 | `probe`，`aclnnKvRmsNormRopeCache*` 报错 |
-| C3 | `MlaPreprocess` 的 `rope_dim=0` 是否合法 | ⏸ **仍不确定，但已降级**。`mla_preprocess` **不在 `torch.ops.npu` 里**（torch_npu 2.10 无此绑定），它来自 vendor 包 → 被 GLIBC 挡住，现在探不了。**但它是性能项**（`SGLANG_NPU_USE_MLAPO` 默认关），不阻塞 BF16 打通 | `torch.ops.npu` 无 `mla_preprocess`；`mla_preprocess.py:386` 调 `torch.ops.npu.mla_preprocess` |
+| C3 | `MlaPreprocess` 的 `rope_dim=0` 是否合法 | ⏸ **仍不确定，但已降级**。`mla_preprocess` **不在 `torch.ops.npu` 里**（torch_npu 2.10 无此绑定），它来自 vendor 包 → 被 GLIBC 挡住，现在探不了。**但它是性能项**（`SGLANG_NPU_USE_MLAPO` 默认关），不阻塞 BF16 打通。
+⚠ 2026-08-28：GLIBC 障碍已消失，vendor 包可加载，这条**现在可以探了** | `torch.ops.npu` 无 `mla_preprocess`；`mla_preprocess.py:386` 调 `torch.ops.npu.mla_preprocess` |
 | C5 | 分组 top-k 是否要自研 | ⏸ **很可能不用，但要跑起来才能确认**。`aclnnQuantLightningIndexer` 有 `cmpRatio` + `sparseCount` + `sparseIndicesOut/sparseValuesOut`，且我们 DSv4 路径已用 `cmp_ratio=4`。**未确证的一点**：`cmp_ratio=4` 时 `sparseIndicesOut` 返回的是 **pool 下标**还是 **raw token 下标**。DSv4 是 compress-then-attend（拿到就直接喂 `cmp_ratio=4` 的 sparse attn，不展开），GLM 是 pool-score-then-expand（要展开回 raw token） | `aclnn_quant_lightning_indexer.h`；`ascend_dsv4_backend.py:1013-1021` |
 
 ### 2.4.1 vendor 包的算子分布（2026-08-27 实测解包）
@@ -160,7 +166,7 @@ C3/C5 依赖 vendor 包，被 GLIBC 挡住（见 §1 环境）。
 
 → **mHC 的 `hc_pre`/`hc_post` 确认为 A3 编译**（A5 结论坐实）。
 → **A5-only（有头文件但无 a3 kernel）**：`indexer_compress_epilog`、`kv_compress_epilog`、`moe_init_routing_group_quant`、`partial_rotary_mul_quant`、`swiglu_group_quant`。
-→ ⚠ **但这三个包的 `.so` 在本机全部因 GLIBC 无法 dlopen**（已实测，见 §1）。
+→ ✅ **2026-08-28 起三个包的 `.so` 在 24.04 上全部正常 dlopen**（此前 20.04 因 GLIBC 全部失败）。
 
 ### 2.5 已排除的路线（不要再走）
 
@@ -223,9 +229,12 @@ C3/C5 依赖 vendor 包，被 GLIBC 挡住（见 §1 环境）。
 
 ## 3. 阶段计划
 
-### P0 · 环境搭建 ✅ 基本完成（详细步骤见 [SETUP.md](./SETUP.md)）
+### P0 · 环境搭建 ✅ 已在 Ubuntu 24.04 上完整复现（详细步骤见 [SETUP.md](./SETUP.md)）
 
-- [x] **P0.1 PASS** Python 3.12.14 venv
+> 下列条目均为 **2026-08-28 在 24.04 / torch_npu 2.10.0.post4 上重跑通过**的结果。
+> `ROOT=/mnt/workspace/y00359136/work/glm53_dev/env`（与代码仓库同级）。
+
+- [x] **P0.1 PASS** Python 3.12.9 venv（24.04 系统自带，不再需要 uv）
 - [x] **P0.2 PASS** torch **2.10.0+cpu** + torch_npu **2.10.0.post4**，`device_count=16`，`Ascend910_9362`，NPU bf16 matmul 通过
 - [x] **P0.3 PASS** sgl-kernel-npu `20260826` 三件套（**cann9.1.0-a3-aarch64 / py312**）+ triton-ascend **3.2.2**
 - [x] **P0.4 PASS** 未执行 `pip install -e python/`（会装 CUDA 变体顶掉 torch_npu），走 `PYTHONPATH`
@@ -234,18 +243,108 @@ C3/C5 依赖 vendor 包，被 GLIBC 挡住（见 §1 环境）。
       - KDA/conv1d **6/6 可导入**：`causal_conv1d_fn_npu`、`causal_conv1d_update_npu`、`fused_kda_gate_npu`、`chunk_gla_fwd_o_gk_npu`、`chunk_gated_delta_rule_fwd_h_npu`、`kda_target_verify_npu`
       - 三项已确认不阻塞：`attentions`（只被 diffusion 用）、`deep_ep`（只被 DeepEP 分发用，**TP16+EP 阶段要回头解决**）、`torch.ops.custom.npu_mla_prolog_v3`（融合 prolog 默认关，且 `torch_npu.npu_mla_prolog_v3` 原生存在）
 - [x] **P0.6 部分 PASS**（`probe/p0_6_shapes.py`、`probe/p0_6_rope0.py`）：见 §2.6
-- [ ] **P0.7 出口判据（两级，未做）**：
-  - [ ] P0.7a 冒烟：DeepSeek-V4-Flash W8A8 起服务 + 单条推理（验 mHC + compressor + compressed-tensors 三条路）
-  - [ ] P0.7b 精度：GPQA-Diamond，**non-thinking**，**repeat 3**，**多 batch 并发**
-  - 执行方式：派 agent，不占主上下文
-- [ ] **P0.8 换机后需重做**：本节全部步骤照 SETUP.md 重跑；**Ubuntu 24.04 上可跳过附录 B 的 glibc 绕行**
+      - **2026-08-28 在 torch_npu 2.10 上复跑，结论与 2.7.1 一致**：
+        `FIA GLM 512+0/N=64` → `[1,64,1,512]` OK；`FIA GLM 256/256 N=64` → `[1,64,256,256]` OK（A1 坐实）；
+        `rope=0` 的 `npu_kv_rmsnorm_rope_cache` v1/v2 **仍双双 RuntimeError**（C4 坐实 → D2 必做）
+      - ⚠ 新观察（**未定性**）：`FIA DSv3 512+64 / N=128` 在 2.10 上 **FAIL**（`aclnnFusedInferAttentionScoreV3` err 561002）。
+        2.7.1 上是否通过**没有留下记录**，所以**不能断言是回归**。GLM 走的是 `N=64 / rope=0`，
+        且 TP16 下每 die 只有 8 头，**不在关键路径**；等 P0.7a DSv4 冒烟时自然会被覆盖到
+- [x] **P0.8 PASS** 换机重做：Ubuntu 24.04 上 P0.1–P0.6 全部重跑通过，**附录 B 的 glibc 绕行整段跳过**
+      （glibc 2.39 / GLIBCXX_3.4.29 已确认；两个 `.run` 无需 `--force`）。24.04 差异见 SETUP.md 附录 D
+- [x] **P0.7a PASS** 冒烟：DeepSeek-V4-Flash W8A8 在 **A3 单节点 TP16/DP16 + DeepEP** 起服务成功
+      （`launch_dsv4_a3.sh.example`）。`/health_generate` 200，`/generate` 与 `/v1/chat/completions`
+      都返回非空且连贯的文本。权重 **28.08 GB/die**（16 个 rank 一致），NPU graph 捕获通过。
+      > DP-attention 下每个 rank 各存一份 attention/dense 权重，所以比纯 TP16 不开 DP 时
+      > （18.45 GB/die）高。两者不可直接比。
+      - 配方来自上游 PR [sgl-project/sglang#25144](https://github.com/sgl-project/sglang/pull/25144)
+        （`[NPU] Add Ascend NPU support for DeepSeek-V4`，已合入 main），按本机路径改写
+      - ⚠ **与 PR 的唯一实质差异：`--quantization compressed-tensors`，不是 PR 的 `modelslim`**。
+        我们这份 modelscope 权重的 `config.json` 自述 `quant_method=compressed-tensors`，
+        照抄 PR 的 `modelslim` 会被 SGLang 直接拒绝启动（"Quantization method specified in the
+        model config (compressed-tensors) does not match ... (modelslim)"）
+      - ⚠ 这套配置**不是** A2 那份单卡 KT CPU offload 教程（`deepseek_v4_flash.mdx`）。
+        A3 有 16×64 GB HBM，275 GB 权重直接放得下，**不需要 KT CPU 卸载**
+- [x] **P0.7b PASS** 精度：GPQA-Diamond，**non-thinking**，**3 轮**，并发 16（DP16 → 每 rank 1）
 
-> DSv4 W8A8 权重此前因 `-rw-r-----` 权限读不了，需 owner `chmod -R a+rX`。P0.7b 通过后可删（回收 275 GB）。
+      | 轮 | 分数 | 用时 |
+      |---|---|---|
+      | 1 | **74.24%**（147/198） | 709 s |
+      | 2 | **75.25%**（149/198） | 703 s |
+      | 3 | **71.72%**（142/198） | ~700 s |
+      | **均值** | **73.74%**（样本 SD 1.82 pp） | |
 
-### P1 · 分支合流 ☐
-- [ ] P1.1 把 18 个 NPU commit rebase 到 `0b9c38484e`（冲突面 10 个文件）
-- [ ] P1.2 **出口判据**：新 base 上 DSv4-Flash 回归通过
-> 注意：697-commit 窗口里 `ascend_dsv4_backend.py` 被改了 1187/2179 行，`dsv4_allocator/memory_pool/common_hooks` 全部重构，新增 `extra_ops_loader.py`。这些文件我们没动过，不会冲突，但行为要重验。
+      - 对标口径 **73.23%**（PR#25144 与 `deepseek_v4_flash.mdx` 一致）→ **差 +0.51 pp，完全在噪声内**
+      - 198 题在 temperature=1 下单轮二项标准误约 ±3.2pp，所以**只看均值**；三轮之间统计上不可区分
+      - 工具：EvalScope（`gpqa_diamond`），`temperature=1 / top_p=1 / max_tokens=32768`，
+        thinking 通过 `extra_body.chat_template_kwargs={"thinking": False}` 关闭；0 个请求错误
+      - 脚本在 `$ROOT/eval/`（`run_gpqa.py` + `run_all.sh`），用**独立的 `.venv-eval`**，
+        没有污染 `.venv-glm53`
+
+> **✅ P0 全部完成。** 环境、算子、DSv4 冒烟与精度闭环都通过，可以进 P1。
+
+> DSv4 W8A8 权重 2026-08-28 已重新下齐（46 shard，275 GiB，owner 即本用户，无权限问题）。P0.7b 通过后可删（回收 275 GB）。
+
+### P1 · 分支合流 ✅ 完成
+
+**参考实现已更新（2026-08-28 重新 fetch）**：上游 PR [#36507 `GLM-5.3-Flash support`](https://github.com/sgl-project/sglang/pull/36507)
+**仍未合入 main**（open，非 draft），分支 `xinyuan/glm-5.3-flash-support` 头已从我们快照的
+`0b9c38484e`(08-26) 前进到 **`033446bb05`(08-27)**，145 文件 / +16702 −836。
+本地已 fetch 并打 tag **`glm53-gpu-ref-033446bb`**。
+
+- [x] **P1.1 试跑通过**（2026-08-28，在隔离 worktree `../rebase-trial` / 分支 `p1-rebase-trial`，
+      **`glm53_dev` 未动**）：`git rebase --onto 033446bb05 eea2e5d6e5`，19 个 commit 全部重放成功。
+      - **只有 2 个冲突**（远少于预期）：
+        1. `layers/moe/hash_topk.py` —— 上游新增了 `_is_xpu` 分支，我们加的是 `not _is_npu` 护栏。
+           **两边都要**，解成 `if _is_xpu: ... elif ...FUSED_HASH_TOPK.get() and not _is_npu:`。
+           ⚠ 核实过：新 base 里 **`fused_hash_topk_npu` 并不存在**（PR#25144 的描述提到它，但没落地），
+           所以我们的 `not _is_npu` 护栏**仍然必要**
+        2. `models/deepseek_v4.py` —— 上游把 `self.rope_scaling` 就地改写换成了
+           `active_rope_scaling` 副本，且只在 `compress_ratio in (4,128)` 时才设 `deepseek_yarn`；
+           我们的改动是 NPU 上把 `rotary_emb` 置 None 省 ~1.25 GiB HBM。
+           解法：**采用上游的 `active_rope_scaling` 逻辑 + 保留我们的 NPU None 护栏**
+      - `server_args.py` **自动合并且结果正确**：我们的 `kt_expert_placement_strategy` /
+        `kt_activation_freq_path` 落在了新的声明式风格里，`NS("exec.moe")` 命名空间与上游自带的
+        `kt_num_gpu_experts` 一致。原先担心的 #36255 重构**没有造成实际返工**
+      - 验证：18 个改动文件 **0 语法错误、0 残留冲突标记**；`import sglang` +
+        `import http_server` 通过；`ServerArgs` 构造出来 kt-* 三个参数取值正确
+      - ⚠ **尚未验证运行时行为** —— 那是 P1.2
+- [x] **P1.1b PASS** 已 promote 到 `glm53_dev`（2026-08-28，P1.2 回归通过之后才做）：
+      `glm53_dev` 现在是 **`033446bb05` + 19 个 NPU commit**。
+      - 回退用：本地 tag **`glm53_dev-pre-p1-rebase`** = 旧 head `a6be0fe83b`，
+        且 `origin/glm53_dev` **尚未 push**，仍指向旧 head → 两条回退路都在
+      - GPU 参考实现 tag：`glm53-gpu-ref-033446bb`
+- [x] **P1.2 PASS** 出口判据：新 base 上 DSv4-Flash 回归通过
+
+      | | round1 | round2 | round3 | 均值 | SD |
+      |---|---|---|---|---|---|
+      | P0.7b 基线（旧 base） | 74.24% | 75.25% | 71.72% | **73.74%** | 1.82pp |
+      | P1.2（rebase 到 `033446bb05`） | 75.76% | 73.74% | 70.20% | **73.23%** | 2.81pp |
+
+      **差 −0.50 pp，在噪声内**（单轮二项 SE ≈ ±3.2pp），均值正好等于公开口径 73.23%。
+      服务启动、`/generate`、`/v1/chat/completions` 均正常；权重 **28.17 GB/die**
+      （旧 base 28.08，差 0.09 = 噪声，**无内存回归**）
+      - 回归基线就是 P0.7b 这三轮：**均值 73.74%**（74.24 / 75.25 / 71.72，SD 1.82pp）。
+        新 base 上重跑 3 轮，均值落在 **约 70.5–77.0%**（±1.8pp 左右）即算不回归；
+        ⚠ 别拿单轮下结论
+      - **DSv4 权重要留到这一步做完才能删**（§0 决策）
+
+**实测冲突面：只有 8 个代码文件重叠**（其余 7 个 NPU 文件上游没碰，应当干净）：
+
+| 文件 | 我们 | 上游 | 风险 |
+|---|---|---|---|
+| `server_args.py` | 22+/2− | **2256+/1189−** | **高**（见下） |
+| `models/deepseek_v4.py` | 52+/10− | 769+/106− | 中 |
+| `models/deepseek_v2.py` | 13+/1− | 100+/48− | 低 |
+| `moe/hash_topk.py` | 6+/1− | 37+/2− | 低 |
+| `moe/kt_ep_wrapper.py` | 470+/42− | 5+/2− | 低（几乎全是我们的） |
+| `moe/fused_moe_triton/layer.py` | 27+/1− | 7+/4− | 低 |
+| `utils/hf_transformers/common.py` | 20+/1− | 45+/3− | 低 |
+| `test/registered/moe/test_hash_topk.py` | 27+/0− | 1+/1− | 低 |
+
+> ⚠ **`server_args.py` 的高churn 是有原因的**：`0b9c38484e..033446bb05` 的增量里合了
+> main 的 **[#36255 `config: ServerArgs holds the raw input`](https://github.com/sgl-project/sglang/pull/36255)** ——
+> ServerArgs 改成了「声明式 resolution」模型。我们那 22 行 kt-* 参数**不能直接 rebase 过去，要按新模型重写**。
+> 动手前先读 `sglang-runtime-context` skill（仓库里有）。
 
 ### P2 · BF16 权重 ☐
 - [ ] P2.1 写逐 shard 反量化脚本（`weight_block_size=[128,128]`）
@@ -268,6 +367,21 @@ C3/C5 依赖 vendor 包，被 GLIBC 挡住（见 §1 环境）。
 ### P4 · BF16 端到端 ☐
 - [ ] P4.1 TP16 / 32K / 纯文本 / 关 NPU Graph / 关 MTP / 关 CP 启动
 - [ ] P4.2 **出口判据**：GSM8K 对齐 CPU golden 与 GPU 分支公开口径
+      - **GPU 公开口径已找到**（PR#36507 分支里的 cookbook，`docs/src/snippets/configs/zai-org/glm-5.3-flash-benchmarks.jsx`）：
+        **GSM8K 97.50%**，全 1319 题，stop rate 100%，4×GB300 TP4/EP4
+      - ✅ **权重版本已核实对上**（2026-08-28）：该数字绑定 `zai-org/GLM-5.3-Flash` revision
+        **`c5b82b63e37b`**，本地这份与之 **71/71 文件齐全、62/62 个 safetensors 分片 size 逐个一致**
+        （合计 328.34 GB 双方相同）。本地多出的 `LICENSE`/`configuration.json` 是 modelscope 自己加的。
+        证据：`hf-mirror.com` 的 `/api/models/.../revision/c5b82b63e37b` + `paths-info`。
+        ⚠ 口径说明：这是**文件清单 + 逐分片 size** 比对，**不是 sha256 校验**
+      - ⚠ **97.50% 是 thinking 打开测的**，别拿 non-thinking 去比。cookbook 里的原始命令：
+        ```
+        sgl-eval run gsm8k --base-url http://HOST:PORT/v1 --model zai-org/GLM-5.3-Flash \
+          --num-threads 64 --max-tokens 32768 --temperature 1.0 --top-p 0.95 --thinking
+        ```
+        （`pip install git+https://github.com/sgl-project/sgl-eval`）
+      - ⚠ cookbook 的 speed 数字是带 `SGLANG_SIMULATE_ACC_LEN=3` 跑的，**只能当吞吐口径，不能用来对精度**
+        （cookbook 自己也这么写：“Never run accuracy against it”）
 
 ### P5 · W8A8 compressed-tensors ☐
 - [ ] P5.1 llm-compressor recipe：weight per-channel + act per-token **dynamic**（静态会被 raise）
@@ -300,8 +414,13 @@ C3/C5 依赖 vendor 包，被 GLIBC 挡住（见 §1 环境）。
 ## 4. 待补 / 待决
 
 - [x] ~~算子缺口核实~~ → 已完成，见 §2.5，已并入 P6
-- [ ] DSv4 W8A8 权重格式确认（compressed-tensors？）
-- [ ] P5 之后磁盘怎么排：BF16(643) + W8A8(333) = 976 GB / 984 GB，只剩 8 GB。可能要把 W8A8 写到 `/usr/.devenv`
+- [x] ~~DSv4 W8A8 权重格式确认~~ → **compressed-tensors**（config.json 自述，且 SGLang 会拒绝 `--quantization modelslim`）
+- [x] ~~核实本地 GLM-5.3-Flash 权重版本~~ → **对上了** revision `c5b82b63e37b`（71/71 文件 + 62/62 分片 size 一致；非 sha256 校验）
+- [x] ~~P0.7b 后是否立刻删 DSv4 权重~~ → **不删，保留到 P1.2 做完**（2026-08-28 用户决策）。
+      磁盘账：DSv4 275 + BF16 643 = **918 GB / 984 GB，余 66 GB**。P2 是逐 shard 转完即删源，
+      峰值不超过这个数，可行但余量紧 —— **P2 期间要盯着 `df`**
+- [ ] P5 之后磁盘怎么排：删掉 DSv4 后 BF16(643) + W8A8(333) = 976 GB / 984 GB，只剩 8 GB。
+      可能要把 W8A8 写到 `/usr/.devenv`（466 GB 可用）
 
 ---
 
@@ -322,3 +441,23 @@ C3/C5 依赖 vendor 包，被 GLIBC 挡住（见 §1 环境）。
 | 2026-08-27 | P0.3 曾因 GLIBC 2.32/2.34 阻塞（Ubuntu 20.04 / glibc 2.31）。LD_PRELOAD shim 验证无效（verneed 指名 libc.so.6）；**用独立解包的 glibc 2.35 loader 解决**，vendor `.so` 全部加载成功 |
 | 2026-08-27 | **P0.3 / P0.4 / P0.5 PASS**。9/10 custom 算子 + 6/6 KDA kernel 可用。triton-ascend 必须 3.2.2 且 `--no-deps` |
 | 2026-08-27 | 新增 [SETUP.md](./SETUP.md) 复现文档 + `probe/` 探测脚本 + `env.sh.example`。**下一步换 Ubuntu 24.04 镜像重建**（可跳过 glibc 绕行） |
+| 2026-08-28 | **换 Ubuntu 24.04 镜像，环境从零重建完毕**：P0.1–P0.6 全部重跑通过，**P0.8 PASS**。附录 B 的 glibc 绕行确认整段不需要 |
+| 2026-08-28 | 24.04 上的新坑：**pip 26 不读 `~/.pip/pip.conf`**，不带 `-i` 会静默回落 pypi.org 挂死；**`pybind11` 必须显式装**否则 KDA/conv1d 6/6 import FAIL。已写入 SETUP.md §3 与附录 D |
+| 2026-08-28 | **P0.5 在 2.10 上更好**：`import attentions` 由 FAIL 变 OK；仍 FAIL 的只剩 `deep_ep`（`deep_ep_cpp`，TP16+EP 阶段再解） |
+| 2026-08-28 | **P0.6 在 torch_npu 2.10 上复跑，A1/C4 结论不变**。新观察：`FIA 512+64/N=128` 在 2.10 FAIL（err 561002），因 2.7.1 无记录**不定性为回归**，且不在 GLM 关键路径 |
+| 2026-08-28 | GLIBC 障碍消失的连带影响：§2.4 里 **C3 / C5 两条"被 GLIBC 挡住"的探测现在都可以实跑了**（尚未跑）；A2 的实跑同理已无障碍 |
+| 2026-08-28 | ROOT 迁到 `/mnt/workspace/y00359136/work/glm53_dev/env`（与代码仓库同级）；`env.sh.example` 换成 24.04 实跑版 |
+| 2026-08-28 | **P0.7a PASS**：DSv4-Flash W8A8 在 A3 **TP16/DP16 + DeepEP** 起服务并推理成功。落盘 `launch_dsv4_a3.sh.example` |
+| 2026-08-28 | **deep_ep 修好了**（此前一直标"TP16+EP 阶段再解"）：不是 GLIBC，是 wheel 的**打包 bug** —— `deep_ep/__init__.py` 写的是**顶层** `from deep_ep_cpp import Config`，而 `.so` 装在 `deep_ep/` 包目录里。往 site-packages 放一个指向该目录的 `.pth` 即可。**至此 P0.5 的 21 项只剩 `npu_mla_prolog_v3` 一项 MISS（已知非阻塞）** |
+| 2026-08-28 | 发现上游 PR#25144 是 DSv4 昇腾支持的**权威配方**（含全套 env var 与精度口径）。其中 `INF_NAN_MODE_FORCE_DISABLE=1` 标注为**必须**，否则 W8A8 溢出产生 NaN —— 这条对 P5 的 GLM W8A8 同样适用，记在这里免得重踩 |
+| 2026-08-28 | 装 SGLang 依赖时发现新的"顶掉 torch"路径：`timm -> torchvision -> torch==2.13.0`（CUDA）。已用 constraints 文件锁死，写入 SETUP.md §8.2 |
+| 2026-08-28 | **P1 的 base 变了**：PR#36507 仍未合入 main，但分支头已从 `0b9c38484e` 前进到 **`033446bb05`**，已 fetch 并打 tag `glm53-gpu-ref-033446bb`。实测冲突面**只有 8 个代码文件**，其中只有 `server_args.py` 是高风险（增量里合入了 #36255 的 ServerArgs 声明式重构，我们的 kt-* 参数要按新模型重写） |
+| 2026-08-28 | **P4 出口判据有了公开对标数**：GPU 分支 cookbook 报 **GSM8K 97.50%**（全 1319 题 / stop rate 100% / 4×GB300 TP4-EP4），绑定权重 revision `c5b82b63e37b`。**已核实本地权重就是这一版**（71/71 文件 + 62/62 分片 size 一致，非 sha256） |
+| 2026-08-28 | **P0.7b PASS，P0 阶段全部完成**：GPQA-Diamond non-thinking 三轮 74.24 / 75.25 / 71.72，**均值 73.74%**（SD 1.82pp），对标 73.23% 差 +0.51pp，在噪声内。0 请求错误 |
+| 2026-08-28 | ⚠ 发现计划内部冲突：P1.2 判据要用 DSv4 回归，但原计划 P0.7b 后就删 DSv4 权重。**已决策：保留到 P1.2 做完再删**。磁盘账 918/984 GB，余 66 GB，P2 期间要盯 `df` |
+| 2026-08-28 | **P1.1 试跑通过**：19 commit rebase 到 `033446bb05` 只有 **2 个冲突**（`hash_topk.py` / `deepseek_v4.py`），都已解并说明理由；`server_args.py` 自动合并且正确，#36255 重构**没造成返工**。在隔离 worktree 做的，`glm53_dev` 未动 |
+| 2026-08-28 | **P1.2 PASS**：rebase 到 `033446bb05` 后 GPQA 三轮 75.76 / 73.74 / 70.20，**均值 73.23%**，对基线 73.74% 差 −0.50pp（噪声内）。权重占用 28.17 vs 28.08 GB/die，无回归 |
+| 2026-08-28 | ⚠ 更正一处早先记错的数：DP16 配方的权重占用是 **28.08 GB/die**（16 rank 一致），不是 18.45 —— 18.45 是**纯 TP16 不开 DP** 那次启动尝试的数，两者不可比（DP-attention 下每 rank 各存一份 attention/dense 权重） |
+| 2026-08-28 | **P1 完成**：`glm53_dev` 已 promote 到 `033446bb05` + 19 个 NPU commit。回退路径：tag `glm53_dev-pre-p1-rebase`（旧 head `a6be0fe83b`）+ 未 push 的 `origin/glm53_dev` |
+| 2026-08-28 | **纯 TP16 跑不通，是结构性约束不是 NPU bug**：`deepseek_v4.py:608` 的 `n_local_groups = n_groups // attn_tp_size`，DSv4-Flash `o_groups=8`，TP16 时 `8//16=0` → `o.view(T,0,-1)` 崩。**attention TP 上限是 8**，所以 PR#25144 必须用 DP16(attn_tp=1)+EP16。GLM-5.3 config 无 `o_groups`，**这条不会搬到 GLM** |
+| 2026-08-28 | 权重占用三档实测（同一权重、同一代码树）：DP16+EP16 **28.08 GB/die** / 纯 TP16 **20.39** / 纯 TP16 + `--context-length 32768` **18.45**。三者配置不同，**不可互相比较** |
