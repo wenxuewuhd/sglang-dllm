@@ -468,7 +468,11 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
 - [x] **P3.1a 已改**：`attention_registry.py` 的 `glm5_next_config` 分支加了 `_is_npu` 判断，
       路由到 `AscendKDAAttnBackend` / `AscendKDAHybridLinearAttnBackend`（照抄同文件 Kimi-K3 的写法）。
       **改动生效，服务能起来**，前向已经走到 KDA
-- [ ] P3.1b **发现布局契约不匹配（gate 张量）**：
+- [x] **P3.1b PASS 已修**（`_flat_kda_gate`，`ascend_kda_backend.py:122`）：按「最后一维是否已等于
+      `A_log.numel() * head_k_dim`」决定要不要 flatten。**不改算子、不增加运算量**
+      —— flatten 在 python 封装层，算子内部本来就会 `reshape(-1, shape[-1])`；且连续张量上
+      flatten/reshape 是纯视图操作。**实测生效**：KDA 的 gate 报错消失，前向推进到了 MLA
+- [x] ~~P3.1b 布局契约不匹配（gate 张量）~~ 详情：
       `ascend_kda_backend.py:365` 传的是 `g.flatten(-2)`，那是 Kimi 的 4-D 布局
       `[..., heads, head_dim]`；但 **GLM 传进来的 `forget_gate` 已经是 flat 的**
       —— prefill 下是 `[1, T, heads*head_dim]`（`glm5_next.py:577` 的 `unsqueeze(0)`），
@@ -490,6 +494,10 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
         `out_norm_weight` 折叠，而 `npu_hc_pre` 返回 `norm_fused=False`（norm 要调用方自己做）。
         这正是本条原来标的风险点，要配 HF golden（`Glm5NextTextHyperConnection`）逐项核
 - [ ] P3.3 **NoPE MLA**：拆 `npu_kv_rmsnorm_rope_cache` + 20 处 split 早退 + KV buffer 二元组语义 + `trans_rope_weight` assert
+      - **实测已撞到 D3 的第一处**：`npu/modules/deepseek_v2_attention_mla_npu.py:368`
+        无条件访问 `m.rotary_emb.is_neox_style`，而 GLM 的 `qk_rope_head_dim=0` 根本没建 rope 模块
+        → `AttributeError: 'NoneType' object has no attribute 'is_neox_style'`
+      - 这是**当前 GLM BF16 前向的最前沿阻塞点**
 - [ ] P3.4 **kpool indexer**：解掉 `kpool_fp8_index.py:588` 与 `dsa_indexer_kpool.py:1766` 的非 CUDA 硬拦，用 `torch.topk` 打通 `group_topk=512`
 - [ ] P3.5 **出口判据**：四个模块逐层 golden 对齐
 
@@ -660,3 +668,4 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
 | 2026-08-28 | **P3.1a 完成**：`attention_registry.py` 的 GLM 分支加了 NPU 路由。**P3.1b 发现新问题**：`ascend_kda_backend.py:365` 的 `g.flatten(-2)` 是 Kimi 的 4-D 布局契约，GLM 的 gate 已经是 flat 的 → 校验失败。**布局问题，非算子能力问题** |
 | 2026-08-28 | **P3.2 的 D6 实测坐实**：不加 NPU 分支，第一次前向就 `NameError: deep_gemm`。已用 `SGLANG_OPT_USE_TILELANG_MHC_*=False` 临时绕开。`npu_hc_pre` 封装已存在且 DSv4 在用，P3.2 是接线不是重写 |
 | 2026-08-28 | **B2（GLM clipped SwiGLU）撤销**：上机核实与 DSv4 语义逐字相同，昇腾侧已有可用路径，**不需要算子开发**。同时推翻仓库里两处错误注释（`clamp_limit` 只在 `swiglu_mode=1` 生效；`swiglu_clip_quant` 是输出离群裁剪不是输入 clamp），已修正注释 |
+| 2026-08-28 | **P3.1 完成并实测通过**：`_flat_kda_gate` 修掉 Kimi/GLM 的 gate 布局契约不匹配（不改算子、零额外运算）。GLM BF16 前向现已越过 KDA，**最前沿阻塞点前移到 P3.3 的 NoPE MLA**（`deepseek_v2_attention_mla_npu.py:368` 假设 rope 存在） |

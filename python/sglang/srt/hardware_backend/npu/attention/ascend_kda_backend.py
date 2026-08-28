@@ -119,6 +119,20 @@ class _AscendKDAExtendKernel:
         return out
 
 
+def _flat_kda_gate(gate: torch.Tensor, layer) -> torch.Tensor:
+    """Hand fused_kda_gate_npu a tensor whose last dim is heads*head_dim.
+
+    Kimi hands the gate over head-split as ``[..., heads, head_dim]``; GLM-5.3
+    hands it over already flat, straight off f_b_proj. Flattening the last two
+    dims unconditionally would fold the token axis into the feature axis for
+    GLM, so key off the width the kernel actually expects. Both branches are
+    views, not copies.
+    """
+    if gate.shape[-1] == layer.A_log.numel() * layer.head_k_dim:
+        return gate
+    return gate.flatten(-2)
+
+
 class AscendKDAAttnBackend(KDAAttnBackend):
     """Ascend implementation of Kimi Delta Attention.
 
@@ -363,7 +377,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         GPU model/backend paths unchanged.
         """
         preactivated_g = fused_kda_gate_npu(
-            g.flatten(-2),
+            _flat_kda_gate(g, layer),
             layer.A_log,
             layer.head_k_dim,
             gate_bias=layer.dt_bias,
@@ -439,7 +453,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         # recurrent kernel to match the checkpoint's verify contract.
         # This stays in the Ascend backend so shared/GPU model code is unchanged.
         preactivated_a = fused_kda_gate_npu(
-            dense_a.flatten(-2),
+            _flat_kda_gate(dense_a, layer),
             layer.A_log,
             layer.head_k_dim,
             gate_bias=layer.dt_bias,
