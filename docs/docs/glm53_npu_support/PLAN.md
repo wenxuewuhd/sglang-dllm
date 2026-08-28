@@ -491,8 +491,22 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
       - **好消息**：`npu_hc_pre` 的封装**已经存在**（`mhc.py:1780`）且 **DSv4 已在用**
         （`deepseek_v4.py:1906` / `:2029`），P3.2 是把 GLM 接上，不是从零写
       - ⚠ **不能直接照搬**：GLM 的 `_hc_pre_fn` 多了 `post_mult_value=2.0` 和
-        `out_norm_weight` 折叠，而 `npu_hc_pre` 返回 `norm_fused=False`（norm 要调用方自己做）。
-        这正是本条原来标的风险点，要配 HF golden（`Glm5NextTextHyperConnection`）逐项核
+        `out_norm_weight` 折叠，而 `npu_hc_pre` 返回 `norm_fused=False`（norm 要调用方自己做）
+      - **golden 已就绪**：[`tools/golden_mhc.py`](./tools/golden_mhc.py)，参考实现是
+        HF `Glm5NextTextHyperConnection`。已解掉一个疑问：**`post_mult_value=2.0` 是写死在公式里的**
+        （参考实现就是 `post = 2 * sigmoid(post_w * post_scale + post_b)`），
+        所以 GLM 传 2.0 是对的；**还需确认的是 NPU kernel 内部是否也乘了 2**，别乘两次
+      - **判据（第 0 层 / attn / 64 token 实测噪声地板）**：
+
+        | 输出 | 相对噪声地板 |
+        |---|---|
+        | `post` | 6.6e-4 |
+        | `comb` | **5.7e-6** |
+        | `collapsed` | 4.6e-3 |
+
+        `comb` 的地板极小是因为 Sinkhorn 双随机归一化把 dtype 误差压掉了。
+        这顺带给了一个免费自检：**`comb` 必须行列和都≈1，不满足就是接线错了**
+        （实测 row-sum 0.996–1.004、col-sum 恰为 1.0）
 - [ ] P3.3 **NoPE MLA**：拆 `npu_kv_rmsnorm_rope_cache` + 20 处 split 早退 + KV buffer 二元组语义 + `trans_rope_weight` assert
       - **实测已撞到 D3 的第一处**：`npu/modules/deepseek_v2_attention_mla_npu.py:368`
         无条件访问 `m.rotary_emb.is_neox_style`，而 GLM 的 `qk_rope_head_dim=0` 根本没建 rope 模块
