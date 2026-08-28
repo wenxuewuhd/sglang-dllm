@@ -13,7 +13,7 @@
 | BF16 部署形态 | **单节点 TP16**（16 die × 64 GB = 1024 GB） | 2026-08-27 |
 | 量化格式 | **compressed-tensors W8A8-INT8**（weight per-channel + act per-token dynamic） | 2026-08-27 |
 | 磁盘策略 | FP8 → BF16 **逐 shard 转换、转完即删源 shard** | 2026-08-27 |
-| 精度基准 | CPU 上跑 GPU 分支参考实现取 golden | 2026-08-27 |
+| 精度基准 | ~~CPU 上跑 GPU 分支参考实现~~ → **HF `transformers==5.16.1` 的 `glm5_next`**（见 §3 P3） | 2026-08-28 |
 | 多模态 (ViT/video) | 一期**不做** | 2026-08-27 |
 | MTP / NextN | 一期**不做** | 2026-08-27 |
 | 长上下文 CP | 一期**不做**，只承诺 32K | 2026-08-27 |
@@ -416,7 +416,52 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
 - [ ] P3.4 **kpool indexer**：解掉 `kpool_fp8_index.py:588` 与 `dsa_indexer_kpool.py:1766` 的非 CUDA 硬拦，用 `torch.topk` 打通 `group_topk=512`
 - [ ] P3.5 **出口判据**：四个模块逐层 golden 对齐
 
-> ⚠ P3.4 的 golden 问题：GPU 分支的 kpool 在 CPU 上也跑不起来（`dsa_indexer_kpool.py:1766` 直接 raise）。得先写 torch 参考路径，它既是被测对象又是基准 → 用小规模手算 + 与非 kpool 普通 DSA indexer 交叉验证来锚定。
+#### P3 的 golden 来源：**HuggingFace `transformers==5.16.1`**（2026-08-28 确定）
+
+> **这一条推翻了 §0 里"精度基准 = CPU 上跑 GPU 分支参考实现"的原方案。**
+> 原方案对 kpool **物理上做不到**：我们的配置 `index_topk=2048, index_kpool=4`
+> → `group_topk=512` → 走 `fast_kpool_topk_transform_fused`，它背后是
+> `kernels/jit/csrc/dsa/kpool_topk_transform.cuh` —— **JIT CUDA kernel**，
+> NPU 跑不了、CPU 也跑不了、triton-ascend 也救不了（它不是 triton）。
+> 且本机**没有任何 CUDA 卡**，拿不到 GPU 参考输出。
+
+**transformers 5.16.1 带了完整的 `glm5_next` 纯 PyTorch 实现**（5.16.0 还没有，是 5.16.1 才加的），
+四个模块**全覆盖**，且**零 cuda / triton / flash 引用**，CPU 直接可跑：
+
+| P3 模块 | HF 对应实现 |
+|---|---|
+| P3.1 KDA | `Glm5NextTextLinearAttention`、`recurrent_kimi_delta_attention`、`chunk_kimi_delta_attention`、`causal_conv1d_fn/update`、`Glm5NextTextForgetGate`、`Glm5NextTextRMSNormGated` |
+| P3.2 mHC | `Glm5NextTextHyperConnection`、`Glm5NextTextHyperHead`、`Glm5NextTextUnweightedRMSNorm` |
+| P3.3 NoPE MLA | `Glm5NextTextAttention`、`eager_attention_forward` |
+| **P3.4 kpool indexer** | **`Glm5NextTextIndexer`**（`modeling_glm5_next.py:736-1027`，纯 torch） |
+
+- 环境：**独立的 `$ROOT/.venv-ref`**（transformers 5.16.1 + torch 2.10.0 CPU）。
+  **绝不能装进 `.venv-glm53`** —— sglang 的 `pyproject_npu.toml` 钉死 `transformers==5.12.1`
+- 已实测：`AutoConfig.from_pretrained` 直接读我们的 BF16 目录成功，字段与 §1 逐条吻合
+  （`qk_nope=256 / qk_rope=0 / v=256 / kv_lora=512 / index_topk=2048 / index_kpool=4`）；
+  `Glm5NextTextIndexer(cfg, layer_idx=0)` 在 CPU 上构造成功
+- ⚠ 缩小配置做单元测试时，`num_hidden_layers` 必须与 `layer_types` **和** `mlp_layer_types` 同时截断，否则 config 校验直接 raise
+
+**口径说明（重要）**：HF 实现是**参考实现，不是 sglang GPU 实现的逐位复制**。
+两者可能有融合差异。所以 golden 用 HF，sglang GPU 分支的代码当**第三方佐证**（读源码交叉核对），
+而不是要求三方逐位相同。
+
+> **P3.4 的做法（已与用户确认）**：不移植那个 fused CUDA kernel，而是
+> **在 NPU 上把 `group_topk=512` 路由到 `kpool_fp8_index.py` 里已存在的拆解路径**：
+> ragged top-k（自写 torch，替 `fast_topk_v2`——它硬断言 `topk==2048`）
+> → `expand_pooled_groups_to_topk` → `append_kpool_tail_to_topk`，**后两个是纯 torch，原样可用**。
+> HF 的 `Glm5NextTextIndexer` 做的正是同一套（`topk(select_k)` → `flatten(-2)` 展开 → `append_visible_tail`），
+> 是对这条路线的独立佐证。
+>
+> 两个必须填的缺口：
+> 1. 拆解分支有 `assert page_table_row_index is None`，而 `kpool_plan.py:417` 在分页 decode 时一定会设它
+>    → 要给 torch 版 `expand` 加按行的 page_table gather。**已决定一次做全，不先砍分页路径**
+> 2. 拆解路径在上游**从没在 `group_topk=512` 上跑过**（`fast_topk_v2` 只支持 2048）→ 我们是第一个走这条组合的
+>
+> **判据（已与用户确认）**：用「选出的集合 == 真实 top-k 集合 / 所选分数之和一致」，
+> **不用「下标逐位相等」**。原因：并列分数的 tie-break 在 `torch.topk` 与 CUDA kernel 之间本就可能不同，
+> 且我们**没有 CUDA 卡，任何环节都拿不到 CUDA 参考下标** —— 下标逐位比对在本项目**整体不可行**，
+> 端到端只能用精度分数兜底，不能指望回头做下标定位。
 
 ### P4 · BF16 端到端 ☐
 - [ ] P4.1 TP16 / 32K / 纯文本 / 关 NPU Graph / 关 MTP / 关 CP 启动
@@ -532,3 +577,5 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
 | 2026-08-28 | **P2 改为不删源**（DSv4 腾出空间后 668 GB 够放 643 GB 的 BF16），整个 P2 变可逆；FP8 源留到 P4 验过再删 |
 | 2026-08-28 | P2.2 加强验证：对首个 shard 做**全量逐位比对**（27.6 亿元素），用独立实现重算，**0 处不一致**。反量化数学本身已证死，剩下的风险只在 I/O 与索引拼装 |
 | 2026-08-28 | **P2 完成**：FP8 → BF16 全量转换 62/62，输出 599 GB，出口判据全过（名称集合、形状、dtype、无 scale 泄漏、config 已清洗）。FP8 源**保留**，等 P4 端到端验过再删。磁盘余 70 GB |
+| 2026-08-28 | **P3 的 golden 来源换成 HF `transformers==5.16.1` 的 `glm5_next`**（纯 torch、CPU 可跑、四模块全覆盖，含 `Glm5NextTextIndexer`）。原方案"CPU 跑 GPU 分支"对 kpool 物理上做不到：`group_topk=512` 走的是 JIT CUDA `.cuh`，且本机无 CUDA 卡。装在独立 `.venv-ref`，**不得污染 `.venv-glm53`**（sglang 钉 transformers 5.12.1） |
+| 2026-08-28 | **BF16 产物通过真实加载路径验证**：16 rank 全部 `Load weight end`，52.03 GB/die，`type=Glm…`，**无 missing/unexpected key、无 shape mismatch**。失败点在其后的显存预算（照搬了 DSv4 的 DP16 配方，DP-attention 会复制 attention/dense），是配置问题不是权重问题 |
