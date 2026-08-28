@@ -422,8 +422,32 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         )
         state_work = state.index_select(0, cache_indices.to(torch.int64))
         state_work = state_work.to(weight.dtype).contiguous()
+        # `causal_conv1d_fn_npu` takes the ragged 2-D layout [dim, cu_seq_len] and
+        # pads it to [batch, dim, max_T] with an `index_copy_` along dim 1, then
+        # un-pads the result with an `index_select` -- four full-width copies of the
+        # activation, plus the transposes `index_copy_(dim=1)` itself needs.  When the
+        # batch is a single sequence, cu_seq_len == max_T and both the pad and the
+        # un-pad are the identity, so all of it is pure overhead.  Handing the same
+        # data over as 3-D skips it: `prepare_data` returns early on `x.ndim == 3` and
+        # the function returns the convolution output unchanged.  `unsqueeze(0)` and
+        # `squeeze(0)` are views, so the fast path adds no copy of its own.
+        #
+        # Measured, tp16 per-card KDA prefill (4 heads x 128, chunk 8192, x is
+        # [512, 8192], one sequence): the repacking cost 2.29 ms per layer against
+        # 86 us for the convolution itself.
+        #
+        # Single-sequence only, and not merely as a heuristic: the 3-D path asserts
+        # `query_start_loc[-1] <= x.shape[-1]`, which any multi-sequence batch
+        # violates because cu_seq_len then exceeds one sequence's length.
+        # `seq_lens_cpu` is already on the host, so testing this costs no sync.
+        x_conv = x.to(weight.dtype)
+        single_sequence = (
+            seq_lens_cpu is not None
+            and len(seq_lens_cpu) == 1
+            and int(seq_lens_cpu[0]) == x_conv.shape[-1]
+        )
         out = causal_conv1d_fn_npu(
-            x.to(weight.dtype),
+            x_conv.unsqueeze(0) if single_sequence else x_conv,
             weight,
             bias,
             activation="silu",
@@ -433,6 +457,9 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             query_start_loc=query_start_loc,
             seq_lens_cpu=seq_lens_cpu,
         )
+        if single_sequence:
+            # [1, dim, T] -> [dim, cu_seq_len], the 2-D path's own return contract.
+            out = out.squeeze(0)
         state.index_copy_(0, cache_indices.to(torch.int64), state_work.to(state.dtype))
         return out.to(x.dtype).transpose(0, 1)
 

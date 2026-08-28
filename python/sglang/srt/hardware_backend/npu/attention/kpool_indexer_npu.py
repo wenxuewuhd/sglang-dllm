@@ -106,11 +106,25 @@ def visible_pool_runs(
     Returns ``(cu_seqlens_q, key_lens, run_req_index)``: the TND query prefix sum,
     the visible-pool count per run, and which request each run belongs to.
     """
-    pool_lens = pool_lens.to(torch.int64)
-    key = req_index.to(torch.int64) * (int(pool_lens.max()) + 1) + pool_lens
-    _, counts = torch.unique_consecutive(key, return_counts=True)
-    ends = counts.cumsum(0)
-    starts = ends - counts
+    # Compare the two run keys directly rather than packing them into one integer.
+    # The packed form needed `int(pool_lens.max())`, which is a device-to-host wait,
+    # and it fed `torch.unique_consecutive`, which on Ascend has no AI Core
+    # implementation and falls back to `aclnnUniqueConsecutive` on the AI CPU
+    # (measured: 112 us for 8192 rows, against ~13 us for the AI Core `nonzero` this
+    # uses instead).  `counts.cumsum(0)` was a second AI CPU kernel
+    # (`aclnnCumsum_CumsumAiCpu`, 42 us) and is not needed at all: the run ends are
+    # just the next run's start.
+    n = int(pool_lens.shape[0])
+    device = pool_lens.device
+    zero = torch.zeros(1, dtype=torch.int64, device=device)
+    if n <= 1:
+        starts = zero[:n]
+    else:
+        changed = (req_index[1:] != req_index[:-1]) | (pool_lens[1:] != pool_lens[:-1])
+        starts = torch.cat([zero, changed.nonzero().flatten() + 1])
+    ends = torch.cat(
+        [starts[1:], torch.full((1,), n, dtype=torch.int64, device=device)]
+    )
     return (
         ends.to(torch.int32),
         pool_lens[starts].to(torch.int32),
@@ -179,9 +193,12 @@ def topk_from_pooled_selection(
         expand_pooled_groups_to_topk,
     )
 
+    # `selected_groups >= 0` against a Python scalar makes torch_npu widen the
+    # int32 selection to int64 and compare there: 162 us for [8192, 512] versus
+    # 17 us for the same compare against a 0-dim int32 tensor (measured).
     expanded = expand_pooled_groups_to_topk(
         selected_groups.contiguous(),
-        selected_groups >= 0,
+        selected_groups.ge(selected_groups.new_zeros(())),
         topk=topk,
         pool_size=pool_size,
         page_table=page_table,
