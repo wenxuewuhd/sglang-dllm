@@ -100,8 +100,8 @@
 | # | 项 | 结论 |
 |---|---|---|
 | **1** | **kpool index-K cache: fp8 → bf16** | A3 无 fp8，4 个 compress-write Triton kernel 因此无法编译。改存 **bf16** 后其中 3 个可编译且全程对得上（第 4 个见 §2.4）。选 bf16 不是折中：它既是精度天花板，**也是唯一能被消费的格式**（§2.7）。纯仓库侧改动，**不需要厂商算子** |
-| **2** | **`npu_kv_rmsnorm_rope_cache` 支持 rope=0** | 实测（2.7.1 与 2.10 两版）v1/v2 在 rope=0 时**双双 RuntimeError**。这是唯一一个从头到尾站得住的算子需求 |
-| **3** | **全零 rope 的 workaround** | `npu_sparse_flash_attention` 签名 Optional 但**实际不接受缺省**；只有 `attention_mode=2`（MLA，kv_head=1）可用且要求非空 rope。传全零 rope 数值正确（零 rope 贡献恰为 0） |
+| **2** | **`npu_kv_rmsnorm_rope_cache` 支持 rope=0** | 实测（2.7.1 与 2.10 两版）v1/v2 在 rope=0 时**双双 RuntimeError**。**唯一还活着的算子需求**。⚠ 差点被错误撤销：它只在 `deepseek_v2_attention_mla_npu.py:80` 的 `if m.use_deepseek_yarn_rope:` 里被调用，而 GLM 的 checkpoint json **没有 `rope_scaling`**，看着该走 else 的纯 torch 分支。**但 sglang 自己的 `Glm5NextTextConfig` 会合成一个默认值**（实测构造出来是 `{'rope_theta': 800000.0, 'partial_rotary_factor': 1.0, 'rope_type': 'default'}`），于是 `use_deepseek_yarn_rope = True`，分支照走。**只读 config 文件会得出相反结论。** 能否改走 else 分支从而撤掉它，见 §4 |
+| ~~3~~ | ~~全零 rope 的 workaround~~ | **已实现**（`ascend_backend.py` 的 `_nope_zero_rope`）。实测：`query_rope`/`key_rope` 签名是 Optional，但**缺省、0 宽、16、32、128 全部报错，只收宽度 64**。全零 rope 数值正确（对 torch MLA 参考 rel 3e-3，即 bf16 输出舍入）。**一页零页用 stride-0 `expand` 铺满整个 cache**，与真实零 cache 逐位相同 —— 总共 8 KB，而不是多一份约 10% 的 KV。⚠ 算子文档说不支持非连续输入，所以这是**观察到的行为、不是承诺的行为**；哪天 CANN 不认 stride-0 就退回分配真张量 |
 
 ### 2.4 陷阱（能跑但算错 / 名实不符）
 
@@ -351,3 +351,9 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
       （`_kpool_write_tail_and_maybe_compress_kernel`）只在 `num_draft_tokens >= 3` 触发它。
       **一期不在关键路径上**：那是 MTP，一期不做；真撞上就删 Hadamard（bf16 下可删，见 §2.4）
 - [ ] `deep_ep` 的打包 bug 已用 `.pth` 绕过，可向上游反馈
+- [ ] **能不能让 qk_rope=0 走非 yarn 分支，从而撤掉 OP-3**：`use_deepseek_yarn_rope` 只看
+      `rope_scaling is not None`，不看 `qk_rope_head_dim`。GLM 没有 rope，走 else 分支
+      （torch layernorm + 切片，`rotary_emb` 本来就是 None）在数学上等价。
+      **卡点是 KV cache 由谁写**：yarn 分支里融合算子顺手把 cache 写了，else 分支不写，
+      靠后面 `forward_sparse` 的 `set_kv_buffer`。要先确认两条路的写入语义一致。
+      换成功 = OP-3 撤销 = 工单包清空（推断出的算子缺口命中率 0/5）
