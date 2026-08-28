@@ -4,7 +4,9 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
     MiniMaxSparseKVPool,
@@ -791,3 +793,150 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                         ik_layer.device, non_blocking=True
                     )
         torch.npu.synchronize()
+
+
+class NPUBf16IndexKeyCache(IndexKeyCache):
+    """kpool's compressed index keys as bf16, laid out the way the operator reads.
+
+    The shared cache packs an fp8 key and an fp32 scale into one uint8 page.
+    Atlas A3 cannot hold an fp8 tensor at all -- allocating one raises
+    ``aclnnInplaceZero 161002`` -- and the operator that scores these keys,
+    ``torch_npu.npu_lightning_indexer``, reads bf16 and nothing else. So the
+    scale region goes away and the page becomes ``PA_BSND``:
+    ``(pages, page_size, 1, index_head_dim)``, which is the shape the operator
+    wants with no restride at the call site.
+    """
+
+    def _buffer_shape(self, num_pages: int) -> tuple[int, ...]:
+        pool = self.pool
+        return (num_pages, pool.page_size, 1, pool.index_head_dim)
+
+
+class NPUDSATokenToKVPool(DSATokenToKVPool):
+    """DSA pool whose index-K cache is bf16 rather than packed fp8.
+
+    Everything else -- the latent KV, the bf16 compress-tail ring, the page
+    bookkeeping -- is the shared implementation. Only the index cache and the two
+    writers that quantize into it change.
+    """
+
+    index_k_with_scale_buffer_dtype = torch.bfloat16
+
+    def _create_index_key_cache(self) -> "IndexKeyCache":
+        return NPUBf16IndexKeyCache(self, self.index_buf_size)
+
+    def set_index_k_bf16(
+        self, layer_id: int, loc: torch.Tensor, index_k: torch.Tensor
+    ) -> None:
+        """Scatter compressed pooled keys to their cache slots.
+
+        ``loc`` is a flat slot index -- ``page * page_size + offset_in_page`` --
+        matching the addressing the fp8 kernels compute inline.
+        """
+        buf = self.get_index_k_with_scale_buffer(layer_id)
+        torch_npu.npu_scatter_nd_update_(
+            buf.view(-1, 1, self.index_head_dim),
+            loc.reshape(-1, 1).long(),
+            index_k.reshape(-1, 1, self.index_head_dim).to(torch.bfloat16),
+        )
+
+    def kpool_decode_update_index_cache(
+        self,
+        layer_id: int,
+        key: torch.Tensor,
+        slot_score: torch.Tensor,
+        ape: torch.Tensor,
+        block_tables: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        positions: torch.Tensor,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        round_scale: bool = False,
+    ) -> None:
+        """Advance the tail ring, and compress into the cache when a pool closes.
+
+        A torch transcription of ``_kpool_decode_update_and_maybe_write_cache_kernel``
+        minus its fp8 store: same validity test, same ring addressing, same
+        substitution of the incoming token for the slot it has not been written
+        to yet, and the same pooled-slot address arithmetic.
+
+        Assumes one row per request, which decode guarantees. Two rows sharing a
+        ``req_pool_index`` would race for the same ring slot here -- as two of the
+        kernel's programs would.
+        """
+        from sglang.srt.hardware_backend.npu.attention.kpool_indexer_npu import (
+            compress_pool_bf16,
+        )
+
+        assert (
+            self.kpool_use_compress
+        ), "kpool_decode_update_index_cache called when kpool compress is disabled"
+        batch = key.shape[0]
+        if batch == 0:
+            return
+
+        idx = layer_id - self.start_layer
+        tail_k, tail_score = self._compress_tail_k[idx], self._compress_tail_score[idx]
+        pool_size, tail_width = self.index_kpool, tail_k.shape[1]
+        req_pool_size = tail_k.shape[0]
+
+        req = req_pool_indices[:batch].long()
+        pos = positions[:batch].long()
+        valid = (
+            (req >= 0)
+            & (req < req_pool_size)
+            & (out_cache_loc[:batch] != 0)
+            & (pos >= 0)
+            & (pos < seq_lens[:batch])
+        )
+        safe_req = req.clamp(0, req_pool_size - 1)
+        safe_pos = pos.clamp(min=0)
+
+        # A pool closes on its last slot; only then is there anything to compress.
+        closing = (valid & (safe_pos % pool_size == pool_size - 1)).nonzero(
+            as_tuple=True
+        )[0]
+        if closing.numel() > 0:
+            r, p = safe_req[closing], safe_pos[closing]
+            start = p - p % pool_size
+            phys = (
+                start.unsqueeze(1)
+                + torch.arange(pool_size, device=key.device).unsqueeze(0)
+            ) % tail_width
+            slot_k = tail_k[r.unsqueeze(1), phys].clone()
+            slot_s = tail_score[r.unsqueeze(1), phys].clone()
+            # The closing token is still in flight -- the ring is written below.
+            slot_k[:, pool_size - 1] = key[closing]
+            slot_s[:, pool_size - 1] = slot_score[closing]
+
+            pool_id = p // pool_size
+            page_col = ((pool_id // self.slots_per_page) * pool_size).clamp(
+                0, block_tables.shape[1] - 1
+            )
+            page = block_tables[closing, page_col].long()
+            loc = page * self.page_size + pool_id % self.slots_per_page
+            self.set_index_k_bf16(
+                layer_id, loc, compress_pool_bf16(slot_k, slot_s, ape)
+            )
+
+        keep = valid.nonzero(as_tuple=True)[0]
+        if keep.numel() > 0:
+            phys_slot = safe_pos[keep] % tail_width
+            tail_k[safe_req[keep], phys_slot] = key[keep]
+            tail_score[safe_req[keep], phys_slot] = slot_score[keep]
+
+    def set_index_k_scale_buffer(self, *args, **kwargs):
+        raise NotImplementedError(
+            "This pool stores index keys as bf16; there is no fp8 key + fp32 scale "
+            "to write. Use set_index_k_bf16."
+        )
+
+    def get_index_k_scale_buffer(self, *args, **kwargs):
+        raise NotImplementedError(
+            "This pool stores index keys as bf16; there is no separate scale to read."
+        )
+
+    def get_index_k_scale_continuous(self, *args, **kwargs):
+        raise NotImplementedError(
+            "This pool stores index keys as bf16; there is no separate scale to read."
+        )

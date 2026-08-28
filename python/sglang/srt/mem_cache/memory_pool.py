@@ -3827,6 +3827,17 @@ class HybridLinearKVPool(KVCache):
                 DSAPoolCls = LayerSplitDSATokenToKVPool
                 pool_kwargs["layer_shard_rank"] = layer_shard_rank
                 pool_kwargs["layer_shard_size"] = layer_shard_size
+            elif _is_npu:
+                # The shared index cache packs an fp8 key with an fp32 scale, and
+                # Ascend cannot hold an fp8 tensor at all. The NPU pool stores the
+                # key as bf16 instead, which is also the only dtype the operator
+                # that scores it reads. Layer-split would need the same treatment
+                # and does not have it yet.
+                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                    NPUDSATokenToKVPool,
+                )
+
+                DSAPoolCls = NPUDSATokenToKVPool
             self.full_kv_pool = DSAPoolCls(
                 size=size,
                 page_size=self.page_size,
