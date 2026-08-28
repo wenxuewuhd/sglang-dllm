@@ -505,6 +505,24 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
         HF `Glm5NextTextHyperConnection`。已解掉一个疑问：**`post_mult_value=2.0` 是写死在公式里的**
         （参考实现就是 `post = 2 * sigmoid(post_w * post_scale + post_b)`），
         所以 GLM 传 2.0 是对的；**还需确认的是 NPU kernel 内部是否也乘了 2**，别乘两次
+      - ✅ **已用 golden 实测过 DSv4 的融合算子对 GLM 是正确的**（2026-08-28）：
+        直接拿 `torch.ops.custom.npu_hc_pre` 跑 GLM 第 0 层真实权重，对 HF golden ——
+        `post` 8.92e-5 / `comb` 6.14e-6 / `y` 4.65e-3，**三个都在噪声地板内**；
+        `comb` 双随机自检也过（row 0.996–1.004，col 恰为 1.0）
+
+      **接线时的四个坑（全部实测撞出来的）**：
+
+        | # | 坑 |
+        |---|---|
+        | 1 | **kernel 内部已经乘了 2** —— `post vs golden=8.9e-5`，`post vs golden/2=1.0`。GLM 的 `post_mult_value=2.0` **不能在外面再乘一次**，否则 post 翻倍，服务照跑但分数悄悄掉 |
+        | 2 | **`norm_eps` 要传 GLM 的 1e-5**，不是 DSv4 的 1e-6。两模型其余 mHC 配置（`hc_mult=4`/`sinkhorn=20`/`hc_eps=1e-6`）完全相同 |
+        | 3 | **输入必须 4-D** `[b, s, hc_mult, hidden]`，传 2-D 报 `dim num should be 4` |
+        | 4 | **`hc_fn`/`scale`/`base` 必须 fp32**，传 bf16 直接报错（checkpoint 里本来就是 F32） |
+
+        另：`npu_hc_pre` 返回 `norm_fused=False`，**不折叠 input_layernorm**，
+        调用方要自己做 —— 与 GLM 现在 `_hc_pre_fn` 传 `out_norm_weight` 的做法不同，
+        接线时要把 norm 挪到外面。
+
       - **判据（第 0 层 / attn / 64 token 实测噪声地板）**：
 
         | 输出 | 相对噪声地板 |
@@ -716,3 +734,4 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
 | 2026-08-28 | **C5 消解**：`npu_quant_lightning_indexer` 在 `cmp_ratio=4` 下返回 pool 级下标 + `-1` 填充，**pooled 打分与分组 top-k 昇腾侧都已有**，缺的只是 B3 的展开/尾部/页表映射 → OP-1 的工作量比原估计小得多 |
 | 2026-08-28 | **性能缺口第一名不是 kpool 而是 mHC**：`mhc.py` 的 flat 入口完全没有 `_is_npu` 分支，每次 forward **90 次调用 / 约 12,600 次 kernel launch**（含 19 轮 Sinkhorn 循环）。但 `npu_hc_pre`/`npu_hc_post` **已存在且 DSv4 已在用** —— **这是接线不是算子开发**，即 P3.2 |
 | 2026-08-28 | ⚠ **发现两个会挡住 P3 对拍的精度 bug**：① DeepEP routed 专家路径**静默丢掉 `swiglu_limit=10.0`**（`moe_runner/ascend.py:114-118` 只读 `gemm1_clamp_limit`，GLM 是 None），同一层里 shared 专家 clamp 而 routed 不 clamp；② NPU router GEMM 走 bf16（`deepseek_v2.py:567-568`），而 GLM 配置是 `moe_router_dtype: float32` |
+| 2026-08-28 | **P3.2 的可行性已用 golden 实测坐实**：DSv4 的 `npu_hc_pre` 对 GLM 真实权重与 HF golden 三个输出全部落在噪声地板内。**并判死了 ×2 的归属——kernel 内部已经乘了，外面不能再乘**。另记录 4 个接线坑（norm_eps 1e-5、输入必须 4-D、权重必须 fp32、norm 不折叠） |
