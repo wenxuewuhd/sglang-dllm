@@ -8,62 +8,68 @@
 
 ```
 ⚠ 先看这条，否则第一条命令就会卡死：
-本机 shell 继承了全局 HTTP_PROXY / HTTPS_PROXY，但该代理**只对 GitHub / Anthropic 有效**。
-访问任何其他站点（pypi 华为源、hf-mirror、gitcode、ports.ubuntu.com …）之前必须先
-`unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY`，否则一路超时到 timeout。
-详见 SETUP.md §1 的站点/走法对照表。
+本机 shell 继承了全局 HTTP_PROXY / HTTPS_PROXY，但该代理只对 GitHub / Anthropic 有效。
+访问任何其他站点（pypi 华为源、hf-mirror、gitcode …）之前必须先
+`unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY`，否则一路超时。
 
-你要接手 GLM-5.3-Flash 在昇腾 NPU（Atlas A3 / Ascend910_9362）上的适配工作。
+你要接手 GLM-5.3-Flash 在昇腾 NPU（Atlas A3 / Ascend910_9362）上的适配。
 仓库：当前目录（sglang-dllm fork，分支 glm53_dev）。
 
 【第一件事：读文档，不要重新调研】
-按顺序读，全部在 docs/docs/glm53_npu_support/ 下：
-  1. SETUP.md  —— 环境搭建复现文档。前一轮踩过的坑都在里面，照做，别自己摸索。
-  2. PLAN.md   —— 活的计划文档。§1 环境事实、§2 算子结论、§3 阶段计划(P0–P6)。
-  3. probe/    —— 现成的探测脚本，别重写。
-这些结论是逐条核实过的（读源码 + 上机实跑），带 file:line 证据。
-GLM53_flash_ascend_support_assessment.html 是最初的评估报告，其中若干判断
-**已被代码核实推翻**，以 PLAN.md §2.8 为准，不要照抄那份 html。
+docs/docs/glm53_npu_support/ 下，按顺序：
+  1. PLAN.md   —— 环境事实、算子结论、阶段计划。**每条结论都标了证据等级**
+                  （实测 / 源码 / 推断），照着用，不要重新推导。
+  2. SETUP.md  —— 环境搭建。换机才需要；坑都在里面，照做别自己摸索。
+  3. operator_handoff/ —— 给算子团队的工单（含纯 torch 参考实现与 pytest）。
+  4. probe/、tools/ —— 现成脚本，别重写。
+GLM53_flash_ascend_support_assessment.html 是最初的评估报告，**多处已被实测推翻**，
+以 PLAN.md 为准。
 
-【当前状态（2026-08-28）】
-- **环境已在 Ubuntu 24.04 上重建完毕，P0.1–P0.6 + P0.8 全部 PASS**。
-  `source /mnt/workspace/y00359136/work/glm53_dev/env/env.sh` 之后用 `npy` 代替 `python` 即可干活。
-- 24.04（glibc 2.39）**确认不需要 SETUP.md 附录 B 的 glibc 绕行**；vendor `.so` 全部正常加载。
-- 两个模型权重都已下齐：`/mnt/workspace/models/{GLM-5.3-Flash, DeepSeek-V4-Flash-W8A8}`。
-- 下一步是 **P0.7a**。
+【环境】
+source /mnt/workspace/y00359136/work/glm53_dev/env/env.sh   # 然后用 npy 代替 python
+参考环境（HF golden，CPU）：$ROOT/.venv-ref/bin/python —— 绝不能装进 .venv-glm53
 
-【接下来做什么】
-✅ P0、P1 都已完成（环境 / 算子 / DSv4 冒烟 / GPQA 精度闭环 / rebase 到 `033446bb05`）。
-现在从 **P3 逐模块对拍**开始，按 PLAN.md §3 往下走 P3 → P4 → P5 …
+【当前进度】
+P0 环境 / P1 分支合流 / P2 BF16 权重转换：全部完成，出口判据见 PLAN 表。
+P3 逐模块对拍进行中：KDA ✅、mHC ✅（已接线并验数值）、NoPE MLA 部分、**kpool 阻塞**。
 
-⚠ 磁盘：现在 915/984 GB，**剩 70 GB**。FP8 源（306 GB）仍保留，**等 P4 端到端验过再删**；
-P5 的 W8A8（333 GB）那时本来也放不下它。DSv4 权重已删（元数据保留）。
+【下一步：P3.4 kpool】
+这是唯一的关键路径。缺口只剩两块（PLAN §2.3、§2.6）：
+  a) 索引缓存 fp8 → int8。A3 没有 fp8；规格与三个条件已定死，见
+     operator_handoff/specs/op1_kpool_topk_transform.md。
+  b) 昇腾侧由谁算 indexer logits —— **唯一真正开放的问题**。CUDA 侧是 deep_gemm
+     （CUDA 非 Triton，不会随 Triton 路径可用），npu_quant_lightning_indexer 用不了
+     （metadata 只接受 num_heads_q=64，GLM 是 32）。
+最快跑通的路径：int8 化缓存 + 用 torch 写一个 MQA-logits（慢但正确）。
+kpool 的 10 个 Triton kernel 里 7 个已实测可在 triton-ascend 上跑且逐位精确，
+所以这不是"移植整个子系统"。
 
-（若又换机重建环境：照 SETUP.md 走一遍，24.04 的差异集中在附录 D。）
+跑通之后按这个顺序验精度（快 → 慢）：
+  tools/logit_check.py 的 teacher-forced logprob 对拍（秒级、无采样噪声、能定位）
+  → prefill/decode 的 KL 一致性 → 最后才是 GSM8K + profiling。
 
 【工作方式（用户明确要求）】
-- **PLAN.md 是活文档**：每完成一步就在对应条目标 [x] PASS 或 [!] FAIL，
-  计划要改就直接改这个文件，并在 §5 变更日志加一行。不要另开新文档。
-- **实事求是**：不确定就明确写「不确定」，并写清用什么动作能消解它。
-  证据不足不要给结论。给判断时标注是「实测」还是「我的推断」。
-- **打杂派 agent**：跑评测、扫清单、核实外部报告这类「输出量远大于结论量」的活，
-  派 subagent 去做，别在主上下文里跑。派的时候把已知环境事实写进 prompt。
-- **先讨论再动手**：大的方案变更先说清楚再执行。
+- PLAN.md 是活文档：完成一步就更新对应条目。**只记当前事实，不记怎么走到这里的**
+  —— 过程看 git log。不要另开新文档。
+- 实事求是：不确定就写「不确定」，并写清用什么动作能消解。证据不足不给结论。
+  **每条判断都要标是「实测」还是「推断」**。
+- 派 agent 干"输出量远大于结论量"的活（跑评测、扫清单、核实外部说法），
+  别在主上下文里跑。派的时候把已知环境事实写进 prompt。
+- 先讨论再动手：大的方案变更先说清楚。
+- 涉及算子 handoff 的改动要主动 highlight。
 
-【环境硬规则（会反复踩）】
-- 代理 http://127.0.0.1:1056 **只对 GitHub / Anthropic 有效**。访问 pypi 华为源、
-  hf-mirror、gitcode、ports.ubuntu.com 之前必须 `unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY`，
-  否则一路超时。
-- CANN toolkit 在 `/home/developer/Ascend/ascend-toolkit/`，**不是** /usr/local/Ascend
-  （那里只有 driver）。
-- 认 SoC 用 `torch.npu.get_device_name(0)`，npu-smi 对 A2/A3 都显示 Ascend910。
-- 认 CANN 版本看 `compiler/version.info`，**不要**信 ascend_toolkit_install.info 的包名。
-- 绝对不要跑 `pip install -e python/`（会装 CUDA 变体顶掉 torch_npu，容器就废了）。
+【一条血的教训】
+从源码或签名推断出来的"算子缺口"，本项目至今命中率 0/3 —— 三次都是算子本来就存在，
+只是被默认参数、同名算子或另一个模型的属性掩盖了。**派人力之前先花十分钟把算子跑一次。**
+反过来，"能跑但算错"才是真危险：见 PLAN §2.4 的四个陷阱。
 
-【一个关键判断，供你安排优先级】
-PLAN.md §2.6 的结论是：BF16 首次打通**不被任何算子硬卡住** —— 确认要开发的 4 项
-都有 torch 退路。所以别一上来就写 AscendC 算子，先用 torch 把精度打通（P3/P4），
-算子优化放到 P6。
+【环境硬规则】
+- 代理只对 GitHub / Anthropic 有效，其余先 unset。
+- CANN 在 /home/developer/Ascend/ascend-toolkit/（不是 /usr/local/Ascend，那里只有 driver）。
+- 认 SoC 用 torch.npu.get_device_name(0)；认 CANN 版本看 compiler/version.info。
+- 绝对不要跑 pip install -e python/（会装 CUDA 变体顶掉 torch_npu）。
+- 每条 pip 都要带 -i 华为源，且装 sglang 依赖必须带 constraints（见 SETUP §8.2）。
+- --page-size：GLM 必须 64，DSv4 是 128。
 ```
 
 ---
