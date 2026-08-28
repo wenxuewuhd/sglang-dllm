@@ -28,14 +28,46 @@
 ```bash
 source $ROOT/env.sh
 
-# 阶段 A（CPU）。golden 很大，存在仓库外
-$ROOT/.venv-ref/bin/python dump_reference.py --layer 3 --out $ROOT/goldens/layer03.pt
+# 阶段 A（CPU）。golden 很大，存在仓库外。
+# --ref-prefill-chunk 在 8k 以上是必须的：torch 的 CPU depthwise conv1d
+# JIT 不了那么长的窗口（illegal immediate parameter）。
+$ROOT/.venv-ref/bin/python dump_reference.py --module kda --layer 0 \
+    --prefill 32768 --decode 8 --ref-prefill-chunk 8192 \
+    --out $ROOT/goldens/kda_layer00_s32k.pt
 
-# 阶段 B（NPU）
-PYTHONPATH=$REPO/python $VENV/bin/python check_dsa.py --case $ROOT/goldens/layer03.pt
+# 阶段 B（NPU）。PYTHONPATH 必须**追加**，不能覆盖 —— CANN 的 tbe 在里面，
+# 冲掉它 F.conv1d 会以 "No module named 'tbe'" 失败。
+PYTHONPATH=$REPO/python:$PYTHONPATH $VENV/bin/python check_kda.py \
+    --case $ROOT/goldens/kda_layer00_s32k.pt --ranks all --batch 16 --prefill-chunk 8192
+
+# 同一个脚本量本层稳态耗时（形状照部署，不打分）
+PYTHONPATH=$REPO/python:$PYTHONPATH $VENV/bin/python check_kda.py \
+    --case $ROOT/goldens/kda_layer00.pt --bench
 ```
 
-**golden 不进仓库**（一个 32k 的用例约 776 MB）。放 `$ROOT/goldens/`，用脚本重新生成。
+**形状要照部署来。** `$ROOT/run/launch_glm_bf16.sh` 是 `--tp-size 16 --page-size 64
+--context-length 32768 --max-running-requests 16`，所以 KDA **每卡只有 4 个头**，
+不是 64。`check_kda.py` 在一张卡上顺序跑 16 个 rank 再把 `o_proj` 的部分和加起来：
+每卡形状是真的，同时整层还能跟未切分的 CPU 参考对上。玩具形状测不出东西 ——
+`kda.py:214` 的 autotune 挂死就是短序列也照样触发、但只有真跑真实路径才看得见。
+
+**golden 不进仓库**（KDA 的 32k 用例 1.6 GB）。放 `$ROOT/goldens/`，用脚本重新生成。
+
+### KDA 这一轮抓到的三个真 bug（都在 `ascend_kda_backend.py`，已修）
+
+对拍不是走过场：这三个都是「跑得通但算错 / 直接崩」，模块级 golden 一个也看不见。
+
+1. **prefill 的 beta 没过 sigmoid。** GLM 把 gate 摊平（`[B,T,H*K]`）交出去，同时把
+   beta 交原始值 —— CUDA 路径正是用「gate 是不是摊平的」当 `beta_is_raw`，在
+   `chunk_kda` 里补 sigmoid。Ascend 的 extend 链没这个钩子。修之前 out.prefill 差
+   **70.55×** 预算、ssm 状态差 **943.61×**；修完 0.31× / 0.22×。
+2. **decode 的 conv state 写回 dtype 不对。** GLM 的 conv 权重是 fp32、conv cache 是
+   bf16，昇腾 update 算子按权重 dtype 写回，`aclnnIndexPut` 直接报
+   `expected DT_FLOAT but found DT_BFLOAT16`。**第一次 decode 就崩**。extend 路径早就
+   有这个 fp32 工作集的绕法，decode 路径漏了。
+3. **`kda.py:214` 的 autotune 会挂死 AI core。** 真实路径必经（`chunk_kda_scaled_dot_kkt_fwd`
+   就在 `_AscendKDAExtendKernel.extend` 里），24 个 config 的 `do_bench` 扫描在**第一个**
+   config 上就 `aicore timeout`（507014）。单钉一个 config 时 triton 根本不 bench，就没事。
 
 ## 整网 tracing
 
@@ -53,8 +85,8 @@ tracing 用短 prompt（128 token 量级）就够，不要用 32k。
 |---|---|---|
 | DSA indexer（kpool） | 11 层（3,7,…,43） | ✅ **端到端已验**，见 `../tools/check_kpool_indexer_e2e_npu.py`。32k 下 pool overlap 0.99616，正好落在地板上 |
 | DSA 整层（含稀疏注意力） | 同上 | 进行中 |
-| KDA 线性注意力 | 34 层 | ⚠ 只有**模块级** golden（`../tools/golden_kda.py`），**没走 Ascend backend 的真实路径** |
-| mHC | 每层 | ⚠ 同上，模块级验过（`../tools/golden_mhc.py`） |
+| KDA 线性注意力 | 34 层 | ✅ **端到端已验**，`dump_reference.py --module kda` + `check_kda.py`。真实部署形状（tp16 → 每卡 4 头、bs=16 ragged、prefill 32768 分 8192 一块）下 6/6 在预算内，最差 0.31× |
+| mHC（pre + post） | 每层 2 个站点 × 45 层；已验 1/5/20/40 层 | ✅ **端到端已验**，见 `check_mhc.py`。走真实 `hc_pre`/`hc_post` → `npu_hc_pre`/`npu_hc_post`，**NPU 分支用调用计数证明走到了，不是假设**。97/97 用例、485 个张量全在预算内，最差 0.50×。部署形状 M=1…16384 全覆盖（TP 不切 mHC，源码确认）。sinkhorn 20 轮误差**不累积而是收缩**（1.9e-6 → 1.6e-7），迭代数经辨识确为 20（次近迭代远 267–16892 倍）|
 | MoE（288 专家） | 42 层 | ❌ **未验**，且 PLAN §4 记着**两个已知未修的精度缺陷** |
 | Dense FFN | 前 3 层 | ✅ **端到端已验**（layer 2，真实 TP16 形状：每卡 gate_up `[M,1536]`、down `[M,768]`；M=1/16/8192），最差 0.66× 预算。反向对照 `KT_DISABLE_SWIGLU_CLAMP=1` 时 `act` 失败 52–95×，说明检查有牙。⚠ **真实输入下 clamp 从不触发**（max\|gate_up\|=2.17 vs limit 10），要验 clamp 必须 `--scale-input 48` |
 | 整网逐层 trace | 45 层 | ⚠ **stage A 已跑通**（`trace_reference.py`，CPU 流式建模，128 token 3.5 min / 峰值 RSS 646 GB / 输出 755 MB）。stage B 只有**格式与 hook 定义**，真实抓取等 P4.1。**只在浅层有牙**，见下一行 |

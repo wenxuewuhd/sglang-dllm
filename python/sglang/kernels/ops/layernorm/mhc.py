@@ -1849,10 +1849,13 @@ def npu_hc_pre(
         return y, post, comb, False
 
     # Note the return order: (y, post, comb) — y is the (T, hidden)
-    # mixed activation, post / comb are the hc_post inputs. The
-    # fused kernel emits y in fp32 (sinkhorn iterates in fp32), so
-    # cast back to the input dtype before the downstream
-    # aclnnRmsNorm (which has no x=fp32 / gamma=bf16 overload).
+    # mixed activation, post / comb are the hc_post inputs. Measured
+    # dtypes out of the kernel: y follows x (bf16, *not* fp32 as this
+    # comment used to claim), post and comb are fp32 because sinkhorn
+    # iterates in fp32. The .to(dtype) below is therefore a no-op today
+    # and is kept only so the contract with the downstream aclnnRmsNorm
+    # (which has no x=fp32 / gamma=bf16 overload) survives a kernel that
+    # later starts widening y.
     y, post, comb = torch.ops.custom.npu_hc_pre(
         x,
         hc_fn,

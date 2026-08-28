@@ -339,7 +339,14 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
 
 ### P6 · 性能 ☐（可与 P3–P5 并行）
 排序按实测/静态估算的影响。**前三项都不是算子开发，算子已存在。**
-- [ ] P6.1 **mHC**（已在 P3.2 接线，待 profiling 确认收益）—— 原 torch 路径每 forward **90 次调用 / ~12,600 次 launch**
+- [x] P6.1 **mHC** —— **收益已实测**。torch 的 pre 是 **155 次 aten 调用**，融合后 **8 次**；
+      155 × 2 站点 × 45 层 = 13,950，和原先估的 ~12,600 次 launch 对得上。
+      加速比 **decode 13.8× / prefill 5.1×**，D2H 同步 0 次。
+      单站点 p50：decode(M=16) **0.211 ms**、prefill(M=8192) **2.784 ms**。
+      **sinkhorn 是个只在 prefill 有意义的旋钮**：44.8 µs/轮，占 prefill pre 的 **46%**，
+      decode 下占 **0%**（那里是 launch-bound，20 轮白送）。
+      roofline：post 高于带宽下界 2.6×、pre 9.5×（去掉 sinkhorn 是 5×）——
+      **prefill 下不是 host 开销主导**，和 DSA 的 100× 不是一回事
 - [ ] P6.2 **KDA prefill conv1d** —— `causal_conv1d_fn_npu` 内部退回 `F.conv1d`（`sgl_kernel_npu` 上游的实现选择）；
       且 Ascend 后端拆成 3 次调用而共享后端只做 1 次
 - [ ] P6.3 **MoE SwiGLU clamp** —— 现在是 2×clamp + `cat` + `npu_swiglu` 四个 kernel，可换成一个 `npu_clipped_swiglu`
