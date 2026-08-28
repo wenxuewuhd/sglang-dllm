@@ -168,3 +168,45 @@ for n_heads in (64, 32, 16, 128):
         print(f"  [OK]   quant metadata num_heads_q={n_heads}")
     except Exception as e:
         print(f"  [FAIL] quant metadata num_heads_q={n_heads}: {str(e)[:70]}")
+
+print("### 7. the full survey: is there any OTHER operator that could select over")
+print("###    a quantized key cache?  Enumerate every registered schema, don't")
+print("###    guess from the names one happens to remember.")
+import re
+
+schemas = torch._C._jit_get_all_schemas()
+by_ns = {}
+for s in schemas:
+    ns, _, name = s.name.partition("::")
+    by_ns.setdefault(ns, set()).add(name)
+KEY = re.compile(r"index|sparse|topk|top_k|select|mqa|logit|lightning|compress|nsa", re.I)
+hits = {
+    ns: sorted(n for n in names if KEY.search(n))
+    for ns, names in by_ns.items()
+    if ns in ("npu", "custom")
+}
+print(f"  npu:: {len(by_ns.get('npu', ()))} ops, custom:: {len(by_ns.get('custom', ()))} ops")
+for ns, names in hits.items():
+    print(f"  {ns}:: {len(names)} match the filter")
+
+# Of those, the ones that PRODUCE a selection (rather than consume one) over a
+# paged key cache, and the key dtype each takes:
+PRODUCERS = {
+    "npu_lightning_indexer": "bf16 keys only (measured above) -- GLM's route",
+    "npu_quant_lightning_indexer": "int8 keys, but metadata takes only 64 heads",
+    "npu_nsa_compress_attention_infer": "bf16/fp16 keys; NSA's fixed-stride block "
+    "compression, a different algorithm, and needs a value tensor",
+}
+CONSUMERS = (
+    "npu_nsa_select_attention_infer",       # takes topk_indices as input
+    "npu_kv_quant_sparse_flash_attention",  # int8 KV, takes sparse_indices as input
+    "npu_kv_quant_sparse_attn_sharedkv",
+    "npu_sparse_flash_attention",
+    "npu_gather_selection_kv_cache",
+    "npu_block_sparse_attention",
+)
+print("  producers of a selection:")
+for n, note in PRODUCERS.items():
+    print(f"    {n}: {'present' if hasattr(torch_npu, n) else 'ABSENT'} -- {note}")
+print(f"  consumers of a selection (not candidates): {', '.join(CONSUMERS)}")
+print("  => no operator on this target selects over an int8 key cache at 32 heads.")

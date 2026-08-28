@@ -156,6 +156,13 @@
 |---|---|
 | `npu_lightning_indexer` | 只收 bf16，int8 被拒 |
 | `npu_quant_lightning_indexer` | metadata 只接受 `num_heads_q=64`，GLM 是 32 |
+| `npu_nsa_compress_attention_infer` | 也只收 bf16/fp16；且是 NSA 的定步长块压缩，算法不同、还要 value |
+
+这不是凭印象列的：**全量枚举过** `npu::`（399）与 `custom::`（24）的所有算子 schema，
+按 index/sparse/topk/select/mqa/logit/lightning/compress/nsa 过滤（命中 35 + 12），
+再区分「产出选择」与「消费选择」。产出选择的只有上表三个。
+探针第 7 节可复现。**注意这是按名字过滤的枚举，不是穷尽证明** ——
+若某个名字不沾这些词的算子也能做选择，结论要改。
 
 唯一的绕法是每层每次前向把整个 cache 反量化成 bf16 —— 多一份全尺寸 buffer、多一趟 dequant，
 精度还不如直接存 bf16（那张表里 overlap=1.0 的基准**就是 bf16**）。
