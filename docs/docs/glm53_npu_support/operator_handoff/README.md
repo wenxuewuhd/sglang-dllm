@@ -77,49 +77,9 @@ kv_lora_rank = 512       hidden_size = 4096       45 layers (34 linear + 11 DSA)
 
 ## 2. The operators
 
-| # | Operator | Kind | Priority | One-line rationale |
-|---|---|---|---|---|
-| **1** | [kpool pool→raw expand + tail append (the top-k epilogue)](specs/op1_kpool_topk_transform.md) | **NEW kernel** | **highest** | The DSA indexer's inner loop. 11 layers, every decode step. **Scope narrowed — read §2a below before starting:** the pooled scoring and the group top-k already exist on Ascend and are in DeepSeek-V4 production. What is missing is the epilogue. |
-| ~~2~~ | ~~`compressor` with a LayerNorm variant~~ | — | **WITHDRAWN — do not build** | GLM never calls the vendor `compressor`. That operator appears twice in the tree, both on the DeepSeek-V4 path (`ascend_dsv4_backend.py:401`). GLM's kpool compresses through the Triton kernels in `kpool_fp8_index.py`, and its index-K `LayerNorm` is a plain module applied to the key *before* compression (`dsa_indexer_kpool.py:146`, applied at `:625`, `:645`, `:666`) — never fused into any operator. The LayerNorm-vs-RMSNorm difference was a property of DeepSeek-V4's operator, not a gap. |
-| **3** | [`npu_kv_rmsnorm_rope_cache` accepting rope width 0](specs/op3_kv_norm_rope_cache_rope0.md) | extend a torch_npu op | medium | GLM has no rotary half. Measured: rope=0 raises on both v1 and v2. A software fallback exists but costs an extra kernel + an extra pass over `[T,512]` on the 11 sparse-attention layers. |
-| ~~4~~ | ~~bf16-output `DequantSwigluClampQuant`~~ | — | **WITHDRAWN — do not build** | `torch_npu.npu_clipped_swiglu` already ships in the target runtime, supports A3, and takes bf16 in → bf16 out. Measured on device: with `alpha=1.0, limit=10.0, bias=0.0, interleaved=False` it is **bit-exact** with the reference. Its defaults are gpt-oss values, but every one is a parameter. See [`specs/op4_optional_swiglu_bf16.md`](specs/op4_optional_swiglu_bf16.md). |
-
-**Only OP-3 is a confirmed request.** OP-2 and OP-4 are withdrawn, and OP-1 is on hold with
-its scope in question. Every premise we have checked so far has resolved to "no operator
-needed" except OP-3's, which is measured twice and holds.
-
-OP-1 and the withdrawn OP-2 now reduce to **one** question, not two: kpool stores its
-compressed index keys in **fp8**, and Atlas A3 has no fp8. That single fact is what blocks
-the compression path, and it blocks it in the Triton kernels rather than in any vendor
-operator. Settle the int8 route first (README §0).
-
-### 2a. OP-1's scope is narrower than a from-scratch top-k
-
-`torch.ops.custom.npu_quant_lightning_indexer(..., cmp_ratio=4, sparse_count=..., sparse_mode=3)`
-is already in DeepSeek-V4 production (`ascend_dsv4_backend.py:729-750`), and
-`aclnnQuantLightningIndexer` exposes `cmpRatio` / `sparseCount` / `sparseIndicesOut` /
-`sparseValuesOut`. Its own bf16 reference path (`ascend_dsv4_backend.py:618-682`) scores
-over `seq // ratio` pooled entries and calls `.topk(min(index_topk, seq // ratio))`, then
-pads with `-1`. So **at `cmp_ratio=4` the pooled MQA scoring and the group top-k both
-already exist on Ascend and return pool-level indices with `-1` padding.**
-
-What is genuinely missing is the **epilogue**: expand each selected pool by `index_kpool`
-in slot order, truncate to `min(length * P, topk)`, append the visible tail, apply the
-page-table / offset map, and fill with `-1`. Scope the work as that epilogue and as
-composing it with the existing indexer — not as a new radix-select top-k.
-
-Two consequences the spec body has not yet been rewritten for:
-
-- The score tensor that the current OP-1 interface takes as input is produced today only
-  by CUDA-only kernels (`deep_gemm.fp8_paged_mqa_logits` / the tilelang variant,
-  `dsa_indexer_kpool.py:895-920`). On Ascend there is no producer for it, and the Ascend
-  op that *could* produce it fuses scoring and selection and emits indices rather than
-  scores. **Settle the composition with us before implementing to the current signature.**
-- On the decode path the logits are passed **uncleaned** (`clean_logits=False`,
-  `dsa_indexer_kpool.py:907` and `:918`; extend passes `True`). Values outside
-  `[row_starts[b], row_starts[b] + lengths[b])` are garbage and may be NaN. Any
-  implementation that vectorises to an aligned tile **must not let the padding reach a
-  max-reduction or a mask**.
+See [§0](#0-where-this-stands) for status and [`specs/`](specs/) for each request.
+OP-1's open question -- what computes the indexer logits on Ascend -- is
+[`specs/op1_kpool_topk_transform.md`](specs/op1_kpool_topk_transform.md) §5.
 
 ## 3. How the pieces fit together
 
@@ -220,15 +180,3 @@ and exact equality of the selected-score multiset — never index-by-index equal
 ties at the 512-th boundary legitimately differ between implementations, the selection
 order is unspecified, and there is no CUDA device on this machine to produce reference
 indices anyway. Full statement in [ACCEPTANCE.md](ACCEPTANCE.md).
-
-## 7. One correction to how this was originally framed
-
-The brief said the paged **decode** path passes `page_table_row_index` to OP-1. It is
-actually the ragged **extend / chunked-prefill** path that does
-(`dsa_indexer_kpool.py:1017-1043`, fed from `kpool_plan.py:414-420`); the decode call
-site at `dsa_indexer_kpool.py:921-929` leaves it `None`. **The operator must still
-support it** — prefill uses the same kernel — but it is not on the per-decode-step hot
-path. There is a real consequence for the implementation: in that mode the page table is
-the entire `req_to_token` pool, whose row stride is context-scale, so page-table
-addresses must be computed in 64-bit. Details in
-[specs/op1](specs/op1_kpool_topk_transform.md) §4.
