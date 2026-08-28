@@ -1,4 +1,24 @@
-# OP-3 — `npu_kv_rmsnorm_rope_cache`: accept rope width 0
+# OP-3 — `npu_kv_rmsnorm_rope_cache`: accept rope width 0 (WITHDRAWN)
+
+**Status: WITHDRAWN. No operator work is requested.**
+
+The operator really does reject a zero-width rope -- that measurement stands. What
+does not stand is that GLM ever calls it. Both call sites are unreachable here:
+
+- `deepseek_v2_attention_mla_npu.py:93` sits in `forward_mha_prepare_npu`'s yarn
+  branch. Every GLM MLA layer has `use_dsa=True` (measured through the repo's own
+  `get_config` against the real checkpoint), and `handle_attention_ascend` returns
+  `DSA_NPU` on both of its branches, so that function is never entered. Were it
+  entered, `glm5_next.py:665` passes `skip_rope=True` with `qk_rope_head_dim=0`, so
+  `deepseek_v2.py:1913` leaves `rotary_emb` as `None` and it would raise eleven
+  lines before reaching the operator.
+- `mla_preprocess.py:331` is behind `SGLANG_NPU_USE_MLAPO`, which defaults off, and
+  `npu_mla_prolog_v3` is absent from this build anyway.
+
+Evidence is source plus a measured config, **not** a live-service observation; P4.1
+confirms it for free when a server first runs.
+
+**Everything below is the withdrawn request, kept for the record.**
 
 **Status:** EXTEND an existing torch_npu op. **Priority: medium** (structural, but a
 workable software fallback exists — see §7).

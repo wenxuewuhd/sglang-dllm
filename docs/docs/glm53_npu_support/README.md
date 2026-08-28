@@ -65,10 +65,12 @@ kpool 的 10 个 Triton kernel 里 7 个已实测可在 triton-ascend 上跑且�
 - 涉及算子 handoff 的改动要主动 highlight。
 
 【一条血的教训】
-从源码或签名推断出来的"算子缺口"，本项目至今命中率 0/4 —— 四次都是算子本来就存在，
+从源码或签名推断出来的"算子缺口"，本项目至今命中率 **0/5**。前四次都是算子本来就存在，
 只是被默认参数、同名算子、另一个模型的属性，或者一个只差 quant_ 前缀的近名算子掩盖了
-（npu_lightning_indexer vs npu_quant_lightning_indexer）。
-**派人力之前先花十分钟把算子跑一次。**
+（npu_lightning_indexer vs npu_quant_lightning_indexer）。第五次不一样：算子限制是**真的**，
+但那个调用点 GLM 根本走不到。
+两条教训方向相反：**派人力之前先把算子跑一次**（杀掉前四个）；
+**再确认模型真的会调它**（杀掉第五个）。
 反过来，"能跑但算错"才是真危险：见 PLAN §2.4 的四个陷阱。
 
 【环境硬规则】
@@ -123,5 +125,6 @@ GPU 参考实现在 `upstream/xinyuan/glm-5.3-flash-support @ 0b9c38484e`（本�
 候选**正好落在噪声地板上**（SLACK 1.0），同样 bf16 输入下与 fp32-torch 参考逐位相同。
 详见 PLAN §2.3、§2.6、**§2.8**。
 
-**给算子团队的工单**在 [`operator_handoff/`](./operator_handoff/) —— 四个原始需求
-**全部撤销**（算子本就存在），只剩 `kv_rmsnorm_rope_cache` 支持 rope=0 这一项。
+**给算子团队的工单**在 [`operator_handoff/`](./operator_handoff/) —— **四个原始需求全部撤销，
+工单包已清空，不需要任何算子开发**。前三个是算子本就存在；OP-1 是找错了近名算子；
+OP-3 的算子限制是真的，但**调用点不在 GLM 的路径上**。

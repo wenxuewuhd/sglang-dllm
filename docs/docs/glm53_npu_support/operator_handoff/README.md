@@ -1,7 +1,10 @@
 # GLM-5.3-Flash on Ascend — operator handoff package
 
-This directory is a **self-contained work order for an Ascend kernel team**. It
-specifies one operator, gives a pure-torch reference
+**This package is empty: all four requests are withdrawn, and no operator work is
+asked for.** It is kept as a record of what was checked and why each request fell.
+
+It was a **self-contained work order for an Ascend kernel team**. It
+specified operators, gave a pure-torch reference
 implementation of each that *is* the definition of correct, ships an executable test
 suite, and states the acceptance criteria. It is meant to be implementable without
 asking us anything.
@@ -16,36 +19,35 @@ Everything here is new; nothing outside this directory was changed.
 
 ## 0. Where this stands
 
-Four operators were specified. **Three are now withdrawn, and so is the rewritten OP-1.**
-**One request remains: OP-3.** Read this section before anything else — the spec bodies
-for the withdrawn ones are kept only as a record.
+Four operators were specified. **All four are withdrawn.** Read this section before
+anything else — the spec bodies are kept only as a record.
 
 | | status |
 |---|---|
 | ~~OP-1~~ kpool | **withdrawn** — the index cache moves fp8 → **bf16**, a repo-side dtype change with no operator behind it. `torch_npu.npu_lightning_indexer` reads bf16 keys, takes GLM's 32 index heads, and already ships. See [`specs/op1_kpool_topk_transform.md`](specs/op1_kpool_topk_transform.md). |
 | ~~OP-2~~ compressor LayerNorm | **withdrawn** — GLM never calls the vendor `compressor`, and its index-K LayerNorm was never fused into an operator. |
-| **OP-3** `kv_rmsnorm_rope_cache` at rope 0 | **confirmed** — measured twice, both versions raise at rope 0. This is the one request that has held throughout. |
+| ~~OP-3~~ `kv_rmsnorm_rope_cache` at rope 0 | **withdrawn** — the operator does reject a zero-width rope, and that measurement stands; GLM simply never calls it. Both call sites are unreachable. See [`specs/op3_kv_norm_rope_cache_rope0.md`](specs/op3_kv_norm_rope_cache_rope0.md). |
 | ~~OP-4~~ bf16 swiglu | **withdrawn** — `torch_npu.npu_clipped_swiglu` already ships and is bit-exact once its four parameters are passed. |
 
-What is left reduces to one fact:
-
-- **`npu_kv_rmsnorm_rope_cache` rejects a zero-width rope**, which is GLM's configuration.
-  Measured on both 2.7.1 and 2.10; v1 and v2 both raise. This is the one request that has
-  held throughout.
-
-**Atlas A3 has no fp8** — `bishengir-compile` cannot lower the e4m3 conversion and the
+Nothing is left. **Atlas A3 has no fp8** — `bishengir-compile` cannot lower the e4m3 conversion and the
 torch side faults on device — so kpool's fp8 index cache cannot run as written. That was
 OP-1. It is no longer an operator request: storing the cache in **bf16** makes three of
 the four failing Triton kernels compile and match, and `npu_lightning_indexer` consumes
 bf16 keys directly at GLM's 32 heads, fusing the top-k. The formerly open question —
 *what computes the indexer logits on Ascend* — is answered in OP-1 §5.
 
-A note on how this package's hit rate went. Of the four operators specified from source
-reading and signatures, **four turned out to already exist** on the target, hidden behind
-default parameters, a same-named operator in another namespace, or — in OP-1's case — a
-near-identical operator name (`npu_lightning_indexer` vs `npu_quant_lightning_indexer`).
-The lesson for anyone extending this package: **run the operator before writing the
-request.**
+A note on how this package's hit rate went: **five inferred gaps, five falsified.** Four
+operators turned out to already exist on the target, hidden behind default parameters, a
+same-named operator in another namespace, or a near-identical operator name
+(`npu_lightning_indexer` vs `npu_quant_lightning_indexer`). The fifth, OP-3, was a real
+operator limitation attached to a call site GLM never reaches.
+
+Two lessons, pointing opposite ways. **Run the operator before writing the request** --
+that is what killed the first four. And **check that the model actually calls it** -- that
+is what killed the fifth. A third, from a near miss on OP-3: GLM's checkpoint carries no
+`rope_scaling`, which makes the yarn branch look dead and the request look withdrawable
+for the wrong reason; sglang's own config class synthesizes a default, so the flag is
+true. Reading the config file alone gives the opposite answer to constructing the config.
 
 ---
 
@@ -85,7 +87,7 @@ kv_lora_rank = 512       hidden_size = 4096       45 layers (34 linear + 11 DSA)
 ## 2. The operators
 
 See [§0](#0-where-this-stands) for status and [`specs/`](specs/) for each request.
-OP-1 is withdrawn; what computes the indexer logits on Ascend is answered in
+All four specs are withdrawn; what computes the indexer logits on Ascend is answered in
 [`specs/op1_kpool_topk_transform.md`](specs/op1_kpool_topk_transform.md) §5.
 
 ## 3. How the pieces fit together

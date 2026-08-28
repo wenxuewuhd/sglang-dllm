@@ -77,6 +77,11 @@ def forward_mha_prepare_npu(
     kv_a, _ = latent_cache.split([m.kv_lora_rank, m.qk_rope_head_dim], dim=-1)
     latent_cache = latent_cache.unsqueeze(1)
 
+    # NoPE models never reach here, which is why nothing needs the fused
+    # npu_kv_rmsnorm_rope_cache to accept a zero-width rope. They are DSA models,
+    # and handle_attention_ascend routes every DSA layer to DSA_NPU in both
+    # branches, so this whole function is unreachable for them; m.rotary_emb
+    # below is None for them in any case.
     if m.use_deepseek_yarn_rope:
         B, S = q.shape[0], 1
         cos, sin = m.rotary_emb.get_cos_sin_cache(
