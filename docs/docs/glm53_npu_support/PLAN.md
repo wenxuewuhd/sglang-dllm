@@ -256,38 +256,23 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
 - [ ] **P3.3 NoPE MLA** —— 已修 4 处 rope=0 早退（分流、`fused_split_qk_norm`、cos/sin 预取、rope 应用；
       下游 `q_rope/k_rope` 传 `None`）。**剩余**：20+ 处 split 早退、KV buffer 二元组语义、
       `trans_rope_weight(w,0)` 的静默损坏加 assert。**数值未对拍**
-- [ ] **P3.4 kpool indexer** —— 路线已定，**不需要纯 torch 兜底**，也**不需要新算子**。
-      **接线形态由调研定死了（详见 §2.9）：照 `DSANPUIndexerMixin` 的先例，绕开
-      `BaseIndexerMetadata`**，直接读 `get_attn_backend().forward_metadata`。
-      原因是 NPU 上 `get_indexer_metadata()` 返回 `None`（`AscendAttnBackend` 不定义它，
-      落到 ABC 默认），kpool 那套 metadata 一个都没有。
-      存储上**不改共享的打包 cache，而是照 DSv4 的 NPU 先例在旁边加一份 NPU 布局的 buffer**
-      （`npu/dsv4/dsv4_memory_pool.py:148` 的 `NPUDeepSeekV4IndexerPool` 就是这么做的：
-      基类的打包 buffer 留着，另加 int8 K + fp16 scale 的 PA_ND buffer，用
-      `npu_scatter_nd_update_` 写、给厂商算子读）。这样 CUDA 路径一行不动，
-      也绕开了那 4 个编不出来的 fp8 写入 kernel。
-      ① 加 `NPUDSATokenToKVPool`：bf16 的 `[pages, page_size, 1, 128]` PA_BSND buffer，
-         按 pool 槽位写；`index_k_with_scale_buffer_dtype` 已经是类属性，是现成的接缝；
-      ② 压缩写入（4-池化 + APE + softmax 加权 + Hadamard）在 NPU 侧用 torch/bf16 算，
-         **绕开那 4 个 fp8 kernel**，不去改它们。快不快是 P6 的事，不是 P3.4 的事；
-      ③ 加 `IndexerKPool.forward_npu`：q/k 走 bf16（没有 `act_quant`，所以
-         `_get_logits_head_gate` 里的 `q_scale` 因子要去掉 —— **是否为 weights 侧唯一差异，待确认**），
-         decode 逐行、extend 按可见-pool 分段调 `npu_lightning_indexer`（§2.6）；
-      ④ 选择之后的 pool→token 展开与尾部拼接，复用已实测逐位精确的 7 个 Triton kernel；
-      ⑤ ~~解掉 `dsa_indexer_kpool.py:1766` 的硬拦~~ —— **那行在 NPU 上根本到不了**（实测）。
-         `IndexerKPool` 只定义了 `forward_cuda`，NPU 上 dispatch 落到
-         `MultiPlatformOp.forward_npu` → `forward_native` → 裸 `NotImplementedError`。
-         别把 :1766 那句话当症状追
-      **前置门槛已通过**（§2.8）。这一轮还带出两件必须做的事：
-      ⑥ **`weights` 传 fp32，不要传 bf16**。算子收 fp32。传 bf16 时 32k 下 146/512 行会与
-         fp32-torch 参考差 1–2 个近似并列的 pool；传 fp32 则 0 行。DSv4 现在传的是 bf16
-         （`dsa_npu_indexer.py:103,108,136,141`）—— 对重合率影响在噪声内，但这是免费的；
-      ⑦ **`rotate_activation` 在 NPU 上没有实现**。`_get_q_k_bf16` 对 query 调它，它落到
-         `kernels/ops/quantization/hadamard.py` 的 CUDA JIT kernel，非 CUDA 张量直接 raise，
-         本机也没有 nvcc 编不出来。需要一个 torch 版（7 行）。**已验证**：torch 版正交
-         （2.2e-16），且与 Sylvester H128/√128 以及 Triton 侧 key 用的 `_hadamard128`
-         **逐位相同**（max|d| = 0）。这也是为什么选「保留 Hadamard」而不是「删掉」——
-         key 侧的 Triton 实现已经在算它，两侧必须一致
+- [~] **P3.4 kpool indexer** —— **代码已写完，端到端未跑过**。形态见 §2.9，数值门槛见 §2.8
+  - [x] `rotate_activation` 的 NPU 分支（原本没有实现，非 CUDA 张量直接 raise）
+  - [x] `compress_pool_bf16` —— 压缩写入的 torch 版，**与 kernel body 逐行转写 bit-identical**，
+        NPU/CPU 一致。那 4 个编不出来的 fp8 kernel 就此绕开，不改
+  - [x] `NPUDSATokenToKVPool` —— bf16 的 `(pages, page_size, 1, 128)` PA_BSND 索引缓存，
+        挂在 `memory_pool.py:3813` 的 `elif use_dsa:`（三个分支里唯一没有 `_is_npu` 的那个）。
+        decode 的写入是 kernel 的 torch 转写，**对着逐行参考验过**（含 4 种失效情形）
+  - [x] `KPoolNPUIndexerMixin.forward_npu` —— 绕开 `BaseIndexerMetadata`，
+        直接读 `forward_metadata`；head gate 去掉 `q_scale` 且保持 fp32；
+        打分用 `npu_lightning_indexer`，展开/尾部复用共享代码；
+        不传 page_table 与 offsets，输出即**逻辑 token 位置**，正是下游要的
+  - [ ] **端到端跑一次**。目前每个部件单独验过，**整条 `forward_npu` 一次都没执行过**
+  - [ ] 还没确认：`IndexerKPool.__init__` 在 NPU 上是否活得下来
+        （`:116-121` 的 `is_cuda()` 守卫会跳过 `self.sm_count` 的赋值）；
+        `_get_q_k_bf16` 在 `rope_head_dim=0` 下的实际行为（P3.3 修过 4 处，未合并验证）
+  - [ ] DSA 注意力本体还缺全零 rope 的接线（§2.3 第 3 条），否则拿到 topk 也跑不出注意力
+
 - [ ] **P3.5 出口判据** —— 四模块逐层 golden 对齐
 
 ### P4 · BF16 端到端 ☐
