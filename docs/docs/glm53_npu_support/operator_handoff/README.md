@@ -14,6 +14,34 @@ Everything here is new; nothing outside this directory was changed.
 
 ---
 
+## 0. HOLD on OP-1 — read this before starting it
+
+**Do not start OP-1 until we have finished a feasibility check.** OP-2 and OP-3 are
+unaffected; start with those.
+
+The kpool epilogue this package specifies exists today as **Triton** kernels, not CUDA
+ones, and Triton runs on this hardware through `triton-ascend`. Measured on the target
+machine: `append_kpool_tail_to_topk` — one of the kernels OP-1 would replace — **compiles
+and runs on the NPU under triton-ascend 3.2.2, and its output is bit-identical to a torch
+reference written line by line from the kernel source**, across four shape configurations.
+
+If the rest of that file behaves the same way, OP-1 is not "write a new kernel" but
+"remove the CUDA-only gates and validate the existing Triton path", which is a different
+job and possibly not one for a kernel team at all.
+
+What is still open, and why this is a hold rather than a cancellation:
+
+- Only one of the fourteen Triton kernels in `kpool_fp8_index.py` has been tried.
+- Nothing is known about how the triton-ascend path *performs* against a native AscendC
+  kernel. Correct is not the same as fast, and this sits on the decode hot path.
+- The **scoring** step is genuinely CUDA (`deep_gemm.fp8_paged_mqa_logits` and the
+  tilelang variant), not Triton, so it does not come along for free — though
+  `npu_quant_lightning_indexer` may already cover it (README §2a).
+
+We will resolve this and update the package.
+
+---
+
 ## 1. Context for someone who has never seen this project
 
 **SGLang** is an LLM inference server. We are bringing up **GLM-5.3-Flash** on

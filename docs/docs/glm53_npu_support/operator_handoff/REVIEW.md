@@ -10,6 +10,23 @@ rather than rewritten into the specs, so the specs stay a stable work order.
 
 ---
 
+## HOLD on OP-1: the kpool epilogue may already run on this hardware
+
+`append_kpool_tail_to_topk` is a **Triton** kernel (`kpool_fp8_index.py:466`, kernel at
+`:490`), and Triton runs on Ascend through `triton-ascend`, which is installed and is
+already how `sgl_kernel_npu`'s KDA and causal-conv1d kernels work.
+
+Executed on the target machine: it **compiles and runs on the NPU**, and its output is
+**bit-identical** to a torch reference transcribed line by line from the kernel body, over
+rows/cols of (4,16), (9,32), (1,8) and (17,64).
+
+That undercuts OP-1's premise. Before committing kernel-team time, check whether the other
+thirteen `@triton.jit` kernels in that file also compile and run, and measure the
+triton-ascend path against the decode-latency budget. The scoring step is separate — it is
+CUDA (`deep_gemm.fp8_paged_mqa_logits` / tilelang), not Triton, and does not come along.
+
+---
+
 ## Corrected in the package
 
 **OP-4 is withdrawn.** `torch_npu.npu_clipped_swiglu` already ships in the target runtime

@@ -745,3 +745,5 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
 | 2026-08-28 | **P3.2 的可行性已用 golden 实测坐实**：DSv4 的 `npu_hc_pre` 对 GLM 真实权重与 HF golden 三个输出全部落在噪声地板内。**并判死了 ×2 的归属——kernel 内部已经乘了，外面不能再乘**。另记录 4 个接线坑（norm_eps 1e-5、输入必须 4-D、权重必须 fp32、norm 不折叠） |
 | 2026-08-28 | **P3.2 接线完成**：`_mhc_pre_dispatch`/`_mhc_post_dispatch` 加 NPU 分支走 `npu_hc_pre`/`npu_hc_post`，启动脚本里那两个 `SGLANG_OPT_USE_TILELANG_MHC_*=False` 绕过已删。`npu_hc_post` 的 `post` 必须 2-D（实测 `[s,n,1]` 被拒）。前向已越过 mHC |
 | 2026-08-28 | **profiling 的时机定了**：现在做不了 —— 端到端跑不通（卡 P3.4），采不到 trace。顺序是 **P3.2 接线 → P3.4 先用 torch 兜底跑通 → 再 profiling 重排序**。⚠ 目前性能清单里的数字（12,600 次 launch 等）**全是静态推算不是实测**，profiling 之后要回来核 |
+| 2026-08-28 | ⚠ **可能改变 OP-1 性质的实测**：`append_kpool_tail_to_topk` 这个 **Triton kernel 在 triton-ascend 上直接跑通，且与从 kernel 源码逐行改写的 torch 参考在 4 组形状上逐位相同**。若该文件其余 13 个 `@triton.jit` 同样可跑，OP-1 就从「写新 kernel」变成「拆掉 `is_cuda` 硬拦 + 验证 Triton 路径」。**已在交接包 README §0 与 REVIEW.md 置顶为 HOLD**。仍未知：其余 kernel 是否可跑、triton-ascend 的**性能**、以及打分那步是 CUDA（deep_gemm/tilelang）**不随之可用** |
+| 2026-08-28 | P3.4 的实现路线因此改变：原打算写 torch 兜底，但查明整个 kpool 子系统（打分/top-k/cache 写/尾部）全是 Triton/CUDA，纯 torch 兜底等于移植整个子系统。**改为先做 triton-ascend 可行性扫描** |
