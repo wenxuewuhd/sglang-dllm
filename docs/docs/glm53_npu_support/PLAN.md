@@ -137,8 +137,28 @@
 | # | 算子 | 结论 | 证据 |
 |---|---|---|---|
 | B1 | **compressor 的 LayerNorm 变体** | 需要开发，但**范围很小**：vendor `compressor` 的 fused norm 是 **RMSNorm**（DSv4 用），GLM 的 index-K norm 是**真 LayerNorm（减均值 + bias）**。是"给已有算子扩一个 norm 类型" | `layers/layernorm.py:974-1014` GLM 走 `F.layer_norm(bias=True)`；`ascend_dsv4_backend.py:411` 传 `_fused_norm_weight_fp32` |
-| B2 | **GLM 版 clipped SwiGLU（非对称 clamp）** | 需要开发。`npu_clipped_swiglu` 是 **gpt-oss 语义**（`alpha=1.702, bias=1.0, interleaved=True`），GLM 是 `silu(clamp(gate, max=L)) * clamp(up, -L, L)`。本仓库早已踩过并用 `torch.clamp_` 兜底 | torch_npu 签名；`glm5_next.py:139-143`；`hardware_backend/npu/moe/activation.py:93-96,116` |
+| B2 | ~~**GLM 版 clipped SwiGLU（非对称 clamp）**~~ | ❌ **2026-08-28 撤销：不需要开发**。上机核实 GLM 与 DeepSeek-V4 的 clamp **语义逐字相同**（同公式、同 `L=10.0`），DSv4 的昇腾路径已在生产跑，GLM 复用即可，**只差把 `swiglu_limit` 从 `text_config` 接进 `MoeRunnerConfig`**。详见 §2.3.1 | `glm5_next.py:139-144` vs `npu/moe/activation.py:78-120`；两边 `swiglu_limit` 均为 10.0 |
 | B3 | **KPool 的 pool→raw 展开 + 尾部追加** | 需要开发（或用 torch 实现）。这部分是 GLM 特有的索引后处理，`compressor` / `lightning_indexer` 都不负责 | `kpool_fp8_index.py:379-401 expand_pooled_groups_to_topk`、`:421+ append_kpool_tail_to_topk` |
+
+#### 2.3.1 B2 撤销的经过（2026-08-28 上机核实）
+
+初版判断「`npu_clipped_swiglu` 是 gpt-oss 语义不可复用 → 要新开发」，**方向错了**：真正该看的不是
+`npu_clipped_swiglu`，而是 DSv4 昇腾路径实际在用的东西。核实结果：
+
+- **DSv4 现在用的根本不是融合 clamp 算子**，而是 `torch.clamp_` + 现成的
+  `npu_swiglu`（bf16）/ `npu_dequant_swiglu_quant`（int8）。这个组合**与模型无关**，GLM 直接可用
+- **两条仓库里写着的说法被实测推翻**：
+  1. 注释说 `npu_dequant_swiglu_clamp_quant` 的 `clamp_limit` 无效 —— **只在默认 `swiglu_mode=0` 下成立**。
+     `swiglu_mode=1` 时 clamp 是生效的：`glu_alpha=1.0, glu_bias=0.0, activate_left=True` 下
+     与 GLM 公式 **relerr 0.00000**（排除性对照：交换半边 0.993、up 不做下界 0.800 → 确认是 chunk 切分、非对称 clamp）
+  2. 注释说 `swiglu_clip_quant` 的 `group_alpha` 是 GLU alpha —— **不是**。该算子算完 `silu*up` 后
+     把**输出**裁到 `±group_alpha × rowmax(|y|)`，是逐 token 的**量化离群点裁剪**，
+     `group_alpha` 是行最大值的比例。**拿它做输入 clamp 是错的**
+- **唯一可能的算子需求（优化，非阻塞）**：`npu_dequant_swiglu_clamp_quant` 的 `dst_type` 被静默忽略，
+  **输出恒为 int8**。所以 W8A8 路径可以用它替掉「clamp + dequant_swiglu_quant」两趟白赚一次融合；
+  **BF16 路径用不了**。若将来要 BF16 融合，正当需求是「该算子的 BF16 输出变体」，**按优化排期**
+- ⚠ 未消解：`group_index` 的约定（逐组计数 vs 前缀和）没能区分开，集成时要确认
+- 已修正 `npu/moe/activation.py` 里那两处会误导人的注释
 
 ### 2.4 不确定项的消解结果（2026-08-27 二次核实）
 
@@ -639,3 +659,4 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
 | 2026-08-28 | **GLM-5.3-Flash BF16 首次在 NPU 起服务成功**（纯 TP16，权重 **37.25 GB/die** = 599/16，无复制）。踩到的启动期问题：`--page-size` 必须是 **64**（DSA pool 硬断言），不是 DSv4 的 128 |
 | 2026-08-28 | **P3.1a 完成**：`attention_registry.py` 的 GLM 分支加了 NPU 路由。**P3.1b 发现新问题**：`ascend_kda_backend.py:365` 的 `g.flatten(-2)` 是 Kimi 的 4-D 布局契约，GLM 的 gate 已经是 flat 的 → 校验失败。**布局问题，非算子能力问题** |
 | 2026-08-28 | **P3.2 的 D6 实测坐实**：不加 NPU 分支，第一次前向就 `NameError: deep_gemm`。已用 `SGLANG_OPT_USE_TILELANG_MHC_*=False` 临时绕开。`npu_hc_pre` 封装已存在且 DSv4 在用，P3.2 是接线不是重写 |
+| 2026-08-28 | **B2（GLM clipped SwiGLU）撤销**：上机核实与 DSv4 语义逐字相同，昇腾侧已有可用路径，**不需要算子开发**。同时推翻仓库里两处错误注释（`clamp_limit` 只在 `swiglu_mode=1` 生效；`swiglu_clip_quant` 是输出离群裁剪不是输入 clamp），已修正注释 |

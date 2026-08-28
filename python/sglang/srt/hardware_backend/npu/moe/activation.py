@@ -89,11 +89,17 @@ def apply_swiglu_limit_(hidden_states: torch.Tensor, limit: Optional[float]) -> 
     Doing it here, before the fused swiglu op, keeps the fusion intact: the kernel then
     computes silu(clamped_gate) * clamped_up, which is exactly the reference.
 
-    No fused alternative exists in this operator release, which was checked rather than
-    assumed: ``custom::npu_dequant_swiglu_clamp_quant`` accepts a ``clamp_limit`` but ignores
-    it (output stays bit-identical to the unclamped op for every ``swiglu_mode`` 0-7), and
-    ``custom::npu_swiglu_clip_quant`` computes the gpt-oss activation instead -- its
-    ``group_alpha`` is the GLU alpha, not a clamp limit. ``npu_swiglu`` takes only a dim.
+    A fused alternative exists but only for an int8 output.
+    ``custom::npu_dequant_swiglu_clamp_quant`` does honour ``clamp_limit``, but only at
+    ``swiglu_mode=1``; at the default mode 0 it ignores it, which is what an earlier check
+    here measured. At mode 1 with ``glu_alpha=1.0, glu_bias=0.0, activate_left=True`` it
+    reproduces the reference exactly, so the int8 path can drop this pre-clamp and call it
+    directly. Its ``dst_type`` is ignored and the output is always int8, so the bf16 path
+    still needs the clamp here.
+
+    ``custom::npu_swiglu_clip_quant`` is not an input clamp at all: it computes plain
+    silu*up and then clips the *output* to +/- ``group_alpha`` x rowmax(|y|), i.e. a
+    per-token quantization outlier clip. ``npu_swiglu`` takes only a dim.
 
     ``activate_left=True`` is the convention at every call site, i.e. the left half is the
     silu input (gate) and the right half is up.
