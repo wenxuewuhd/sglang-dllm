@@ -112,10 +112,28 @@ operators already exist.
 | # | Item | What runs instead | Frequency | Verdict |
 |---|---|---|---|---|
 | 1 | **mHC pre/post** (`mhc.py:1662-1674`, `:1701-1702`) | ~140 eager kernels per `hc_pre`, ~120 of them a 19-iteration Sinkhorn loop on `[s,4,4]`; `hc_post` materialises a `[s,4,4,4096]` fp32 temp — 16x its own output | **90 calls per forward** (2 x 45 layers), ~12,600 launches | **Largest item, and not kernel work.** `npu_hc_pre` / `npu_hc_post` exist and are wired for DeepSeek-V4 (`deepseek_v4.py:1905-1915`, `:2028-2029`); `mhc.py`'s flat entry points simply have no `_is_npu` branch. |
-| 2 | **KDA prefill conv1d** (`ascend_kda_backend.py:326-360`) | `F.conv1d(groups=dim)` over a dense ragged-to-padded buffer, plus a full bf16 to fp32 round-trip of the activation | 102 calls per forward (34 layers x 3) | Repo-side fix: the shared backend makes one packed call; the Ascend split into three is extend-only and unexplained. The existing `npu_fused_causal_conv1d` does **not** fit (weight K fixed at 3, GLM needs 4). |
+| 2 | **KDA prefill conv1d** (`ascend_kda_backend.py:326-360`) | `F.conv1d(groups=dim)` over a dense ragged-to-padded buffer, plus a full bf16 to fp32 round-trip of the activation | 102 calls per forward (34 layers x 3) | **No operator needs writing — see the note below.** Repo-side: the shared backend makes one packed call; the Ascend split into three is extend-only and unexplained. |
 | 3 | **MoE SwiGLU clamp** (`deepseek_v2.py:464-470`, `npu/moe/activation.py:78-122`) | two strided clamps plus a full-size `cat`, then `npu_swiglu` — four kernels where one suffices | per layer per forward | Same `npu_clipped_swiglu` that retires OP-4. Largest in prefill. |
 | 4 | DeepEP-normal device-to-host sync (`moe_runner/ascend.py:270-274`) | `.sum(0).cpu().numpy().tolist()` then straight back to device | 42x per prefill forward; decode is clean | Real but the fix lives in the third-party `deep_ep` wheel. Profile first. |
 | 5 | NoPE unfused split + RMSNorm (`deepseek_v2_attention_mla_npu.py:405-433`) | separate splits and two RMSNorms; also a `q.clone()` of `[T,1536]` that appears dead | 11 layers per forward | Same root cause as OP-3; scope together. |
+
+### On the conv1d, since three statements about it appear to disagree
+
+They describe three different things, and all three are accurate:
+
+- **`sgl_kernel_npu` does ship a Triton causal-conv1d that supports width 4.** Its
+  `KERNEL_WIDTH` has explicit branches for 1 through 6 and it reads the width from the
+  weight. That kernel is `_causal_conv1d_update_kernel_npu_tiled`, and
+  `causal_conv1d_update_npu` launches it — so **decode is fine and needs nothing**.
+- **`torch_npu.npu_fused_causal_conv1d` is a different operator**, and its documentation
+  fixes `K` at 3, so it does not fit GLM's width of 4. It is simply not the one to use.
+- **Prefill uses neither.** `causal_conv1d_fn_npu` densifies the ragged batch in
+  `prepare_data` and then calls `causal_conv1d_fn_native`, which is plain
+  `F.conv1d(groups=dim)`. That is `sgl_kernel_npu`'s own implementation choice, upstream
+  of this project.
+
+So: **no kernel work here.** The prefill cost is either upstream's to fix, or ours to
+route around, and whether it is worth doing at all should wait for a profile.
 
 Three of the six env flags the launch script sets to force torch paths are **no-ops on
 this model** — `SGLANG_OPT_USE_FUSED_HASH_TOPK` (GLM has no hash layers, and
