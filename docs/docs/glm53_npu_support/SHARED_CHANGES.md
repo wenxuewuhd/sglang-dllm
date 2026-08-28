@@ -128,6 +128,68 @@ int32 上限 2.1e9，**要到 20 亿的上下文才会溢出**。
 
 ---
 
+## 4. `layers/quantization/mxfp4_flashinfer_trtllm_moe.py` —— 只报告，**没改**
+
+**问题**：`maybe_fuse_routed_scale_and_shared_add()` 的**第一句**是
+
+```python
+from sglang.srt.layers.quantization.expert_pack import ExpertPackMoEMethod
+```
+
+而 `expert_pack.py` 的模块头部是 `from sgl_kernel.quantization import ggml_moe_a8_vec`。
+`sgl_kernel` 是 CUDA 扩展。于是在任何 quant-method 判断之前就
+`ModuleNotFoundError: No module named 'sgl_kernel'`。
+
+**谁会碰到**：`DeepseekV2MoE.forward_normal` **每次 forward 的结尾**都调它，
+而 GLM 的 MoE 就是它（`glm5_next.py:106`：`from ...deepseek_v2 import DeepseekV2MoE as Glm5NextMoE`）。
+所以 **GLM 在昇腾上的每一次 MoE decode 都会撞上**；DSv4 / 任何非 CUDA 平台的
+DeepseekV2 系 MoE 同理。
+
+**实测**（2026-08-29，`layer_check/graph_capture/cap_runner_layers.py`，A3 单卡）：
+GLM layer 3 的 MoE 在图捕获的第一次 forward 就抛这个异常。
+之前没暴露，是因为 `check_moe.py` / `cap_moe.py` 都是**手搭 moe runner**、
+不经过 `DeepseekV2MoE.forward`。
+
+**为什么没改**：共享路径（`layers/quantization/`），按本文件的规矩先报告。
+
+**建议的修法**（一行位置）：把那个 import 挪进 `isinstance` 判断里，或者包一层
+`try: ... except ImportError: ExpertPackMoEMethod = ()`。函数体里另外三个
+Mxfp4* import 也是 CUDA-only 但它们**没有**模块级的 `sgl_kernel` 依赖，所以只有
+`expert_pack` 这一条是致命的。
+
+**绕过（测试用，不进产品路径）**：
+`layer_check/graph_capture/runner_fixture.py:patch_shared_path_gaps()`
+把这个函数替成它自己的 `fused=False` 分支（昇腾必然走的那条）。
+
+**回归**：CUDA 侧不受影响（import 本来就成功）。修完需要在 CUDA 上跑一次
+DeepseekV2/V4 的 MoE 前向确认 `fused` 判定没变。
+
+---
+
+## 4. `layers/quantization/mxfp4_flashinfer_trtllm_moe.py` —— 把一个 CUDA-only 的 import 包起来
+
+**改动**：`maybe_fuse_routed_scale_and_shared_add()` 里对 `ExpertPackMoEMethod` 的 import
+改成 `try/except ImportError`，导不进来就不放进 `isinstance` 的元组。
+
+**为什么**：`expert_pack.py` 模块头部有 `from sgl_kernel.quantization import ggml_moe_a8_vec`，
+而 `sgl_kernel` 在昇腾上**不存在**（实测：`ModuleNotFoundError: No module named 'sgl_kernel'`）。
+这个函数被 `DeepseekV2MoE.forward_normal` 在**每次 forward 的结尾**调用
+（`deepseek_v2.py:1071` 与 `:1211`），GLM 的 MoE 就是它。
+**所以昇腾上每一次 MoE forward 都会 ModuleNotFoundError** —— 整网跑不起来。
+
+（这个 bug 之前没暴露，是因为整网启动更早死在 kpool 的 `NotImplementedError` 上，
+根本没走到 layer 3 的 MLP；而单层的 `check_moe.py` 直接驱动 MoE 模块，不走 `forward_normal`。）
+
+**谁受影响**：所有**没有** `sgl_kernel` 的平台。**CUDA 上 import 成功，元组完全相同，行为不变。**
+
+**为什么这样改是安全的**：那个类只出现在一个 `isinstance` 判断里。
+**模块导不进来，就不可能有对象是它的实例**，所以从元组里省掉它在语义上恰好等价。
+另外三个 mxfp4 方法在昇腾上 import 都是好的（实测），只有 `expert_pack` 一个坏。
+
+**回归**：CUDA 不需要（import 成功时代码路径逐字相同）。昇腾上实测函数两条分支都正确。
+
+---
+
 ## 待决：三处只报告、没改的问题（图捕获那一轮发现）
 
 这三处**没有改动**，记在这里是因为**都会影响 GLM 之外的东西**，改不改要先定。
@@ -136,22 +198,53 @@ int32 上限 2.1e9，**要到 20 亿的上下文才会溢出**。
 对 `ascend_backend.py:792`。runner 按顶层 backend 报的填充值去填 padded `seq_lens`，
 而 `HybridLinearAttnBackend` 把这个问题**委托给全注意力那一半**（昇腾上是 **0**），
 `MambaAttnBackendBase` 自己却缓存成 **1**。CUDA 上两边碰巧都是 1，所以没暴露。
-**今天不炸**（decode runner 显式传 `num_padding`，那个比较是死代码），但任何不传
-`num_padding` 的路径会**静默把 padding 当真实行**。
-修法 A：`AscendKDAAttnBackend` 覆写返回 0（NPU 树内，2 行）；
-修法 B：改共享 `_replay_metadata` 去问顶层 backend（**动共享 CUDA 路径**）。
+
+**2026-08-29 实测**（走真实 `NPUGraphRunner`，`cap_runner_layers.py`，部署形状）：
+
+- **不一致是真的**：`runner.seq_len_fill_value = 0`（顶层 `_AscendKDAHybrid` 报的），
+  `AscendKDAAttnBackend.get_cuda_graph_seq_len_fill_value() = 1`。
+  GLM 的线性半边解析到的是 **`MambaAttnBackendBase._replay_metadata`**
+  （`AscendKDAAttnBackend → KDAAttnBackend → MambaAttnBackendBase`；
+  昇腾自己那份 `AscendMambaAttnBackendBase._replay_metadata`（fill=0）**GLM 走不到**）。
+- **今天确实是死代码**：`build_replay_fb_view` 无条件设
+  `num_padding=bs-raw_bs`（`decode_cuda_graph_runner.py:188`），所以
+  `if num_padding is None` 那个 fallback 在 decode 图路径上永远不进。
+- **如果进了会怎样（实测，不是推断）**：把同一个 padded batch
+  （bucket 16，3 行 padding，`seq_lens=[...,0,0,0]`）用 `num_padding=None`
+  重新 plan 一次再 replay ——
+  fallback 数出 `num_padding = 0`（它拿 1 去比 0），真值是 3。
+  后果是 `mamba_indices[bs-0:] = -1` 这一步被跳过，**padding 行被当成真实行**
+  写进 mamba slot 0，而不是被 `-1`（PAD_SLOT_ID）屏蔽掉。
+  **真实行的输出仍然逐位相同**，被弄脏的只有 mamba slot 0 ——
+  也就是说**爆炸半径是被池子的布局兜住的**（`MambaSlotAllocator` 的
+  `free_slots = arange(1, size+1)` 把 slot 0 留作 padding 的 dummy），
+  **不是被 metadata 代码兜住的**。哪天有池子把 slot 0 发给真实请求，
+  那个请求的状态就没了。
+- 修法不变：A（`AscendKDAAttnBackend` 覆写返回 0，NPU 树内 2 行）
+  或 B（改共享 `_replay_metadata` 去问顶层 backend）。**仍未改。**
 
 **②「`seq_lens_cpu_list` 在捕获时被永久烘死」** —— `ascend_backend.py:645` 算一次，
-`_apply_cuda_graph_metadata` 从不刷新，然后 `forward_decode_graph` 把它当
-`actual_seq_lengths_kv` 喂给 FIA。**GLM 逃过一劫**：DSA 在 `:2607` 就短路进
-`forward_sparse`，到不了 `:2620`。但**对任何走 FIA 的非 DSA 昇腾模型是活的 bug**，
-而且是那种「不报错、数值悄悄错」的。在 NPU 树内可改，但会影响其他昇腾模型。
+`_apply_cuda_graph_metadata` 从不刷新。
+
+**2026-08-29 实测**：确认**永久失效**。捕获时填的是静态 buffer 的初值
+（`[0]*bs`），之后不管 replay 用什么 `seq_lens`，
+`graph_metadata[bs].seq_lens_cpu_list` 一直是 `[0, 0, ...]`；
+同一个 metadata 的**设备** `seq_lens` 则被就地刷新成真值。
+另外 `seq_lens_cpu_int` 在图模式下**根本是 None**（只有 `init_forward_metadata`
+这条 eager 路径会设它）。
+
+**GLM 确实逃过**：把 `seq_lens` 换掉再 replay，输出与 eager **逐位相同**
+（`cap_runner_layers.py` 的场景 C，部署形状下 bs 桶 1..16 全绿）。
+因为 DSA 在 `:2607` 就短路进 `forward_sparse`，那里用的是
+`forward_metadata.seq_lens`（设备张量），到不了 `:2620` 的 `forward_decode_graph`。
+**对任何走 FIA 的非 DSA 昇腾模型仍然是活的、静默的 bug。** 仍未改。
 
 **③「MoE 的 `group_list` 会被烘死」** —— `layers/moe/moe_runner/ascend.py:277` 把每步都变的
-host list 物化成设备张量喂 `npu_grouped_matmul`。**GLM 的部署配方
-（`--moe-a2a-backend none`）走不到**，`--deepep-mode normal` 就活了。**共享代码。**
+host list 物化成设备张量喂 `npu_grouped_matmul`。
 
----
+**2026-08-29 实测**：GLM 的部署配方下 `get_moe_a2a_backend() = NONE`、
+`is_deepep() = False`，quant method 是 `UnquantizedFusedMoEMethod`，
+**这条分支根本不进**。`--deepep-mode normal` 就活了。**共享代码，仍未改。**
 
 ## 关于 DSv4 回归
 

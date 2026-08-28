@@ -382,7 +382,6 @@ def maybe_fuse_routed_scale_and_shared_add(
     # alpha=scale)`. With no shared output, the missing scale is applied
     # in-place. Otherwise `routed` is already scale-final and we just add
     # `shared` (or pass through if there is none).
-    from sglang.srt.layers.quantization.expert_pack import ExpertPackMoEMethod
     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
         Mxfp4FlashinferCutlassMoEMethod,
     )
@@ -390,15 +389,26 @@ def maybe_fuse_routed_scale_and_shared_add(
         Mxfp4MarlinMoEMethod,
     )
 
-    fused = isinstance(
-        experts.quant_method,
-        (
-            Mxfp4FlashinferTrtllmMoEMethod,
-            Mxfp4FlashinferCutlassMoEMethod,
-            Mxfp4MarlinMoEMethod,
-            ExpertPackMoEMethod,
-        ),
-    )
+    fused_methods = [
+        Mxfp4FlashinferTrtllmMoEMethod,
+        Mxfp4FlashinferCutlassMoEMethod,
+        Mxfp4MarlinMoEMethod,
+    ]
+    try:
+        # expert_pack imports sgl_kernel at module scope, so this raises on any
+        # platform without it -- Ascend, for one. Every MoE forward reaches here
+        # (DeepseekV2MoE.forward_normal calls it at the end), so the unguarded
+        # import made MoE unrunnable there. A method class that cannot be
+        # imported cannot be the type of anything, so leaving it out of the
+        # isinstance tuple is not a behaviour change; where the import succeeds
+        # the tuple is identical.
+        from sglang.srt.layers.quantization.expert_pack import ExpertPackMoEMethod
+    except ImportError:
+        pass
+    else:
+        fused_methods.append(ExpertPackMoEMethod)
+
+    fused = isinstance(experts.quant_method, tuple(fused_methods))
     if fused:
         if shared is not None:
             return shared.add_(routed, alpha=routed_scaling_factor)

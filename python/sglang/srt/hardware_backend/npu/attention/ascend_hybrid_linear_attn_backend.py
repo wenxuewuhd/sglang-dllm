@@ -226,6 +226,32 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
     ):
         super().__init__(full_attn_backend, linear_attn_backend, full_attn_layers)
 
+    @property
+    def forward_metadata(self):
+        """The full-attention half's metadata, for the Ascend DSA indexer.
+
+        ``kpool_indexer_npu.forward_npu`` and ``dsa_npu_indexer`` read
+        ``get_attn_backend().forward_metadata`` directly (block_tables,
+        seq_lens, actual_seq_lengths_*).  On a non-hybrid Ascend model
+        ``get_attn_backend()`` *is* the ``AscendAttnBackend`` that owns those
+        fields; on a hybrid model (GLM-5.3-Flash) it is this wrapper, which has
+        no ``forward_metadata`` of its own -- so those reads raised
+        ``AttributeError`` on the very first DSA layer of a hybrid decode.
+        The full-attention half owns the KV block tables, so delegating there
+        hands out the same object the non-hybrid path reads.
+
+        Same shape as ``ShortConvHybridAttnBackend.forward_metadata``
+        (``linear/inkling_sconv_backend.py``), setter included: the eager
+        runner's idle path does ``attn_backend.forward_metadata = None``
+        (``runner/eager_runner.py``) to drop stale metadata, and a read-only
+        property would turn that into an AttributeError.
+        """
+        return self.full_attn_backend.forward_metadata
+
+    @forward_metadata.setter
+    def forward_metadata(self, value):
+        self.full_attn_backend.forward_metadata = value
+
     def update_mamba_state_after_mtp_verify(
         self,
         last_correct_step_indices: torch.Tensor,
