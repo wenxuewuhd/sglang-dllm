@@ -1,5 +1,26 @@
 # OP-2 — `compressor`: add a LayerNorm variant to the fused norm
 
+**Status: WITHDRAWN — do not build this.**
+
+GLM-5.3-Flash never calls the vendor `compressor`. That operator is referenced twice in
+the tree and both are the DeepSeek-V4 path (`ascend_dsv4_backend.py:401`, and a docstring
+in `dsv4_memory_pool.py:407`). GLM's kpool compresses through the Triton kernels in
+`kpool_fp8_index.py`, reached via `IndexerKPool._compress_write_*` and the pool's
+`kpool_*_update_index_cache`.
+
+The LayerNorm concern does not survive either: GLM's index-K norm is a plain `LayerNorm`
+module (`dsa_indexer_kpool.py:146`) applied to the key *before* it enters the compression
+path (`:625`, `:645`, `:666`). It was never fused into an operator, so there is nothing to
+extend. "The vendor op fuses RMSNorm only" was true of DeepSeek-V4's operator and not a
+statement about GLM.
+
+What genuinely blocks GLM's compression is fp8: the compress-and-write Triton kernels do
+not compile on A3 because it cannot express the e4m3 conversion. That is the same question
+as OP-1's, and it is one question rather than two.
+
+The sections below are kept as a record of what was traced.
+
+
 **Status:** EXTEND an existing vendor op. **Priority: high** (blocks the GLM DSA
 indexer's compressed index-K path; 11 layers).
 

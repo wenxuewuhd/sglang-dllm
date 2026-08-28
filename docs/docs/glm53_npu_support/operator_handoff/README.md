@@ -89,12 +89,18 @@ kv_lora_rank = 512       hidden_size = 4096       45 layers (34 linear + 11 DSA)
 | # | Operator | Kind | Priority | One-line rationale |
 |---|---|---|---|---|
 | **1** | [kpool pool→raw expand + tail append (the top-k epilogue)](specs/op1_kpool_topk_transform.md) | **NEW kernel** | **highest** | The DSA indexer's inner loop. 11 layers, every decode step. **Scope narrowed — read §2a below before starting:** the pooled scoring and the group top-k already exist on Ascend and are in DeepSeek-V4 production. What is missing is the epilogue. |
-| **2** | [`compressor` with a LayerNorm variant](specs/op2_compressor_layernorm.md) | extend a vendor op | high | The vendor op fuses RMSNorm only; GLM's index-K norm is a true LayerNorm. Blocks the compressed index-K path on the same 11 layers. |
+| ~~2~~ | ~~`compressor` with a LayerNorm variant~~ | — | **WITHDRAWN — do not build** | GLM never calls the vendor `compressor`. That operator appears twice in the tree, both on the DeepSeek-V4 path (`ascend_dsv4_backend.py:401`). GLM's kpool compresses through the Triton kernels in `kpool_fp8_index.py`, and its index-K `LayerNorm` is a plain module applied to the key *before* compression (`dsa_indexer_kpool.py:146`, applied at `:625`, `:645`, `:666`) — never fused into any operator. The LayerNorm-vs-RMSNorm difference was a property of DeepSeek-V4's operator, not a gap. |
 | **3** | [`npu_kv_rmsnorm_rope_cache` accepting rope width 0](specs/op3_kv_norm_rope_cache_rope0.md) | extend a torch_npu op | medium | GLM has no rotary half. Measured: rope=0 raises on both v1 and v2. A software fallback exists but costs an extra kernel + an extra pass over `[T,512]` on the 11 sparse-attention layers. |
 | ~~4~~ | ~~bf16-output `DequantSwigluClampQuant`~~ | — | **WITHDRAWN — do not build** | `torch_npu.npu_clipped_swiglu` already ships in the target runtime, supports A3, and takes bf16 in → bf16 out. Measured on device: with `alpha=1.0, limit=10.0, bias=0.0, interleaved=False` it is **bit-exact** with the reference. Its defaults are gpt-oss values, but every one is a parameter. See [`specs/op4_optional_swiglu_bf16.md`](specs/op4_optional_swiglu_bf16.md). |
 
-**Do them in that order.** OP-1 is most of the value; OP-2 and OP-3 are small deltas on
-code that already exists.
+**Only OP-3 is a confirmed request.** OP-2 and OP-4 are withdrawn, and OP-1 is on hold with
+its scope in question. Every premise we have checked so far has resolved to "no operator
+needed" except OP-3's, which is measured twice and holds.
+
+OP-1 and the withdrawn OP-2 now reduce to **one** question, not two: kpool stores its
+compressed index keys in **fp8**, and Atlas A3 has no fp8. That single fact is what blocks
+the compression path, and it blocks it in the Triton kernels rather than in any vendor
+operator. Settle the int8 route first (README §0).
 
 ### 2a. OP-1's scope is narrower than a from-scratch top-k
 

@@ -136,7 +136,7 @@
 
 | # | 算子 | 结论 | 证据 |
 |---|---|---|---|
-| B1 | **compressor 的 LayerNorm 变体** | 需要开发，但**范围很小**：vendor `compressor` 的 fused norm 是 **RMSNorm**（DSv4 用），GLM 的 index-K norm 是**真 LayerNorm（减均值 + bias）**。是"给已有算子扩一个 norm 类型" | `layers/layernorm.py:974-1014` GLM 走 `F.layer_norm(bias=True)`；`ascend_dsv4_backend.py:411` 传 `_fused_norm_weight_fp32` |
+| B1 | ~~**compressor 的 LayerNorm 变体**~~ | ❌ **2026-08-28 撤销：GLM 根本不调这个算子**。vendor `compressor` 全仓只有两处引用，都在 DSv4 路径（`ascend_dsv4_backend.py:401`）。GLM 的 kpool 走 `kpool_fp8_index.py` 的 Triton kernel；且 GLM 的 index-K norm 是**独立的 `LayerNorm` 模块**（`dsa_indexer_kpool.py:146`），在进压缩路径**之前**作用于 key（`:625`/`:645`/`:666`），**从来就没有融合进算子**。原判断： ：vendor `compressor` 的 fused norm 是 **RMSNorm**（DSv4 用），GLM 的 index-K norm 是**真 LayerNorm（减均值 + bias）**。是"给已有算子扩一个 norm 类型" | `layers/layernorm.py:974-1014` GLM 走 `F.layer_norm(bias=True)`；`ascend_dsv4_backend.py:411` 传 `_fused_norm_weight_fp32` |
 | B2 | ~~**GLM 版 clipped SwiGLU（非对称 clamp）**~~ | ❌ **不需要开发**。而且比第一次撤销时以为的还简单：**`torch_npu.npu_clipped_swiglu` 直接可用**——`alpha=1.0, limit=10.0, bias=0.0, interleaved=False` 下与 GLM 公式**逐位相同**（两次独立上机验证；用默认参数则差 156，这正是当初误判「gpt-oss 语义不可复用」的来源：**默认值是 gpt-oss 的，但每个都是参数**）。bf16 进 bf16 出，A3 支持。详见 §2.3.1 | 本机实测；`glm5_next.py:139-144` |
 | B3 | **KPool 的 pool→raw 展开 + 尾部追加** | 需要开发（或用 torch 实现）。这部分是 GLM 特有的索引后处理，`compressor` / `lightning_indexer` 都不负责 | `kpool_fp8_index.py:379-401 expand_pooled_groups_to_topk`、`:421+ append_kpool_tail_to_topk` |
 
@@ -757,3 +757,4 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
 | 2026-08-28 | ⚠ **`npu_quant_lightning_indexer` 无法表达 GLM 的 indexer**：其 metadata 算子**只接受 `num_heads_q=64`**，而 GLM 的 `index_n_heads=32`。这动摇了把 OP-1 的打分环节交给该算子的设想 |
 | 2026-08-28 | ⚠ **KDA prefill 在 Triton autotune 时挂死 AI core**（`kda.py:214` 的 24 config `do_bench` 扫描 → `aicore timeout` 507014，在 die 4/6/8 上 **3/3 复现**）。单独钉住任一 config 都能跑通 → 是 benchmark 扫描本身的问题。⚠ 但实际 TP16 服务跑过 KDA 层 0–2 没触发，**列为「上线前必须确认」而非已证实的阻塞** |
 | 2026-08-28 | `torch.ops.custom.compressor` 与 `npu_quant_lightning_indexer` 的 kernel **无法在独立 harness 里驱动**（都需要活的 pool/page-table），返回不透明错误 → **OP-2 的前提仍未验证**。`ascend_dsv4_backend.py:401` 调的是 `torch.ops.npu.compressor`，与 `torch.ops.custom.compressor` **不是同一个**（本 build 只有 custom 命名空间有） |
+| 2026-08-28 | **B1 / OP-2 撤销**：GLM 从不调用 vendor `compressor`（全仓两处引用均在 DSv4 路径），且其 index-K LayerNorm 是独立模块、压缩前施加、从未融合。「vendor 只融合 RMSNorm」是 DSv4 算子的属性，不是 GLM 的缺口。**真正挡住 GLM 压缩的是 fp8**，且挡在 Triton kernel 里而不是任何 vendor 算子里 → 与 OP-1 合并为**同一个问题** |
