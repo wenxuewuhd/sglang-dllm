@@ -365,7 +365,10 @@ def forward_dsa_prepare_npu(
         )
     else:
         fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
-        if m.rotary_emb.is_neox_style:
+        # NoPE models (GLM-5.3-Flash: qk_rope_head_dim == 0) build no rotary_emb
+        # at all, so the style of a rope that does not exist cannot be asked for.
+        has_rope = m.qk_rope_head_dim > 0
+        if has_rope and m.rotary_emb.is_neox_style:
             q, latent_cache = fused_qkv_a_proj_out.split(
                 [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
             )
@@ -400,7 +403,8 @@ def forward_dsa_prepare_npu(
                 torch.npu.current_stream().wait_event(q_event)
         else:
             if (
-                fused_qkv_a_proj_out.shape[0] < 65535
+                has_rope
+                and fused_qkv_a_proj_out.shape[0] < 65535
                 and not dsa_use_prefill_cp(forward_batch)
                 and not getattr(m, "_disable_npu_fused_split_qk_norm", False)
             ):
@@ -435,12 +439,13 @@ def forward_dsa_prepare_npu(
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        if m.layer_id == 0:
-            m.rotary_emb.sin_cos_cache = m.rotary_emb.cos_sin_cache.index_select(
-                0, positions
-            )
+        if has_rope:
+            if m.layer_id == 0:
+                m.rotary_emb.sin_cos_cache = m.rotary_emb.cos_sin_cache.index_select(
+                    0, positions
+                )
 
-        q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+            q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
@@ -490,8 +495,11 @@ def forward_dsa_core_npu(
         k_nope.contiguous(),
         forward_batch,
         save_kv_cache=True,  # False if forward_batch.forward_mode.is_extend() else True,
-        q_rope=q_pe.contiguous(),
-        k_rope=k_pe.contiguous(),
+        # query_rope / key_rope are Optional on the Ascend sparse attention op;
+        # a NoPE model splits out zero-width tensors, which must be dropped
+        # rather than handed over as empty.
+        q_rope=q_pe.contiguous() if q_pe is not None and q_pe.shape[-1] else None,
+        k_rope=k_pe.contiguous() if k_pe is not None and k_pe.shape[-1] else None,
         topk_indices=topk_indices,
     )
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)

@@ -497,8 +497,20 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
       - **实测已撞到 D3 的第一处**：`npu/modules/deepseek_v2_attention_mla_npu.py:368`
         无条件访问 `m.rotary_emb.is_neox_style`，而 GLM 的 `qk_rope_head_dim=0` 根本没建 rope 模块
         → `AttributeError: 'NoneType' object has no attribute 'is_neox_style'`
-      - 这是**当前 GLM BF16 前向的最前沿阻塞点**
-- [ ] P3.4 **kpool indexer**：解掉 `kpool_fp8_index.py:588` 与 `dsa_indexer_kpool.py:1766` 的非 CUDA 硬拦，用 `torch.topk` 打通 `group_topk=512`
+      - [x] **已修第一批（4 处）**，`deepseek_v2_attention_mla_npu.py`：
+        引入 `has_rope = m.qk_rope_head_dim > 0`；① 分流不再问 `rotary_emb.is_neox_style`；
+        ② `fused_split_qk_norm` 没有 rope=0 形态，rope=0 时走未融合的普通 split；
+        ③ `sin_cos_cache` 预取与 rope 应用整体跳过；
+        ④ 下游 `attn_mqa` 的 `q_rope`/`k_rope` **传 `None` 而不是零宽张量**
+        （依据 A2：这两个参数本就是 Optional）
+      - **实测生效**：AttributeError 消失，前向推进到 indexer
+      - ⚠ 仅证明「不崩」，**数值尚未对拍**（要配 HF `Glm5NextTextAttention` golden）
+- [ ] P3.4 **kpool indexer**：解掉 `dsa/kpool_fp8_index.py:583/589` 与 `dsa/dsa_indexer_kpool.py:1766`
+      的非 CUDA 硬拦，用 `torch.topk` 打通 `group_topk=512`
+      （⚠ 路径已随 rebase 移入 `layers/attention/dsa/` 子目录，行号仍对得上）
+      - **这是当前 GLM BF16 前向的最前沿阻塞点**：`deepseek_v2_attention_mla_npu.py:457`
+        调 `m.indexer(...)` → `NotImplementedError`
+      - 做法见 §3 的 P3.4 段（路由到拆解路径 + 自写 torch ragged top-k + 补 `page_table_row_index`）
 - [ ] P3.5 **出口判据**：四个模块逐层 golden 对齐
 
 #### P3 的 golden 来源：**HuggingFace `transformers==5.16.1`**（2026-08-28 确定）
@@ -669,3 +681,5 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
 | 2026-08-28 | **P3.2 的 D6 实测坐实**：不加 NPU 分支，第一次前向就 `NameError: deep_gemm`。已用 `SGLANG_OPT_USE_TILELANG_MHC_*=False` 临时绕开。`npu_hc_pre` 封装已存在且 DSv4 在用，P3.2 是接线不是重写 |
 | 2026-08-28 | **B2（GLM clipped SwiGLU）撤销**：上机核实与 DSv4 语义逐字相同，昇腾侧已有可用路径，**不需要算子开发**。同时推翻仓库里两处错误注释（`clamp_limit` 只在 `swiglu_mode=1` 生效；`swiglu_clip_quant` 是输出离群裁剪不是输入 clamp），已修正注释 |
 | 2026-08-28 | **P3.1 完成并实测通过**：`_flat_kda_gate` 修掉 Kimi/GLM 的 gate 布局契约不匹配（不改算子、零额外运算）。GLM BF16 前向现已越过 KDA，**最前沿阻塞点前移到 P3.3 的 NoPE MLA**（`deepseek_v2_attention_mla_npu.py:368` 假设 rope 存在） |
+| 2026-08-28 | **P3.3 第一批修完并实测**：NoPE（rope=0）在 NPU MLA 路径上的 4 处假设已早退，前向越过 MLA。**P3 的四个模块按 PLAN 预测的顺序逐个暴露：KDA → mHC → NoPE MLA → kpool**，现在停在 P3.4 |
+| 2026-08-28 | 走到这里为止，**PLAN §2.6「BF16 打通不被任何算子硬卡住」仍然成立**：暴露的全部是框架接线问题（page_size、mHC dispatch、KDA gate 布局、rope=0 空指针），**没有一个是缺算子** |
