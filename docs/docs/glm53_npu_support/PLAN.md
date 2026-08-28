@@ -261,6 +261,14 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
 
 ### P4 · BF16 端到端 ☐
 - [ ] P4.1 TP16 / 32K / 纯文本 / 关 NPU Graph 启动
+      **关 graph 只是 bring-up 顺序，不是终态** —— 开 graph 是 P6.6，一定要做。
+      P4 关掉的理由：捕获会把「算错」变成更难查的「算错」（静态 shape/地址、
+      host 侧控制流被烘进图里或直接打断捕获），而 kpool 这条路上到处是 host 侧控制流
+      （`_compress_write_extend` 在 python 循环里读 `extend_seq_lens_cpu[i]`；
+      `moe_runner/ascend.py:270` 的 D2H 同步）。先拿到一个可调试的正确基线。
+      另外 `npu_lightning_indexer` 在捕获下能否用**尚未验证**（§2.6）；
+      decode 侧形状是静态的（每 batch 一行、`sparse_count` 固定），**推断**可捕获，
+      prefill 的分段数随位置变化但 prefill 本来就不捕获
 - [ ] P4.2 **出口判据**：**GSM8K 97.50%**（GPU 分支 cookbook 口径：全 1319 题、stop rate 100%、4×GB300 TP4/EP4）
       - ⚠ **该数字是 thinking 打开测的**（`temperature=1.0, top_p=0.95, max_tokens=32768`，`sgl-eval run gsm8k --thinking`）
       - ⚠ cookbook 的速度数字带 `SGLANG_SIMULATE_ACC_LEN=3`，**只能当吞吐口径**

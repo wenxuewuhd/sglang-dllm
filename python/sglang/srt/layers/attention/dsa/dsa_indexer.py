@@ -186,6 +186,11 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
         from fast_hadamard_transform import hadamard_transform
     elif _is_xpu:
         from sgl_kernel import hadamard_transform
+    elif _is_npu:
+        # The default resolves to a CUDA JIT kernel that rejects non-CUDA tensors.
+        from sglang.srt.hardware_backend.npu.attention.kpool_indexer_npu import (
+            hadamard_transform_npu as hadamard_transform,
+        )
     else:
         from sglang.kernels.ops.quantization.hadamard import hadamard_transform
 
