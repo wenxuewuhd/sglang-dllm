@@ -1060,6 +1060,53 @@ class AscendAttnBackend(AttentionBackend):
         attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0)
         return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    # One zero page per (device, dtype, page shape), aliased across the whole
+    # cache -- see _nope_zero_rope.
+    _nope_rope_page: dict = {}
+
+    #: The only rope width npu_sparse_flash_attention accepts (measured: None, 0,
+    #: 16, 32 and 128 all raise).
+    NOPE_ROPE_WIDTH = 64
+
+    def _nope_zero_rope(self, q_nope: torch.Tensor, k_nope: torch.Tensor):
+        """An all-zero rope for a NoPE model, which the operator insists on.
+
+        ``npu_sparse_flash_attention`` documents ``query_rope`` / ``key_rope`` as
+        optional, but rejects a missing rope, a zero-width one, and every width
+        except 64. A zero rope is free in exact arithmetic -- it contributes 0 to
+        every score -- and against a torch MLA reference the result comes back at
+        rel 3e-3, which is bf16 output rounding.
+
+        A real key rope would be a second paged cache, ~10% more KV holding
+        nothing but zeros. One zero page aliased across every page with a
+        stride-0 ``expand`` gives bit-identical results, and the query side takes
+        the same treatment.
+
+        ⚠ The operator's docs say non-contiguous inputs are unsupported, so the
+        aliasing is observed behaviour, not promised behaviour. If a CANN update
+        stops honouring the stride, allocate real tensors instead -- correct,
+        just larger.
+        """
+        w = self.NOPE_ROPE_WIDTH
+        key = (k_nope.device, k_nope.dtype, tuple(k_nope.shape[1:-1]))
+        page = self._nope_rope_page.get(key)
+        if page is None:
+            page = torch.zeros(
+                (1, *k_nope.shape[1:-1], w), dtype=k_nope.dtype, device=k_nope.device
+            )
+            self._nope_rope_page[key] = page
+        k_pe = page.expand(k_nope.shape[0], *([-1] * (k_nope.dim() - 1)))
+        q_key = (q_nope.device, q_nope.dtype, q_nope.dim())
+        q_page = self._nope_rope_page.get(q_key)
+        if q_page is None:
+            q_page = torch.zeros(
+                (1,) * (q_nope.dim() - 1) + (w,),
+                dtype=q_nope.dtype,
+                device=q_nope.device,
+            )
+            self._nope_rope_page[q_key] = q_page
+        return q_page.expand(*q_nope.shape[:-1], w), k_pe
+
     def forward_sparse(
         self,
         q: torch.Tensor,
@@ -1082,12 +1129,15 @@ class AscendAttnBackend(AttentionBackend):
 
         if save_kv_cache:
             k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
-            k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
+            if k_rope is not None:
+                k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
             self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        if q_pe is None or q_pe.shape[-1] == 0:
+            q_pe, k_pe = self._nope_zero_rope(q_nope, k_nope)
 
         if is_prefill:
             if self.forward_metadata.actual_seq_lengths_q is not None:
