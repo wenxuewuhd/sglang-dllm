@@ -10,20 +10,28 @@ rather than rewritten into the specs, so the specs stay a stable work order.
 
 ---
 
-## HOLD on OP-1: the kpool epilogue may already run on this hardware
+## OP-1 re-scoped: the kpool Triton path runs; the gap is the fp8 index cache
 
-`append_kpool_tail_to_topk` is a **Triton** kernel (`kpool_fp8_index.py:466`, kernel at
-`:490`), and Triton runs on Ascend through `triton-ascend`, which is installed and is
-already how `sgl_kernel_npu`'s KDA and causal-conv1d kernels work.
+Measured on target, triton-ascend 3.2.2 / Ascend910_9362: **7 of the 10 kpool Triton
+kernels compile, run, and are bit-identical** to torch references transcribed from the
+kernel bodies. The four that fail all fail at the same place — `bishengir-compile` cannot
+lower the fp8 e4m3 conversion — which is a **hardware** fact about A3, not a triton-ascend
+one; with the fp8 store replaced by bf16, three of them compile, run and match across the
+full computation (per-dimension softmax, APE, online-softmax rescale, Hadamard, absmax and
+clamp, cache page/slot addressing).
 
-Executed on the target machine: it **compiles and runs on the NPU**, and its output is
-**bit-identical** to a torch reference transcribed line by line from the kernel body, over
-rows/cols of (4,16), (9,32), (1,8) and (17,64).
+One genuine triton-ascend defect remains: `_hadamard128`'s 7-stage rotation faults with a
+UB out-of-bounds. It is context-sensitive — correct inside three of the kernels, faulting
+standalone and in `_kpool_write_tail_and_maybe_compress_kernel` at
+`num_draft_tokens >= 3`. Worth an upstream report. Likely moot here: the rotation is
+orthonormal and applied to both q and k, so it can be dropped on a bf16 indexer without
+changing the scores.
 
-That undercuts OP-1's premise. Before committing kernel-team time, check whether the other
-thirteen `@triton.jit` kernels in that file also compile and run, and measure the
-triton-ascend path against the decode-latency budget. The scoring step is separate — it is
-CUDA (`deep_gemm.fp8_paged_mqa_logits` / tilelang), not Triton, and does not come along.
+**What to settle before commissioning OP-1:** kpool stores compressed index keys in fp8.
+DeepSeek-V4 on Ascend already uses **int8** for exactly this
+(`ascend_dsv4_backend.py:685`, with int8 branches at `:469-470` and `:597-598`). If GLM's
+kpool can take the same route, OP-1 shrinks to a cache-dtype change plus whatever operator
+does compress-quantize-write in int8 — not a new selection kernel.
 
 ---
 

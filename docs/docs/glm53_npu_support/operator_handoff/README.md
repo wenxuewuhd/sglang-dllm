@@ -14,31 +14,40 @@ Everything here is new; nothing outside this directory was changed.
 
 ---
 
-## 0. HOLD on OP-1 — read this before starting it
+## 0. OP-1 has been re-scoped — read this before starting it
 
-**Do not start OP-1 until we have finished a feasibility check.** OP-2 and OP-3 are
-unaffected; start with those.
+**Do not build OP-1 as written.** OP-2 and OP-3 are unaffected; start with those. What
+follows replaces OP-1's premise; the spec body has not been rewritten yet.
 
-The kpool epilogue this package specifies exists today as **Triton** kernels, not CUDA
-ones, and Triton runs on this hardware through `triton-ascend`. Measured on the target
-machine: `append_kpool_tail_to_topk` — one of the kernels OP-1 would replace — **compiles
-and runs on the NPU under triton-ascend 3.2.2, and its output is bit-identical to a torch
-reference written line by line from the kernel source**, across four shape configurations.
+The kpool epilogue OP-1 asks for exists as **Triton** kernels, not CUDA ones, and Triton
+runs on this hardware through `triton-ascend`. We measured all of them on the target
+machine:
 
-If the rest of that file behaves the same way, OP-1 is not "write a new kernel" but
-"remove the CUDA-only gates and validate the existing Triton path", which is a different
-job and possibly not one for a kernel team at all.
+| outcome | count | detail |
+|---|---|---|
+| compile, run, **bit-exact** vs a torch transcription of the kernel body | **7 of 10** | including the ragged layout, the write plan, the tail append, the tail scatter, and the pool-slot pack/select |
+| fail to compile — **fp8** | 4 | `bishengir-compile` rejects the e4m3 conversion outright; `x.to(torch.float8_e4m3fn)` faults on device too. **Atlas A3 cannot express fp8.** With the fp8 store stood in for bf16, three of these compile, run and match the reference across the whole computation |
+| **triton-ascend codegen defect** | 1 | `_hadamard128`'s 7-stage rotation faults with a UB out-of-bounds in some contexts. It runs correctly *inside* three of the kernels and faults standalone, so it is a lowering bug, not a missing language feature |
 
-What is still open, and why this is a hold rather than a cancellation:
+So the top-k, the expand, the tail append and the plan/layout machinery **already work on
+this hardware**. Two things do not, and neither is the operator this document specified.
 
-- Only one of the fourteen Triton kernels in `kpool_fp8_index.py` has been tried.
-- Nothing is known about how the triton-ascend path *performs* against a native AscendC
-  kernel. Correct is not the same as fast, and this sits on the decode hot path.
-- The **scoring** step is genuinely CUDA (`deep_gemm.fp8_paged_mqa_logits` and the
-  tilelang variant), not Triton, so it does not come along for free — though
-  `npu_quant_lightning_indexer` may already cover it (README §2a).
+**The real gap is the index-K cache dtype.** kpool stores compressed index keys in fp8,
+and A3 has no fp8. **DeepSeek-V4 already solved this on Ascend by using int8 instead** —
+see `ascend_dsv4_backend.py:685`, which sets `compressor.li_kv_dtype = "int8"`, and the
+int8 branches at `:469-470` and `:597-598`. Whether GLM's kpool can follow the same route
+is the question to settle before commissioning anything.
 
-We will resolve this and update the package.
+**The Hadamard defect is probably moot for us.** The 128-point rotation is an orthonormal
+matrix applied to both q and k, so the dot product it feeds is unchanged and it can be
+dropped entirely on a bf16 indexer. If it is dropped, the codegen bug stops mattering; it
+is still worth reporting upstream to triton-ascend.
+
+**Scoring is separate and does not come along.** `deep_gemm.fp8_paged_mqa_logits` and its
+tilelang variant are CUDA, not Triton. `npu_quant_lightning_indexer` may already cover it
+(§2a below).
+
+We will rewrite OP-1 once the int8 question is settled.
 
 ---
 
