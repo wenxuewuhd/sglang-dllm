@@ -17,7 +17,7 @@
 | 多模态 (ViT/video) | 一期**不做** | 2026-08-27 |
 | MTP / NextN | 一期**不做** | 2026-08-27 |
 | 长上下文 CP | 一期**不做**，只承诺 32K | 2026-08-27 |
-| DSv4 权重何时删 | **保留到 P1.2 做完再删**（保住端到端回归判据） | 2026-08-28 |
+| DSv4 权重何时删 | ~~保留到 P1.2 做完再删~~ → **P1.2 完成后已删**（见 §4） | 2026-08-28 |
 
 ---
 
@@ -346,13 +346,47 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
 > ServerArgs 改成了「声明式 resolution」模型。我们那 22 行 kt-* 参数**不能直接 rebase 过去，要按新模型重写**。
 > 动手前先读 `sglang-runtime-context` skill（仓库里有）。
 
-### P2 · BF16 权重 ☐
-- [ ] P2.1 写逐 shard 反量化脚本（`weight_block_size=[128,128]`）
-- [ ] P2.2 **第一个 shard 转完先不删，人工确认数值**
-- [ ] P2.3 全量转换 + 逐 shard 校验 + 删源 shard
-- [ ] P2.4 清洗 `config.json`（删 `quantization_config`）
-- [ ] P2.5 **出口判据**：BF16 目录 tensor 数与 shape 全量比对通过
-> 风险：删源不可逆。FP8 可从 hf-mirror 重下（306 GB 代价）。
+### P2 · BF16 权重 ✅ 完成
+
+**checkpoint 结构（2026-08-28 实测）**：76108 tensor / 62 shard / 305.78 GiB
+
+| 命名空间 | 内容 | 体积 | fp8? |
+|---|---|---|---|
+| `model.language_model.layers.0..44` | 45 层正文 | 297.75 GiB | **是**（37338 个 fp8 + 同分片 scale） |
+| `model.language_model.layers.45` | **MTP / NextN 层**（`eh_proj`/`enorm`/`hnorm`） | 6.98 GiB | 是 → 转换后 13.84 GiB |
+| `model.visual` | ViT，347 个 tensor | 1.05 GiB | **否，本来就是 BF16** |
+| `lm_head.weight` | | | 否，BF16 |
+
+- ✅ **ViT 不需要"转"** —— `model.visual` 里 **0 个 fp8、0 个 `weight_scale_inv`**，脚本原样拷过去
+- MTP 层一期不用，但空间够，**一起转**，免得以后缺
+- 转换后总计 **598.51 GiB（643 GB）**，与初版估算一致
+
+- [x] **P2.1 PASS** 逐 shard 反量化脚本落盘：[`tools/fp8_to_bf16.py`](./tools/fp8_to_bf16.py)
+      （`weight_block_size=[128,128]`，`bf16 = fp8 * scale_inv` 按 128×128 块广播；
+      丢弃 F32 scale；BF16 张量原样拷；`--delete-source` 默认关；带 `--min-free-gib` 空间闸门）
+- [x] **P2.2 PASS** 第一个 shard 转完人工核数值（**未删任何源**）：
+      - 抽查：名称集合 = 源 − scale ✓、形状全等 ✓、480 个元素独立重算最大偏差恰好 0 ✓
+      - **全 shard 逐位比对**：**2,759,852,032 个元素（27.6 亿）全部逐位一致**，
+        重算用的是**与脚本不同的实现**（按 128×128 块 reshape 后逐块乘，
+        而非脚本的 `repeat_interleave` 展开 scale）→ 排除了"用同一个 bug 验自己"
+      - 直拷张量逐位相同 ✓；**全 shard 无 NaN/Inf** ✓
+      - 单 shard 约 20 s → 全量约 21 min
+- [x] **P2.3 PASS** 全量转换：62/62 shard，约 21 min，输出 `/mnt/workspace/models/GLM-5.3-Flash-BF16`
+      **599 GB**（估算 598.51 GiB，吻合）。数目对账：本次 dequant 37009 + 首 shard 329 = **37338**，
+      正好等于索引里 `weight_scale_inv` 总数
+- [x] **P2.4 PASS** `config.json` 已删 `quantization_config`；tokenizer / chat_template /
+      processor_config / generation_config / LICENSE 一并拷贝
+- [x] **P2.5 PASS 出口判据**：BF16 目录全量比对
+      - 索引名称集合 = 源 − scale：**76108 − 37338 = 38770**，实际 38770 ✓
+      - 62 个 shard 逐个打开：索引声明缺失 0 / 文件多余 0 / **形状与源全等** / **无 scale 泄漏** ✓
+      - 输出 dtype：**BF16 38479 + F32 291**。291 个 F32 是**原生 F32**（抽查 50/50 源侧同为 F32），
+        构成正好对上模型结构：`hc_attn_base/scale`+`hc_ffn_base/scale` 各 45（mHC）、
+        `mlp.gate.e_score_correction_bias` 43（MoE 层数）、`self_attn.A_log`+`dt_bias` 各 34（KDA 层数）
+
+> **计划变更（2026-08-28）**：原方案是"转完即删源 shard"，因为当时磁盘只剩 66 GB。
+> 删掉 DSv4 后可用 668 GB，BF16 需 643 GB → **改为全程保留 FP8 源**，结束时余 ~25 GB。
+> 这让整个 P2 变成**可逆**的：转换若有隐蔽 bug，不必重下 306 GB。
+> **FP8 源等 P4 端到端验过再删**（P5 的 W8A8 333 GB 那时本来也容不下它）。
 
 ### P3 · 逐模块对拍 ☐
 按依赖顺序，CPU golden vs NPU。
@@ -416,9 +450,21 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
 - [x] ~~算子缺口核实~~ → 已完成，见 §2.5，已并入 P6
 - [x] ~~DSv4 W8A8 权重格式确认~~ → **compressed-tensors**（config.json 自述，且 SGLang 会拒绝 `--quantization modelslim`）
 - [x] ~~核实本地 GLM-5.3-Flash 权重版本~~ → **对上了** revision `c5b82b63e37b`（71/71 文件 + 62/62 分片 size 一致；非 sha256 校验）
-- [x] ~~P0.7b 后是否立刻删 DSv4 权重~~ → **不删，保留到 P1.2 做完**（2026-08-28 用户决策）。
-      磁盘账：DSv4 275 + BF16 643 = **918 GB / 984 GB，余 66 GB**。P2 是逐 shard 转完即删源，
-      峰值不超过这个数，可行但余量紧 —— **P2 期间要盯着 `df`**
+- [x] ~~DSv4 权重何时删~~ → **P1.2 完成后已删 275 GB 的 safetensors**（2026-08-28）。
+      **元数据全部保留**在 `/mnt/workspace/models/DeepSeek-V4-Flash-W8A8/`（约 12 MB）：
+      `config.json` / `model.safetensors.index.json` / `tokenizer*` / `.msc` / `.mv` / `README.md`
+      → 将来重下可以用 index.json 逐分片校验，确认拿到的是同一版本。
+      - 来源：modelscope，`.mv` 记 `Revision:master, CreatedAt:1777033839`；
+        `.msc` 里是逐文件 revision（`6f4a67e0…` / `b8b7336b…` / `d3b9201f…`）
+      - ⚠ **modelscope 的 repo id 没有记录下来**（权重是用户下的，我没查到），
+        真要重下需要先确认 repo id
+      - 重下成本实测：275 GB **约 14 分钟**（原始下载 23:43→23:57）
+      - 为什么可以删：P2–P6 全是 GLM 自己的事，DSv4 不再参与；且 P5 的 W8A8(333 GB)
+        + BF16(643 GB) = 976/984 GB，**本来也容不下 DSv4**
+      - 什么时候会想要它回来：(a) 再 rebase 一次时复跑同样的回归；
+        (b) GLM 起不来时当"已知能跑"的对照，用来区分模型问题与环境问题
+      ~~不删，保留到 P1.2 做完~~（旧决策）。
+      删除后磁盘：**669 GB 可用**，P2 的 BF16 需要 643 GB → 余量从 66 GB 变成约 341 GB，宽松得多
 - [ ] P5 之后磁盘怎么排：删掉 DSv4 后 BF16(643) + W8A8(333) = 976 GB / 984 GB，只剩 8 GB。
       可能要把 W8A8 写到 `/usr/.devenv`（466 GB 可用）
 
@@ -461,3 +507,8 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
 | 2026-08-28 | **P1 完成**：`glm53_dev` 已 promote 到 `033446bb05` + 19 个 NPU commit。回退路径：tag `glm53_dev-pre-p1-rebase`（旧 head `a6be0fe83b`）+ 未 push 的 `origin/glm53_dev` |
 | 2026-08-28 | **纯 TP16 跑不通，是结构性约束不是 NPU bug**：`deepseek_v4.py:608` 的 `n_local_groups = n_groups // attn_tp_size`，DSv4-Flash `o_groups=8`，TP16 时 `8//16=0` → `o.view(T,0,-1)` 崩。**attention TP 上限是 8**，所以 PR#25144 必须用 DP16(attn_tp=1)+EP16。GLM-5.3 config 无 `o_groups`，**这条不会搬到 GLM** |
 | 2026-08-28 | 权重占用三档实测（同一权重、同一代码树）：DP16+EP16 **28.08 GB/die** / 纯 TP16 **20.39** / 纯 TP16 + `--context-length 32768` **18.45**。三者配置不同，**不可互相比较** |
+| 2026-08-28 | **DSv4 权重已删**（275 GB safetensors，元数据 12 MB 保留）。P1.2 是它最后一个用途；P5 的账本来也容不下它。删后 `/mnt/workspace` 可用 669 GB，P2 余量从 66 GB 变 341 GB |
+| 2026-08-28 | **P2.1 / P2.2 PASS**：反量化脚本落盘，首个 shard 独立重算**偏差恰好 0**。查明 **ViT (`model.visual`) 本来就是 BF16，无需转换**；`layers.45` 是 MTP 层，一并转 |
+| 2026-08-28 | **P2 改为不删源**（DSv4 腾出空间后 668 GB 够放 643 GB 的 BF16），整个 P2 变可逆；FP8 源留到 P4 验过再删 |
+| 2026-08-28 | P2.2 加强验证：对首个 shard 做**全量逐位比对**（27.6 亿元素），用独立实现重算，**0 处不一致**。反量化数学本身已证死，剩下的风险只在 I/O 与索引拼装 |
+| 2026-08-28 | **P2 完成**：FP8 → BF16 全量转换 62/62，输出 599 GB，出口判据全过（名称集合、形状、dtype、无 scale 泄漏、config 已清洗）。FP8 源**保留**，等 P4 端到端验过再删。磁盘余 70 GB |
