@@ -14,40 +14,31 @@ Everything here is new; nothing outside this directory was changed.
 
 ---
 
-## 0. OP-1 has been re-scoped — read this before starting it
+## 0. Where this stands
 
-**Do not build OP-1 as written.** OP-2 and OP-3 are unaffected; start with those. What
-follows replaces OP-1's premise; the spec body has not been rewritten yet.
+Four operators were specified. **Three are withdrawn** and OP-1 has been rewritten into a
+different request. Read this section before anything else — the spec bodies for the
+withdrawn ones are kept only as a record.
 
-The kpool epilogue OP-1 asks for exists as **Triton** kernels, not CUDA ones, and Triton
-runs on this hardware through `triton-ascend`. We measured all of them on the target
-machine:
+| | status |
+|---|---|
+| **OP-1** kpool | **rewritten**: not a fused top-k kernel, but a move of the index-K cache from fp8 to **int8**. See [`specs/op1_kpool_topk_transform.md`](specs/op1_kpool_topk_transform.md). |
+| ~~OP-2~~ compressor LayerNorm | **withdrawn** — GLM never calls the vendor `compressor`, and its index-K LayerNorm was never fused into an operator. |
+| **OP-3** `kv_rmsnorm_rope_cache` at rope 0 | **confirmed** — measured twice, both versions raise at rope 0. This is the one request that has held throughout. |
+| ~~OP-4~~ bf16 swiglu | **withdrawn** — `torch_npu.npu_clipped_swiglu` already ships and is bit-exact once its four parameters are passed. |
 
-| outcome | count | detail |
-|---|---|---|
-| compile, run, **bit-exact** vs a torch transcription of the kernel body | **7 of 10** | including the ragged layout, the write plan, the tail append, the tail scatter, and the pool-slot pack/select |
-| fail to compile — **fp8** | 4 | `bishengir-compile` rejects the e4m3 conversion outright; `x.to(torch.float8_e4m3fn)` faults on device too. **Atlas A3 cannot express fp8.** With the fp8 store stood in for bf16, three of these compile, run and match the reference across the whole computation |
-| **triton-ascend codegen defect** | 1 | `_hadamard128`'s 7-stage rotation faults with a UB out-of-bounds in some contexts. It runs correctly *inside* three of the kernels and faults standalone, so it is a lowering bug, not a missing language feature |
+Everything reduces to two facts:
 
-So the top-k, the expand, the tail append and the plan/layout machinery **already work on
-this hardware**. Two things do not, and neither is the operator this document specified.
+- **Atlas A3 has no fp8.** `bishengir-compile` cannot lower the e4m3 conversion and the
+  torch side faults on device. kpool stores compressed index keys in fp8, so that path
+  cannot run — while 7 of its 10 Triton kernels compile, run and are bit-exact.
+  **int8 fixes it, and is 4.2x more accurate than the fp8 it replaces.**
+- **`npu_kv_rmsnorm_rope_cache` rejects a zero-width rope**, which is GLM's configuration.
 
-**The real gap is the index-K cache dtype.** kpool stores compressed index keys in fp8,
-and A3 has no fp8. **DeepSeek-V4 already solved this on Ascend by using int8 instead** —
-see `ascend_dsv4_backend.py:685`, which sets `compressor.li_kv_dtype = "int8"`, and the
-int8 branches at `:469-470` and `:597-598`. Whether GLM's kpool can follow the same route
-is the question to settle before commissioning anything.
-
-**The Hadamard defect is probably moot for us.** The 128-point rotation is an orthonormal
-matrix applied to both q and k, so the dot product it feeds is unchanged and it can be
-dropped entirely on a bf16 indexer. If it is dropped, the codegen bug stops mattering; it
-is still worth reporting upstream to triton-ascend.
-
-**Scoring is separate and does not come along.** `deep_gemm.fp8_paged_mqa_logits` and its
-tilelang variant are CUDA, not Triton. `npu_quant_lightning_indexer` may already cover it
-(§2a below).
-
-We will rewrite OP-1 once the int8 question is settled.
+One thing is genuinely open and is not a dtype question: **what computes the indexer
+logits on Ascend.** `npu_quant_lightning_indexer` cannot express GLM's 32-head indexer (its
+metadata op accepts only 64), and the CUDA scorer is `deep_gemm`, not Triton, so it does
+not come along. See OP-1 §5.
 
 ---
 
