@@ -112,10 +112,11 @@
 | **Hadamard-128 能不能删，取决于存什么** | 正交归一、q/k 同旋转、点积不变，所以**在 bf16 下确实可删**；**一旦量化就不能删** —— 它正是 int8 优于 fp8 的原因（旋转后 kurtosis≈3.0）。既然一期走 bf16，**保留它**（保留同样中性，且 3 个 kernel 里它本来就正常）；只有撞上 §4 那个 triton-ascend codegen 缺陷才删 |
 | **`ue8m0` scale 舍入** | 对浮点格式免费，对 int8 要付一个真实 bit（32k 重合 99.18% → 98.84%） |
 | **`npu_sparse_flash_attention` 的 sparse_indices 契约比「有效值在前」更严，失败方式也更坏** | 之前记的是「不是前缀就静默返回 0」。**实测在真实形状下不对**：decode@32k、2048 个有效索引时，把 `-1` 挪到 slot 0 得到的是 **rel 1.23e-1 的静默错误非零值**，不是 0。位置扫描显示 `-1` 落**偶数槽**会改变输出（rel 0.15–0.29，静默），落**奇数槽**则逐位相同。「静默返回 0」只在**第一个分块整块无效**时出现（小形状上复现）。所以契约是某种与**槽位奇偶 / 分块对齐**相关的东西，前缀恰好满足它。**我们的链路产出严格前缀所以安全**，但任何自己拼索引的地方风险比原记录高得多。机制**未查清**（要看 `aclnnSparseFlashAttention` 的 tiling 或问厂商）|
+| **KDA prefill 把 raw `beta` 直接喂给 chunk kernel** | GLM 交出来的 gate 是扁平的（`[1,T,H*K]`）、beta 是 raw；**CUDA 路径正是拿这个当判据**（`kda_backend.py:684` 的 `gate_was_flat`）并在 `chunk_kda` 内部做 sigmoid，而 Ascend 的 extend 链没有这个钩子。后果：**out.prefill 70.55× budget、out.decode 142.48×、ssm state 943.61×**，全程不报错。已修（按 `g.ndim == 3` 判据，与 CUDA 同源）。**模块级 golden 抓不到这个**——它只在真实路径上暴露 |
 | **Hadamard 在 bf16 里做** | CUDA kernel 把 bf16 读进 **fp32 寄存器**再变换（`hadamard_jit.cuh:150` 的 `float x_vals[..]`），Triton 的 `_hadamard128` 同样作用在 fp32 accumulator 上。在 bf16 里做要 round 7 次而它们 round 1 次，**不报错**，只是悄悄挪走一批 pool —— 32k 下选择重合掉 0.0006（实测）。这个 bug 我写过一次，被端到端对拍抓出来 |
 | **MoE 的路由在 fp32 与 bf16 之间会翻，从 layer 3 就开始** | 实测：top-8 集合不同的 token 占比 layer 3 为 12.5%、layer 41 达 **63.3%**。后果不是"精度差一点"，而是**双参考法的地板从第一个 MoE 层起就由离散的路由差异主导，不再是舍入**——地板从 9.5e-3 涨到 1.8e-1。**深层的宽地板不能当成"宽误差可接受"的依据**；注入 5% 误差实测只有 layer 7–25 测得出来，layer 26+ 测不出。这是**验收方法本身的边界**，不是某个算子的问题 |
 | **NPU 的 bf16 矩阵乘不是 batch-shape 不变的** | 同一份输入只改 M（4096 行 vs 4080 行），过 `wk`+`k_norm` 后 **5/4080 行**差 1 个 bf16 ulp，gate 差 6/4080（实测）。根因在 torch_npu 的 matmul tiling，不在业务代码。**后果：NPU 上任何 prefill-vs-decode 的逐位一致性断言都不成立**，包括 P4 打算用的 KL 一致性 —— 只能定阈值，不能要求 bit-exact |
-| **KDA prefill 的 Triton autotune** | `kda.py:214` 的 24-config `do_bench` 扫描挂死 AI core（die 4/6/8 上 3/3 复现）；单独钉住任一 config 都能跑。⚠ 实际服务未触发，列为**上线前须确认** |
+| **KDA prefill 的 Triton autotune —— 确认会在真实路径上触发** | 原记「实际服务未触发，列为上线前须确认」，**现已确认：每次 prefill 都走**。`chunk_kda_scaled_dot_kkt_fwd` 由 `_AscendKDAExtendKernel.extend` 直接调用，24-config 的 `do_bench` 扫描在**第一个** config 上就把 AI core 打超时（507014 `aicore timeout`，dies 0/1/2 复现）。单独跑 14 个 config 里 13 个正常，**所以问题在 `do_bench` 本身，不是某个坏 config**。已修：在 NPU backend import 时钉死一个 config（triton 在 `len(configs)==1` 时完全跳过 benchmark），实测 `BK=64` 最快（T=8192/H=4 下 3.98 ms vs BK=32 的 4.68 ms）。**没有改共享的 `kda.py`** |
 
 ### 2.5 已排除（不要再做）
 
@@ -347,7 +348,9 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
       decode 下占 **0%**（那里是 launch-bound，20 轮白送）。
       roofline：post 高于带宽下界 2.6×、pre 9.5×（去掉 sinkhorn 是 5×）——
       **prefill 下不是 host 开销主导**，和 DSA 的 100× 不是一回事
-- [ ] P6.2 **KDA prefill conv1d** —— `causal_conv1d_fn_npu` 内部退回 `F.conv1d`（`sgl_kernel_npu` 上游的实现选择）；
+- [ ] P6.2 **KDA prefill conv1d** —— **已量化**：Ascend 的 extend 把深度卷积拆成 **3 次调用**，
+      而共享 CUDA 路径对整个 qkv 宽度只做 **1 次打包调用**。实测 **6.5 ms / 单层 14.3 ms = 45%**，
+      而且这 3 次调用**各带 3 次 host 等待**（prefill 全部 9 次 host 往返都在这里）。原条目： —— `causal_conv1d_fn_npu` 内部退回 `F.conv1d`（`sgl_kernel_npu` 上游的实现选择）；
       且 Ascend 后端拆成 3 次调用而共享后端只做 1 次
 - [ ] P6.3 **MoE SwiGLU clamp** —— 现在是 2×clamp + `cat` + `npu_swiglu` 四个 kernel，可换成一个 `npu_clipped_swiglu`
 - [ ] P6.4 DeepEP-normal 的 D2H 同步（`moe_runner/ascend.py:270-274`，prefill 每 forward 42 次）—— 修在第三方 wheel 里，先 profiling
