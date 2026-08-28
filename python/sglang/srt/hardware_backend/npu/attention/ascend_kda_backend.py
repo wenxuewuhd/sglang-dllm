@@ -33,6 +33,41 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _LOG2_E = math.log2(math.e)
 
+# The kkt kernels' autotune sweep is fatal on Ascend: triton benchmarks every
+# config with do_bench, and on A3 the sweep times out the AI core (507014,
+# "aicore timeout") on the first config it tries, before any config wins. Each
+# config runs fine on its own -- triton skips benchmarking when only one is
+# registered -- so pin one. Measured per config on A3 at T=8192, H=4 (the tp16
+# per-card KDA shape): BK=64 is ~4.0 ms against BK=32's ~4.7 ms, and num_warps /
+# num_stages move it less than 5%.
+_KKT_INTER_PIN = {"BK": 64, "num_warps": 4, "num_stages": 2}
+_KKT_INTRA_PIN = {"num_warps": 4}
+
+
+def _pin_kkt_autotune_configs() -> None:
+    from sglang.kernels.ops.attention.fla import kda as _kda
+
+    for kernel, pin in (
+        (_kda.chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter, _KKT_INTER_PIN),
+        (_kda.chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra, _KKT_INTRA_PIN),
+    ):
+        configs = kernel.configs
+        if len(configs) == 1:
+            continue
+        want = dict(pin)
+        warps, stages = want.pop("num_warps", None), want.pop("num_stages", None)
+        chosen = [
+            c
+            for c in configs
+            if all(c.kwargs.get(k) == v for k, v in want.items())
+            and (warps is None or c.num_warps == warps)
+            and (stages is None or c.num_stages == stages)
+        ]
+        kernel.configs = chosen[:1] or configs[:1]
+
+
+_pin_kkt_autotune_configs()
+
 
 class _AscendKDAExtendKernel:
     """Ascend-only KDA prefill decomposition backed by sgl-kernel-npu."""
@@ -172,13 +207,8 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
-        qkv = causal_conv1d_update_npu(
-            mixed_qkv,
-            conv_states,
-            layer.conv_weights,
-            layer.bias,
-            activation="silu",
-            conv_state_indices=cache_indices,
+        qkv = self._causal_conv1d_decode(
+            mixed_qkv, layer, conv_states, cache_indices=cache_indices
         )
 
         if self.kernel_dispatcher.supports_packed_decode:
@@ -327,6 +357,49 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             )
         return core_attn_out
 
+    def _causal_conv1d_decode(
+        self,
+        x: torch.Tensor,
+        layer: RadixLinearAttention,
+        state: torch.Tensor,
+        *,
+        cache_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        # The Ascend update kernel writes the new window back in the *weight*
+        # dtype. GLM-5.3 keeps the conv weights in FP32 and the persistent conv
+        # cache in BF16, so writing straight into the pool trips aclnnIndexPut
+        # ("expected DT_FLOAT but found DT_BFLOAT16"). Same compact FP32 working
+        # set as _causal_conv1d_extend; the window itself is copied, not
+        # computed, so the round trip is exact.
+        if state.dtype == layer.conv_weights.dtype:
+            return causal_conv1d_update_npu(
+                x,
+                state,
+                layer.conv_weights,
+                layer.bias,
+                activation="silu",
+                conv_state_indices=cache_indices,
+            )
+        rows = cache_indices.to(torch.int64)
+        local_indices = torch.arange(
+            cache_indices.shape[0],
+            device=cache_indices.device,
+            dtype=cache_indices.dtype,
+        )
+        state_work = (
+            state.index_select(0, rows).to(layer.conv_weights.dtype).contiguous()
+        )
+        out = causal_conv1d_update_npu(
+            x,
+            state_work,
+            layer.conv_weights,
+            layer.bias,
+            activation="silu",
+            conv_state_indices=local_indices,
+        )
+        state.index_copy_(0, rows, state_work.to(state.dtype))
+        return out
+
     def _causal_conv1d_extend(
         self,
         x: torch.Tensor,
@@ -387,6 +460,13 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             gate_bias=layer.dt_bias,
             lower_bound=layer.lower_bound,
         )
+        # A caller that hands the gate over flat ([B, T, H*K]) hands beta over
+        # raw: that is exactly the signal the CUDA path keys `beta_is_raw` off
+        # (kda_backend.py's `gate_was_flat`), and chunk_kda sigmoids it inside.
+        # The Ascend extend chain has no such hook, so activate beta here.
+        # Head-split callers (Kimi) already sigmoid it in the model.
+        if g.ndim == 3:
+            beta = beta.float().sigmoid()
         return preactivated_g, beta, None, None
 
     def _forward_target_verify(
