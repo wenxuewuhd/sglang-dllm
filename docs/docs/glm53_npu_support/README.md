@@ -115,7 +115,7 @@ GPU 参考实现在 `upstream/xinyuan/glm-5.3-flash-support @ 0b9c38484e`（本�
 | P0 环境 / 算子可见性 / DSv4 冒烟与精度 | ✅ GPQA 73.74%（对标 73.23%） |
 | P1 分支合流（rebase 到 `033446bb05`） | ✅ 回归 GPQA 73.23% |
 | P2 FP8 → BF16 权重转换 | ✅ 599 GB，全量比对通过 |
-| P3 逐模块对拍 | 进行中：KDA ✅ / mHC ✅ / NoPE MLA 部分 / kpool 数值门槛已过、待接线 |
+| P3 逐模块对拍 | 进行中：KDA ✅ / mHC ✅ / **kpool ✅ 端到端跑通** / NoPE MLA 部分 |
 | P4 端到端 · P5 W8A8 · P6 性能 | 未开始 |
 
 **当前关键路径**：P3.4 kpool —— 已无阻塞，**数值门槛已通过**。A3 无 fp8，索引缓存改存 **bf16**

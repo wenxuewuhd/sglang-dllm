@@ -242,6 +242,13 @@ def main() -> int:
     w_rows = torch.stack([w_all[rp] for rp in row_pos])                    # [L, R, 32]
 
     out = {
+        # Stage A2 additions: the *inputs* the real IndexerKPool.forward_npu needs,
+        # so the NPU harness can run the module itself instead of replaying tensors.
+        "x_f32": x[0].contiguous(),
+        "q_resid_f32": q_resid[0].contiguous(),
+        "k_f32": k_all.contiguous(),
+        "gate_f32": gate.contiguous(),
+        "w_all_f32": w_all.contiguous(),
         "pooled_key": pooled_key.contiguous(),
         "q_rows": q_rows.contiguous(),
         "w_rows": w_rows.contiguous(),

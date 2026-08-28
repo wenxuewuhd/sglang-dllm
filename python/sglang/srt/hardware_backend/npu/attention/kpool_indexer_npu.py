@@ -20,38 +20,45 @@ from __future__ import annotations
 
 import torch
 
-def hadamard_transform_npu(x: torch.Tensor, scale: float | None = None) -> torch.Tensor:
+_SYLVESTER_CACHE: dict = {}
+
+
+def _sylvester(n: int, device: torch.device) -> torch.Tensor:
+    """Unscaled natural-order Sylvester ``H_n``, fp32, cached per device."""
+    key = (n, str(device))
+    h = _SYLVESTER_CACHE.get(key)
+    if h is None:
+        h = torch.ones(1, 1, device=device, dtype=torch.float32)
+        while h.shape[0] < n:
+            h = torch.cat((torch.cat((h, h), 1), torch.cat((h, -h), 1)), 0)
+        _SYLVESTER_CACHE[key] = h
+    return h
+
+
+def hadamard_transform_npu(x: torch.Tensor, scale=None) -> torch.Tensor:
     """Natural-order Hadamard transform over the last dimension, on any device.
 
-    Stage for stage this is ``_hadamard128`` from ``kpool_fp8_index.py``, widened
-    to any power-of-two width: stage ``i`` pairs elements ``stride`` apart, for
-    ``stride`` doubling from 1. The matrix it realizes is Sylvester ``H_n``, the
-    same one the CUDA ``hadamard_transform`` and the Triton key side realize, so
-    a query rotated here and a key rotated there still share a dot product.
+    Realizes Sylvester ``H_n`` -- the same matrix the CUDA ``hadamard_transform``
+    and the Triton ``_hadamard128`` realize -- so a query rotated here and a key
+    rotated there still share a dot product.
 
-    It is written as a butterfly rather than a matmul on purpose: an NPU fp32
-    matmul may run in a reduced-precision mode, while these are exact adds.
+    Runs in fp32 whatever the input dtype, because both of those do: the CUDA
+    kernel loads into ``float x_vals[..]`` (``hadamard_jit.cuh:150``) and the
+    Triton key side butterflies an fp32 accumulator. A bf16 transform rounds
+    seven times where they round once, and silently moves the selection -- it
+    cost 0.0006 of selection overlap at 32k, measured.
+
+    A matmul, not the butterfly the kernels use: measured on this target an fp32
+    matmul against ``H_n`` is full fp32 precision (rel 1.3e-7 against the
+    butterfly, no reduced-precision mode) and 16.5x faster. The butterfly's only
+    advantage would have been dodging a precision mode that does not exist here.
 
     ``scale`` defaults to ``n**-0.5``, which makes the transform orthonormal.
     """
     n = x.shape[-1]
     assert n & (n - 1) == 0, f"Hadamard width must be a power of 2, got {n}"
-    lead, stride = x.shape[:-1], 1
-    while stride < n:
-        x = x.reshape(*lead, n // (2 * stride), 2, stride)
-        a, b = x[..., 0, :], x[..., 1, :]
-        x = torch.stack((a + b, a - b), dim=-2).reshape(*lead, n)
-        stride *= 2
-    return x * (n**-0.5 if scale is None else scale)
-
-
-def rotate_activation_npu(x: torch.Tensor) -> torch.Tensor:
-    """``rotate_activation`` for Ascend.
-
-    The shared implementation resolves to a CUDA JIT kernel that rejects
-    non-CUDA tensors, so the query side of the indexer has no NPU path at all.
-    """
-    return hadamard_transform_npu(x.float()).to(x.dtype)
+    out = x.float() @ _sylvester(n, x.device)
+    return (out * (n**-0.5 if scale is None else scale)).to(x.dtype)
 
 
 def compress_pool_bf16(
@@ -159,7 +166,6 @@ def topk_from_pooled_selection(
     seq_lens: torch.Tensor | None = None,
     page_table: torch.Tensor | None = None,
     topk_offsets: torch.Tensor | None = None,
-    out_rows: int | None = None,
 ) -> torch.Tensor:
     """``topk_from_pooled_history_logits`` for a selection that is already made.
 
@@ -181,25 +187,16 @@ def topk_from_pooled_selection(
         page_table=page_table,
         topk_offsets=topk_offsets,
     )
-    result = (
-        expanded
-        if seq_lens is None
-        else append_kpool_tail_to_topk(
-            expanded,
-            seq_lens=seq_lens,
-            pool_lens=group_lengths,
-            pool_size=pool_size,
-            page_table=page_table,
-            topk_offsets=topk_offsets,
-        )
+    if seq_lens is None:
+        return expanded
+    return append_kpool_tail_to_topk(
+        expanded,
+        seq_lens=seq_lens,
+        pool_lens=group_lengths,
+        pool_size=pool_size,
+        page_table=page_table,
+        topk_offsets=topk_offsets,
     )
-    if out_rows is None or out_rows == result.shape[0]:
-        return result
-    padded = torch.full(
-        (out_rows, result.shape[1]), -1, dtype=result.dtype, device=result.device
-    )
-    padded[: result.shape[0]] = result
-    return padded
 
 
 class KPoolNPUIndexerMixin:

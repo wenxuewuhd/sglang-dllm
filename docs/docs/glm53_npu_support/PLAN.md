@@ -112,6 +112,8 @@
 | **Hadamard-128 能不能删，取决于存什么** | 正交归一、q/k 同旋转、点积不变，所以**在 bf16 下确实可删**；**一旦量化就不能删** —— 它正是 int8 优于 fp8 的原因（旋转后 kurtosis≈3.0）。既然一期走 bf16，**保留它**（保留同样中性，且 3 个 kernel 里它本来就正常）；只有撞上 §4 那个 triton-ascend codegen 缺陷才删 |
 | **`ue8m0` scale 舍入** | 对浮点格式免费，对 int8 要付一个真实 bit（32k 重合 99.18% → 98.84%） |
 | **`npu_sparse_flash_attention` 的 sparse_indices 必须是「有效值在前」** | `[-1, 70]` 返回 **0.0** 而不是 70 号 token 的值，**不报错**。`0` 不是哨兵（它选 0 号 token），越界值（`-1`/`-2`/`kv_len`）才被忽略。kpool 的 `append_kpool_tail_to_topk` 产出的正好是前缀（history 占 `[0, history_len)`、tail 接在后面、其余 -1），所以这条链满足契约 —— 但任何自己拼索引的地方都要保证前缀性 |
+| **Hadamard 在 bf16 里做** | CUDA kernel 把 bf16 读进 **fp32 寄存器**再变换（`hadamard_jit.cuh:150` 的 `float x_vals[..]`），Triton 的 `_hadamard128` 同样作用在 fp32 accumulator 上。在 bf16 里做要 round 7 次而它们 round 1 次，**不报错**，只是悄悄挪走一批 pool —— 32k 下选择重合掉 0.0006（实测）。这个 bug 我写过一次，被端到端对拍抓出来 |
+| **NPU 的 bf16 矩阵乘不是 batch-shape 不变的** | 同一份输入只改 M（4096 行 vs 4080 行），过 `wk`+`k_norm` 后 **5/4080 行**差 1 个 bf16 ulp，gate 差 6/4080（实测）。根因在 torch_npu 的 matmul tiling，不在业务代码。**后果：NPU 上任何 prefill-vs-decode 的逐位一致性断言都不成立**，包括 P4 打算用的 KL 一致性 —— 只能定阈值，不能要求 bit-exact |
 | **KDA prefill 的 Triton autotune** | `kda.py:214` 的 24-config `do_bench` 扫描挂死 AI core（die 4/6/8 上 3/3 复现）；单独钉住任一 config 都能跑。⚠ 实际服务未触发，列为**上线前须确认** |
 
 ### 2.5 已排除（不要再做）
@@ -256,21 +258,37 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
 - [ ] **P3.3 NoPE MLA** —— 已修 4 处 rope=0 早退（分流、`fused_split_qk_norm`、cos/sin 预取、rope 应用；
       下游 `q_rope/k_rope` 传 `None`）。**剩余**：20+ 处 split 早退、KV buffer 二元组语义、
       `trans_rope_weight(w,0)` 的静默损坏加 assert。**数值未对拍**
-- [~] **P3.4 kpool indexer** —— **代码已写完，端到端未跑过**。形态见 §2.9，数值门槛见 §2.8
-  - [x] `rotate_activation` 的 NPU 分支（原本没有实现，非 CUDA 张量直接 raise）
-  - [x] `compress_pool_bf16` —— 压缩写入的 torch 版，**与 kernel body 逐行转写 bit-identical**，
-        NPU/CPU 一致。那 4 个编不出来的 fp8 kernel 就此绕开，不改
-  - [x] `NPUDSATokenToKVPool` —— bf16 的 `(pages, page_size, 1, 128)` PA_BSND 索引缓存，
-        挂在 `memory_pool.py:3813` 的 `elif use_dsa:`（三个分支里唯一没有 `_is_npu` 的那个）。
-        decode 的写入是 kernel 的 torch 转写，**对着逐行参考验过**（含 4 种失效情形）
-  - [x] `KPoolNPUIndexerMixin.forward_npu` —— 绕开 `BaseIndexerMetadata`，
-        直接读 `forward_metadata`；head gate 去掉 `q_scale` 且保持 fp32；
-        打分用 `npu_lightning_indexer`，展开/尾部复用共享代码；
-        不传 page_table 与 offsets，输出即**逻辑 token 位置**，正是下游要的
-  - [ ] **端到端跑一次**。目前每个部件单独验过，**整条 `forward_npu` 一次都没执行过**
-  - [ ] 还没确认：`IndexerKPool.__init__` 在 NPU 上是否活得下来
-        （`:116-121` 的 `is_cuda()` 守卫会跳过 `self.sm_count` 的赋值）；
-        `_get_q_k_bf16` 在 `rope_head_dim=0` 下的实际行为（P3.3 修过 4 处，未合并验证）
+- [x] **P3.4 kpool indexer** —— **端到端跑通并对齐**。形态见 §2.9，数值见 §2.8。
+      回归脚本：`tools/golden_kpool_indexer.py`（CPU 出 fp32 参考）+
+      `tools/check_kpool_indexer_e2e_npu.py`（真机跑真实 `IndexerKPool` + 真实
+      `NPUDSATokenToKVPool`，约 4 分钟）
+  - [x] `rotate_activation` 的 NPU 分支；`hadamard_transform_npu` 用 matmul
+        （实测 fp32 matmul 就是 fp32 精度，无降精度模式，且比蝶形快 16×）
+  - [x] `compress_pool_bf16`、`NPUDSATokenToKVPool`（bf16 索引缓存 + decode 写入）
+  - [x] `KPoolNPUIndexerMixin.forward_npu` —— 绕开 `BaseIndexerMetadata`
+  - [x] **端到端对齐**（layer 3 真权重、打乱物理页、对 fp32 参考）：
+
+        | seq_len | extend pool overlap | decode | 地板 |
+        |---|---|---|---|
+        | 2048 | 1.00000 | 1.00000 | 1.00000（全选，不具判别力）|
+        | 4096 | 0.99787 | — | 0.99816 |
+        | 8192 | 0.99722 | **0.99722** | 0.99737 |
+        | 32768 | **0.99616** | — | 0.99641 |
+
+        差地板 0.00025，因为这轮 q/wk/gate 全是设备上的 bf16 矩阵乘而非 CPU fp32。
+        **decode 与 extend 在 8192 上数值完全相同**；decode 写入的 pool 与 extend 写入的
+        **逐位相同**。键侧单独验过：写进缓存的 pooled key 对 fp32 参考 rel-L2 0.00328、
+        cos 最小 0.999989 —— 压缩+旋转+页寻址整条链都对，不只是"选出来的集合像"
+  - [x] **输出契约**（全部 32768 行逐行验）：int32、宽 2051、`-1` 补齐、
+        **有效值严格是前缀**、有效个数 == `min(pool_len,512)*4 + seq_len%4` 逐行精确
+  - [x] `append_kpool_tail_to_topk` 这个 Triton kernel 在 Ascend 上**真的跑起来了**
+        —— 事先怀疑会炸，实际没有。又一次"推断出的缺口"落空
+  - [ ] **仍未验证**：ACL/graph capture（§2.9 有 host sync，**推断**会失败）；
+        TP>1；多 DSA 层共享 pool；未对齐 chunk 起点与 radix 前缀复用；
+        overlap scheduler 下 `seq_lens_cpu` 领先设备张量一步的场景；只测了 layer 3、一条 prompt
+  - [ ] **接 spec decode 前必须先解决**：`kpool_decode_update_index_cache` 假设每请求一行，
+        MTP 一次多 draft token 会让同一 `req_pool_index` 的多行抢同一个 ring 槽。
+        共享 CUDA kernel 有 `kpool_max_closed_pools` 那套多 token 逻辑，NPU 这条没有
   - [ ] DSA 注意力本体还缺全零 rope 的接线（§2.3 第 3 条），否则拿到 topk 也跑不出注意力
 
 - [ ] **P3.5 出口判据** —— 四模块逐层 golden 对齐
@@ -306,6 +324,10 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
 - [ ] P6.3 **MoE SwiGLU clamp** —— 现在是 2×clamp + `cat` + `npu_swiglu` 四个 kernel，可换成一个 `npu_clipped_swiglu`
 - [ ] P6.4 DeepEP-normal 的 D2H 同步（`moe_runner/ascend.py:270-274`，prefill 每 forward 42 次）—— 修在第三方 wheel 里，先 profiling
 - [ ] P6.5 NoPE 未融合的 split+RMSNorm（与 P3.3 同源，一起做）；顺带删掉那个看起来是死代码的 `q.clone()`
+- [ ] **P6.7 kpool indexer 的 expand+tail**（实测，单层单 4096-chunk 的最大单项）——
+      `expand_pooled_groups_to_topk` 中间物化了 `[4096, 512, 4]` 的 int64（67 MB）再 reshape，
+      占 6.3 ms / 单层。11 个 DSA 层 → 每个 4096-token chunk 约 69 ms。**在共享代码里**
+      （`kpool_fp8_index.py:379`），改动会影响 CUDA 路径，先 profiling 再决定
 - [ ] P6.6 NPU Graph
 - ⚠ **所有性能数字目前都是静态推算**，端到端跑通后必须用 profiling 重排序
 
