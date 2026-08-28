@@ -364,6 +364,26 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
 - [x] **P2.1 PASS** 逐 shard 反量化脚本落盘：[`tools/fp8_to_bf16.py`](./tools/fp8_to_bf16.py)
       （`weight_block_size=[128,128]`，`bf16 = fp8 * scale_inv` 按 128×128 块广播；
       丢弃 F32 scale；BF16 张量原样拷；`--delete-source` 默认关；带 `--min-free-gib` 空间闸门）
+
+      本次实际用的命令（换权重版本要重转时照抄）：
+
+      ```bash
+      source $ROOT/env.sh
+      SRC=/mnt/workspace/models/GLM-5.3-Flash
+      DST=/mnt/workspace/models/GLM-5.3-Flash-BF16
+
+      # 1) 先只转第一个 shard，什么都不删，人工核数值
+      npy $REPO/docs/docs/glm53_npu_support/tools/fp8_to_bf16.py \
+          --src $SRC --dst $DST --only model-00001-of-00062.safetensors
+
+      # 2) 核过之后再全量。--min-free-gib 是安全闸门，空间不够会中止而不是写坏
+      npy $REPO/docs/docs/glm53_npu_support/tools/fp8_to_bf16.py \
+          --src $SRC --dst $DST --min-free-gib 20
+      ```
+
+      > 全量那一步会在最后写 `model.safetensors.index.json`（剔掉 scale 条目）、
+      > 清洗 `config.json`、拷 tokenizer 等文件；`--only` / `--limit` 模式**不写**这些，
+      > 所以单 shard 试转不会产生半成品目录。输出已存在的 shard 会跳过，**中断可续跑**。
 - [x] **P2.2 PASS** 第一个 shard 转完人工核数值（**未删任何源**）：
       - 抽查：名称集合 = 源 − scale ✓、形状全等 ✓、480 个元素独立重算最大偏差恰好 0 ✓
       - **全 shard 逐位比对**：**2,759,852,032 个元素（27.6 亿）全部逐位一致**，

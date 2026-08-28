@@ -76,6 +76,7 @@ PLAN.md §2.6 的结论是：BF16 首次打通**不被任何算子硬卡住** �
 | **[PLAN.md](./PLAN.md)** | 活的计划 + 全部核实结论 | 环境好了之后。§2 算子结论，§3 阶段计划 |
 | `probe/` | 探测脚本 | `p0_5_ops.py` 验环境；`p0_6_*.py` 验算子 shape |
 | `launch_dsv4_a3.sh.example` | DSv4-Flash 起服务脚本（A3 TP16/DP16+DeepEP） | P0.7 冒烟 / 精度回归 |
+| **[`tools/fp8_to_bf16.py`](./tools/fp8_to_bf16.py)** | FP8 blockwise → BF16 逐 shard 反量化 | P2 权重转换；换权重版本要重转时 |
 | `env.sh.example` | 环境变量模板 | 复制到 `$ROOT/env.sh` |
 | `GLM53_flash_ascend_support_assessment.html` | 最初的评估报告 | 参考。**若干判断已被推翻，见 PLAN.md §2.8** |
 
