@@ -445,8 +445,30 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
 
 ### P3 · 逐模块对拍 ☐
 按依赖顺序，CPU golden vs NPU。
-- [ ] P3.1 **KDA 层**：`attention_registry.py:503-504` 加 NPU 分支路由到 `AscendKDAAttnBackend`（照抄 Kimi-K3 的 494-500）
+- [x] **P3.1a 已改**：`attention_registry.py` 的 `glm5_next_config` 分支加了 `_is_npu` 判断，
+      路由到 `AscendKDAAttnBackend` / `AscendKDAHybridLinearAttnBackend`（照抄同文件 Kimi-K3 的写法）。
+      **改动生效，服务能起来**，前向已经走到 KDA
+- [ ] P3.1b **发现布局契约不匹配（gate 张量）**：
+      `ascend_kda_backend.py:365` 传的是 `g.flatten(-2)`，那是 Kimi 的 4-D 布局
+      `[..., heads, head_dim]`；但 **GLM 传进来的 `forget_gate` 已经是 flat 的**
+      —— prefill 下是 `[1, T, heads*head_dim]`（`glm5_next.py:577` 的 `unsqueeze(0)`），
+      decode 下是 `[T, heads*head_dim]`。对 3-D 输入做 `flatten(-2)` 会把 `T` 和特征维压在一起，
+      于是 `shape[-1]` 变成 `T*512`，`fused_kda_gate_npu` 的
+      `heads*head_dim != hidden` 校验必然失败（`sgl_kernel_npu/fla/kda_gate.py:89`）
+      - **不是算子能力问题**：`A_log` 是 `(1,1,local_num_heads,1)`，TP16 下 numel=4，切分正确；
+        `head_k_dim=128` → 期望最后一维 512，GLM 给的正是 512，只是被 `flatten(-2)` 破坏了
+      - 修法：让 Ascend 后端按最后一维是否已等于 `heads*head_dim` 决定要不要 flatten
 - [ ] P3.2 **mHC**：`_mhc_pre_dispatch`/`_mhc_post_dispatch` 加 NPU 分支。核对 `post_mult_value=2.0` 与 kernel 内部一致性、`(post_mix, comb_mix)` ↔ `(post, comb)` 映射
+      - **实测确认了 D6**：不改的话第一次前向就炸在
+        `mhc.py:1676 _mhc_pre_dispatch` → `mhc.py:850 mhc_pre` →
+        `deep_gemm_wrapper/entrypoint.py:245` → `NameError: name 'deep_gemm' is not defined`
+      - **临时绕过**：`SGLANG_OPT_USE_TILELANG_MHC_PRE=False` + `..._MHC_POST=False`
+        + `SGLANG_OPT_DEEPGEMM_HC_PRENORM=False` → 走 `_mhc_pre_torch` 纯 torch 路径（正确但慢）
+      - **好消息**：`npu_hc_pre` 的封装**已经存在**（`mhc.py:1780`）且 **DSv4 已在用**
+        （`deepseek_v4.py:1906` / `:2029`），P3.2 是把 GLM 接上，不是从零写
+      - ⚠ **不能直接照搬**：GLM 的 `_hc_pre_fn` 多了 `post_mult_value=2.0` 和
+        `out_norm_weight` 折叠，而 `npu_hc_pre` 返回 `norm_fused=False`（norm 要调用方自己做）。
+        这正是本条原来标的风险点，要配 HF golden（`Glm5NextTextHyperConnection`）逐项核
 - [ ] P3.3 **NoPE MLA**：拆 `npu_kv_rmsnorm_rope_cache` + 20 处 split 早退 + KV buffer 二元组语义 + `trans_rope_weight` assert
 - [ ] P3.4 **kpool indexer**：解掉 `kpool_fp8_index.py:588` 与 `dsa_indexer_kpool.py:1766` 的非 CUDA 硬拦，用 `torch.topk` 打通 `group_topk=512`
 - [ ] P3.5 **出口判据**：四个模块逐层 golden 对齐
@@ -614,3 +636,6 @@ C3/C5 依赖 vendor 包，**2026-08-28 起 GLIBC 障碍已消失、vendor 包可
 | 2026-08-28 | **P2 完成**：FP8 → BF16 全量转换 62/62，输出 599 GB，出口判据全过（名称集合、形状、dtype、无 scale 泄漏、config 已清洗）。FP8 源**保留**，等 P4 端到端验过再删。磁盘余 70 GB |
 | 2026-08-28 | **P3 的 golden 来源换成 HF `transformers==5.16.1` 的 `glm5_next`**（纯 torch、CPU 可跑、四模块全覆盖，含 `Glm5NextTextIndexer`）。原方案"CPU 跑 GPU 分支"对 kpool 物理上做不到：`group_topk=512` 走的是 JIT CUDA `.cuh`，且本机无 CUDA 卡。装在独立 `.venv-ref`，**不得污染 `.venv-glm53`**（sglang 钉 transformers 5.12.1） |
 | 2026-08-28 | **BF16 产物通过真实加载路径验证**：16 rank 全部 `Load weight end`，52.03 GB/die，`type=Glm…`，**无 missing/unexpected key、无 shape mismatch**。失败点在其后的显存预算（照搬了 DSv4 的 DP16 配方，DP-attention 会复制 attention/dense），是配置问题不是权重问题 |
+| 2026-08-28 | **GLM-5.3-Flash BF16 首次在 NPU 起服务成功**（纯 TP16，权重 **37.25 GB/die** = 599/16，无复制）。踩到的启动期问题：`--page-size` 必须是 **64**（DSA pool 硬断言），不是 DSv4 的 128 |
+| 2026-08-28 | **P3.1a 完成**：`attention_registry.py` 的 GLM 分支加了 NPU 路由。**P3.1b 发现新问题**：`ascend_kda_backend.py:365` 的 `g.flatten(-2)` 是 Kimi 的 4-D 布局契约，GLM 的 gate 已经是 flat 的 → 校验失败。**布局问题，非算子能力问题** |
+| 2026-08-28 | **P3.2 的 D6 实测坐实**：不加 NPU 分支，第一次前向就 `NameError: deep_gemm`。已用 `SGLANG_OPT_USE_TILELANG_MHC_*=False` 临时绕开。`npu_hc_pre` 封装已存在且 DSv4 在用，P3.2 是接线不是重写 |
