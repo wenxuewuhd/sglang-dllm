@@ -11,6 +11,7 @@
 | 项 | 决定 |
 |---|---|
 | 一期目标 | GLM-5.3-Flash **纯文本**在 A3 上跑通并闭环精度 |
+| **性能目标** | **BF16 + NPU Graph 下的最优性能**（用户明确要求）。图模式是硬要求，不是选项 —— host 开销类的优化会被图吃掉，**device 时间类的才是长期值钱的** |
 | BF16 部署形态 | **单节点 TP16**（16 die × 64 GB） |
 | 量化格式 | **compressed-tensors W8A8-INT8**（weight per-channel + act per-token dynamic） |
 | 精度基准 | **HF `transformers==5.16.1` 的 `glm5_next`**（纯 torch、CPU 可跑、四模块全覆盖） |
@@ -394,7 +395,11 @@ DSA 每步 170 次 aten dispatch，MoE 只要 25 次。
 - [ ] **P6.10 `expand_pooled_groups_to_topk` 改 int32** —— prefill 的 `aclnnAdd` 花 **5.73 ms**
       产出 `[8192,512,4]` 的 int64（134 MB），高于下界 **43×**。token id 最大约 32768，
       **int32 完全够**，既减半流量又避开 Ascend 上被模拟的 int64 向量运算。**在共享代码里**
-- [ ] **P6.11 重写 `_append_kpool_tail_to_topk_kernel`** —— **4.73 ms**，
+- [ ] **P6.11 重写 `_append_kpool_tail_to_topk_kernel`** —— ⚠ **中断时已有关键进展，别从头做**：
+      实测**那 4.73 ms 全部来自被 clamp 的 gather load**，单把它去掉就是 **5.557 → 0.282 ms（约 20×）**。
+      而当初设计的「三处 store」重写方案**既不必要、本身也是错的**（三处 store 地址区间重叠，
+      同一 CTA 内跨线程竞态）—— **那条路不要再走**。未验证的半成品在 `git stash` 第一条。
+      原始分析：**4.73 ms**，
       `aiv_vec_ratio=0.027`、`aiv_mte2_ratio=0.0`，**既不算也不搬，是纯标量瓶颈**
       （8192 个 program 打在 40 个向量核上）。**在共享代码里**
 - [ ] **P6.12 降低 DSA 的 170 次 host 调用** —— 每省一次约 13.5 µs（开 TQE=2 后约 8 µs）
