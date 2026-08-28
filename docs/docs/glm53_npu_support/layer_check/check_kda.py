@@ -508,6 +508,25 @@ def restore_op_phases(saved):
         setattr(owner, name, orig)
 
 
+def ragged_split(total: int, n: int) -> List[int]:
+    """`n` request lengths summing to `total`, spread widest-first.
+
+    Geometric rather than uniform, because what the padded conv layout costs is
+    set by max/mean, and a uniform split hides that: the padded buffer is
+    [n, dim, max_len] however the tokens are distributed.
+    """
+    if n <= 1:
+        return [total]
+    lens, rest = [], total
+    for i in range(n - 1):
+        take = max(64, (rest // 2) // 64 * 64)
+        take = min(take, rest - 64 * (n - 1 - i))
+        lens.append(take)
+        rest -= take
+    lens.append(rest)
+    return lens
+
+
 def run_bench(args, *, weights_full, meta) -> int:
     """Steady-state cost of one KDA layer at the deployment shape, one rank.
 
@@ -593,6 +612,11 @@ def run_bench(args, *, weights_full, meta) -> int:
     # Ragged decode near the context limit: what --max-running-requests 16 looks
     # like once the requests have drifted apart.
     dec_seqs = [ctx - 1 - (i * 137) % 4096 for i in range(bs)]
+    # Same token budget as the single-sequence chunk, split over several requests.
+    # A chunk is only single-sequence when one request is long enough to fill it;
+    # a queue of shorter ones packs several into the same chunk, and the conv and
+    # varlen chunk indexing then take a different path.
+    ragged_lens = ragged_split(args.prefill_chunk, args.bench_ragged_reqs)
     cases = [
         (
             "KDA prefill chunk",
@@ -601,6 +625,16 @@ def run_bench(args, *, weights_full, meta) -> int:
             ForwardMode.EXTEND,
             [ctx],
             [args.prefill_chunk],
+        ),
+        (
+            "KDA prefill chunk, ragged",
+            f"tp{args.tp} rank, {num_heads // args.tp}x{head_dim}, "
+            f"{len(ragged_lens)} reqs summing to {sum(ragged_lens)}, "
+            f"max={max(ragged_lens)} (pad ratio "
+            f"{len(ragged_lens) * max(ragged_lens) / sum(ragged_lens):.2f})",
+            ForwardMode.EXTEND,
+            [args.prefill_chunk + n for n in ragged_lens],
+            ragged_lens,
         ),
         (
             "KDA decode step",
@@ -642,6 +676,14 @@ def run_bench(args, *, weights_full, meta) -> int:
         # Counted without the phase wrappers, and outside the timed region.
         syncs[label] = timing.count_syncs(call, device=DEV)
         results.append(r)
+        if args.profile:
+            import kernel_profile as prof
+
+            timer = timing.Timer(DEV)
+            timer.enabled = False
+            outdir = str(Path(args.profile) / label.replace(" ", "_").replace(",", ""))
+            prof.record(lambda: call(timer), outdir=outdir)
+            print(prof.summarize(outdir, label=f"{label} [{shape}]"))
 
     print(
         timing.render(
@@ -683,6 +725,20 @@ def main() -> int:
     ap.add_argument("--bench-context", type=int, default=32768)
     ap.add_argument("--bench-warmup", type=int, default=5)
     ap.add_argument("--bench-iters", type=int, default=30)
+    ap.add_argument(
+        "--profile",
+        type=Path,
+        default=None,
+        help="also write a kernel-level profile of each --bench case here "
+        "(about 3 MB per case; see profile.py)",
+    )
+    ap.add_argument(
+        "--bench-ragged-reqs",
+        type=int,
+        default=8,
+        help="requests sharing the ragged prefill chunk (1 reproduces the "
+        "single-sequence case)",
+    )
     args = ap.parse_args()
 
     torch.set_grad_enabled(False)
