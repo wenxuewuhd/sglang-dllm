@@ -937,8 +937,16 @@ class NPUDSATokenToKVPool(DSATokenToKVPool):
         phys = (
             start.unsqueeze(1) + torch.arange(pool_size, device=key.device).unsqueeze(0)
         ) % tail_width
-        slot_k = tail_k[safe_req.unsqueeze(1), phys].clone()
-        slot_s = tail_score[safe_req.unsqueeze(1), phys].clone()
+        # Flatten to one index tensor rather than indexing [req, slot] with two.
+        # Multi-tensor advanced indexing has no AI Core implementation, so it
+        # falls back to aclnnIndex on the AI *CPU*: profiled at 293-308us twice
+        # per decode step -- 37.5% of this layer's whole device time -- to move
+        # 35 KB. index_select on the flat view is the same gather on the AI Core.
+        flat_k = tail_k.view(-1, tail_k.shape[-1])
+        flat_s = tail_score.view(-1, tail_score.shape[-1])
+        gather = (safe_req.unsqueeze(1) * tail_width + phys).reshape(-1)
+        slot_k = flat_k.index_select(0, gather).view(batch, pool_size, -1)
+        slot_s = flat_s.index_select(0, gather).view(batch, pool_size, -1)
         # The closing token is still in flight -- the ring is written below.
         slot_k[:, pool_size - 1] = key
         slot_s[:, pool_size - 1] = slot_score
@@ -957,11 +965,17 @@ class NPUDSATokenToKVPool(DSATokenToKVPool):
         # instead of being filtered out -- filtering needs the count on the host.
         self.set_index_k_bf16(layer_id, loc, compress_pool_bf16(slot_k, slot_s, ape))
 
-        # Same for the ring.
+        # Same for the ring, and the write side takes the same treatment: a
+        # two-tensor index_put_ is the AI CPU path again.
         dest = torch.where(valid, safe_req, self._tail_scratch_row)
-        phys_slot = safe_pos % tail_width
-        tail_k[dest, phys_slot] = key
-        tail_score[dest, phys_slot] = slot_score
+        scatter = (dest * tail_width + safe_pos % tail_width).reshape(-1, 1)
+        width = tail_k.shape[-1]
+        torch_npu.npu_scatter_nd_update_(
+            flat_k.view(-1, 1, width), scatter, key.reshape(-1, 1, width)
+        )
+        torch_npu.npu_scatter_nd_update_(
+            flat_s.view(-1, 1, width), scatter, slot_score.reshape(-1, 1, width)
+        )
 
     def set_index_k_scale_buffer(self, *args, **kwargs):
         raise NotImplementedError(

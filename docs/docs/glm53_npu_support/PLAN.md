@@ -25,6 +25,16 @@
 - **SoC `Ascend910_9362`（A3，不是 A2/910B）** —— 认型号只能用 `torch.npu.get_device_name(0)`，
   `npu-smi` 对 A2/A3 都显示 `Ascend910`。所有 sgl-kernel-npu 包选 **a3** 档
 - 16 die × 64 GB HBM；CPU 320 核 / 内存 1.8 TB
+- **单 die 可达 HBM 带宽 ≈ 1.25 TB/s（读写流）/ 1.17 TB/s（纯读）**，四个 die 离散 <1.5%。
+  ⚠ 之前文档里用的 1.6–1.7 TB/s 是**凭记忆给的、高了约 36%**，据此算出的所有倍数都已作废重算。
+  **厂商标称值找不到**（`npu-smi` 与 CANN 配置都不给），只能报实测
+- **L2 = 168 MB**（`Ascend910_9362.ini`）。32–64 MB 的工作集实测到 2.2–2.5 TB/s ——
+  **小于约 168 MB 的工作集可能根本不碰 HBM**，拿 HBM 带宽当下界会低估
+- **每 kernel 固定开销约 13.5 µs** → **流量小于约 16 MB 的 kernel 一律由 launch 开销主导**，与带宽无关
+- **`TASK_QUEUE_ENABLE=2` 把 launch 开销从 13.4–15.7 µs 降到 7.7–8.6 µs**（`0` 是最慢的 17.3 µs）。
+  实测 DSA decode **1.74×**（4.857 → 2.788 ms），而 device-bound 的 prefill/MoE 纹丝不动。
+  ⚠ 仓库自己的 `test/registered/npu/performance/glm5_1/` 里 **decode 节点用的是最慢的 `0`**。
+  **正确性/确定性影响未测，上生产前必须验**
 - **Ubuntu 24.04.3 / glibc 2.39** → SETUP 附录 B 的 glibc 绕行**整段不需要**
 - **A3 没有 fp8**：`bishengir-compile` 无法 lower e4m3（`unsupported datatype for arith::TruncFOp`），
   torch 侧 `x.to(torch.float8_e4m3fn)` 直接触发 device 异常。
@@ -112,6 +122,7 @@
 | **Hadamard-128 能不能删，取决于存什么** | 正交归一、q/k 同旋转、点积不变，所以**在 bf16 下确实可删**；**一旦量化就不能删** —— 它正是 int8 优于 fp8 的原因（旋转后 kurtosis≈3.0）。既然一期走 bf16，**保留它**（保留同样中性，且 3 个 kernel 里它本来就正常）；只有撞上 §4 那个 triton-ascend codegen 缺陷才删 |
 | **`ue8m0` scale 舍入** | 对浮点格式免费，对 int8 要付一个真实 bit（32k 重合 99.18% → 98.84%） |
 | **`npu_sparse_flash_attention` 的 sparse_indices 契约比「有效值在前」更严，失败方式也更坏** | 之前记的是「不是前缀就静默返回 0」。**实测在真实形状下不对**：decode@32k、2048 个有效索引时，把 `-1` 挪到 slot 0 得到的是 **rel 1.23e-1 的静默错误非零值**，不是 0。位置扫描显示 `-1` 落**偶数槽**会改变输出（rel 0.15–0.29，静默），落**奇数槽**则逐位相同。「静默返回 0」只在**第一个分块整块无效**时出现（小形状上复现）。所以契约是某种与**槽位奇偶 / 分块对齐**相关的东西，前缀恰好满足它。**我们的链路产出严格前缀所以安全**，但任何自己拼索引的地方风险比原记录高得多。机制**未查清**（要看 `aclnnSparseFlashAttention` 的 tiling 或问厂商）|
+| **多索引张量的高级索引会回落到 AI CPU** | `t[i0.unsqueeze(1), i1]` 这种两个索引张量的写法**没有 AI Core 实现**，落到 `aclnnIndex_IndexAiCpu_Index`。实测：搬 35 KB 花 **196.9 µs**，换成扁平化后的 `index_select`（`aclnnIndexSelect_GatherV3AiCore`）只要 **7.3 µs**，**27×**。在真实 DSA decode 里它每步跑 2 次、每次 293–308 µs，**占该层全部 device 时间的 37.5%**。⚠ **Python 层的 D2H 计数器看不见它** —— 它不是 stream sync，是一个跑在控制 CPU 上的 device 算子，只有 kernel 级 profiler 能发现 |
 | **KDA prefill 把 raw `beta` 直接喂给 chunk kernel** | GLM 交出来的 gate 是扁平的（`[1,T,H*K]`）、beta 是 raw；**CUDA 路径正是拿这个当判据**（`kda_backend.py:684` 的 `gate_was_flat`）并在 `chunk_kda` 内部做 sigmoid，而 Ascend 的 extend 链没有这个钩子。后果：**out.prefill 70.55× budget、out.decode 142.48×、ssm state 943.61×**，全程不报错。已修（按 `g.ndim == 3` 判据，与 CUDA 同源）。**模块级 golden 抓不到这个**——它只在真实路径上暴露 |
 | **Hadamard 在 bf16 里做** | CUDA kernel 把 bf16 读进 **fp32 寄存器**再变换（`hadamard_jit.cuh:150` 的 `float x_vals[..]`），Triton 的 `_hadamard128` 同样作用在 fp32 accumulator 上。在 bf16 里做要 round 7 次而它们 round 1 次，**不报错**，只是悄悄挪走一批 pool —— 32k 下选择重合掉 0.0006（实测）。这个 bug 我写过一次，被端到端对拍抓出来 |
 | **MoE 的路由在 fp32 与 bf16 之间会翻，从 layer 3 就开始** | 实测：top-8 集合不同的 token 占比 layer 3 为 12.5%、layer 41 达 **63.3%**。后果不是"精度差一点"，而是**双参考法的地板从第一个 MoE 层起就由离散的路由差异主导，不再是舍入**——地板从 9.5e-3 涨到 1.8e-1。**深层的宽地板不能当成"宽误差可接受"的依据**；注入 5% 误差实测只有 layer 7–25 测得出来，layer 26+ 测不出。这是**验收方法本身的边界**，不是某个算子的问题 |
@@ -368,7 +379,25 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
       所以索引缓存多分配一页、tail ring 多分配一行，专供屏蔽行落地。
       **extend 仍有同步**（`visible_pool_runs` 里的 `int(...max())`、
       `_kpool_extend_rows_npu` 的 host 侧构造），但 prefill 本来就不捕获，不需要动
-- ⚠ **所有性能数字目前都是静态推算**，端到端跑通后必须用 profiling 重排序
+- ⚠ 原「所有性能数字都是静态推算」**已作废**：下面是 kernel 级 profiler（`torch_npu.profiler`
+  Level1 + PipeUtilization）实测出的排序。**墙钟看不见其中任何一条**。
+
+**诊断结论：DSA 慢不是因为注意力慢，是因为注意力周围的簿记。** 注意力本身很好 ——
+`SparseFlashAttention` decode cube 利用率 **79.7%**、prefill **85.9%**，`LightningIndexer` **88.1%**。
+对照 MoE 的 `GroupedMatmul`：搬 346 MB 用 330 µs = **1051 GB/s = 实测 roofline 的 84%**。
+MoE 全程只有厂商融合算子，**没有 AI_CPU 回退、没有 Triton、没有 int64 索引算术**；
+DSA 每步 170 次 aten dispatch，MoE 只要 25 次。
+
+按实测收益排序：
+- [x] **P6.8 消掉 decode 的 AI_CPU gather** —— 已修（§2.4）。占 DSA decode device 时间 37.5%，27× 提升
+- [ ] **P6.9 `TASK_QUEUE_ENABLE=2`** —— DSA decode 立得 **1.74×，零代码改动**。先验正确性
+- [ ] **P6.10 `expand_pooled_groups_to_topk` 改 int32** —— prefill 的 `aclnnAdd` 花 **5.73 ms**
+      产出 `[8192,512,4]` 的 int64（134 MB），高于下界 **43×**。token id 最大约 32768，
+      **int32 完全够**，既减半流量又避开 Ascend 上被模拟的 int64 向量运算。**在共享代码里**
+- [ ] **P6.11 重写 `_append_kpool_tail_to_topk_kernel`** —— **4.73 ms**，
+      `aiv_vec_ratio=0.027`、`aiv_mte2_ratio=0.0`，**既不算也不搬，是纯标量瓶颈**
+      （8192 个 program 打在 40 个向量核上）。**在共享代码里**
+- [ ] **P6.12 降低 DSA 的 170 次 host 调用** —— 每省一次约 13.5 µs（开 TQE=2 后约 8 µs）
 
 ---
 
@@ -418,8 +447,13 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
 - [ ] **`NPUMLATokenToKVPool.set_kv_buffer:679` 在检查 `cache_v is None` 之前就
       `cache_v.to(...)`**（源码）。GLM 走的是共享实现所以碰不到，但这条路真被走到会
       直接 `AttributeError`
-- [ ] **预热**：DSA 单层 decode 首次 45.3 ms、稳态 5.6 ms（实测），说明有明显的
-      tiling/编译预热。真实启动脚本带 `--skip-server-warmup`，**P4 起服务前复查**
+- [ ] **预热**：冷:稳比高达 **971–1022×**（dense FFN 实测）。成因已查明：**是「进程内首次使用某个算子」
+      的代价，不是编译、不是 tiling 搜索、不是按 shape**。证据：`npu_swiglu` 首用 212–251 ms 而
+      **换新 shape 一分钱不花**；三个全新进程复现同一数字（不是 page cache）；`kernel_meta/` 全程为空
+      （不是 TBE JIT）。交叉印证：`check_moe.py` 报 MoE decode 首次 257.65 ms，而 `npu_swiglu`
+      单算子首用就是 212–251 ms。
+      **好消息是缓解极便宜**：预热只需让每个算子在**任意一个** shape 上跑一次，不必扫 shape。
+      真实启动脚本带 `--skip-server-warmup`，等于把这笔钱推给第一个真实请求 —— **P4 起服务前处理**
 - [x] ~~能不能让 qk_rope=0 走非 yarn 分支~~ —— **问题是空的**：那条分支 GLM 根本进不去，
       不需要改条件。OP-3 已撤销（§2.5），**工单包清空**。已在
       `deepseek_v2_attention_mla_npu.py` 的分支上方留了一行说明这个跨文件不变量
