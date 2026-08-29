@@ -88,6 +88,7 @@ NPU Graph 捕获：五类层各自 + 两个完整 decoder 层捕进同一个图 
 | [`layer_check/`](./layer_check/) | 逐层与整层对拍、图捕获验证、统一计时口径。**双参考法在 `tolerance.py`** | 改完要验数值时 |
 | 算子清单的对外呈现页 | https://claude.ai/code/artifact/54dbfb20-667f-465d-84c1-ea7d0cc1a827 | 发给下游同事时。**内容来自本目录，仓库为准**；要更新必须带上这个 URL，否则会新建一个而不是更新它 |
 | `tools/fp8_to_bf16.py` | FP8 blockwise → BF16 逐 shard 反量化 | 换权重版本要重转时 |
+| `tools/bf16_to_int8_ct.py` | BF16 → compressed-tensors W8A8-INT8。**不需要机器**（激活动态，无需校准）| P5 量化。产物已在 `/mnt/workspace/models/GLM-5.3-Flash-W8A8` |
 | `tools/golden_kda.py` / `golden_mhc.py` | 从 HF 参考实现生成 CPU golden | 模块级数值对拍 |
 | `tools/golden_kpool_indexer.py` + `check_kpool_indexer_npu.py` | kpool indexer 的两段式对拍：CPU 出 fp32 参考，NPU 跑真算子比选择集合 | 改完 kpool 接线后回归 |
 | `tools/logit_check.py` | teacher-forced logprob 对拍。`--streaming` 出 fp32 参考、`--emit-floor`/`--floor` 做**测出来的**判据、`--decode-tokens` 覆盖 decode、`--prompt-set long` 让稀疏选择真的生效 | 改完接线快速验精度 |
@@ -118,7 +119,7 @@ GPU 参考实现在 `upstream/xinyuan/glm-5.3-flash-support @ 0b9c38484e`（本�
 | P3 逐模块对拍 | ✅ 五类层（DSA / KDA / MoE / mHC / dense FFN）端到端全验 |
 | **P4 端到端** | ✅ **闭环**。TP16 整网跑通；logprob 对拍 8/8 在实测地板内；**GSM8K 97.35%**（判据 97.50%）|
 | **P6 NPU Graph** | ✅ 45 层整网捕获；同 batch 宽度下与 eager **逐位相同**；decode **约 8×** |
-| P5 W8A8 | ☐ 未开始（**磁盘要先删 FP8 源**）|
+| P5 W8A8 | ◐ **权重已转出**（306.1 GiB，62 shard，校验通过），**等上机加载验证** |
 | P6 性能优化 | ☐ 进行中：图下的排序要重做 |
 
 **算子开发需求 0 项** —— 五条推断出来的缺口逐条上机核实，五条全部证伪，

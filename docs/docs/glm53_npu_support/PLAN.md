@@ -482,10 +482,33 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
       `--floor`（判定必须显式传进来，不给默认阈值）
   - [ ] prefill-vs-decode 的 KL 一致性 —— 还没做
 
-### P5 · W8A8 compressed-tensors ☐
-- [ ] P5.1 recipe：weight per-channel + act per-token **dynamic**（静态会被 raise）
-- [ ] P5.2 ignore list 照搬 checkpoint 的 `modules_to_not_convert`：KDA 34 层全部、indexer 全套、`hc_*` 全部、所有 norm/embed/router
-- [ ] P5.3 288 专家校准（覆盖度是主要风险）
+### P5 · W8A8 compressed-tensors ☐（权重已转出，等上机加载）
+- [x] **P5.0 权重已转换**（2026-08-29）：`/mnt/workspace/models/GLM-5.3-Flash-W8A8`，
+      **62 shard / 306.1 GiB / 564 秒**，转换器 `tools/bf16_to_int8_ct.py`。
+      **不需要机器** —— 激活是 per-token 动态量化，没有要校准的东西、没有前向要跑，
+      纯 CPU + 磁盘的离线变换。
+      ⚠ **源是 BF16 不是 FP8**（FP8 分片已删）。但**「哪些权重当初是 FP8」是精确恢复的**：
+      保留下来的 FP8 `index.json` 里每个被量化的权重都带一个 `weight_scale_inv`，
+      读回来正好 **37338 个**，在 BF16 里一个不缺。**这不是按名字模式重新推的** ——
+      按模式推会变成第二个真相来源，早晚和第一个漂移。当初留那 28 MB 元数据就是为了这个。
+      校验：输出 index **76108 条 == FP8 原 index 的 76108 条**；37338 个权重缺失 0、缺 scale 0；
+      抽查 40 个量化张量最差 rel-L2 **9.1e-03**；抽查 40 个未量化张量 **40/40 逐位不变**。
+- [x] **P5.1 recipe** —— weight per-channel symmetric 静态 + act per-token **dynamic**。
+      这是 `compressed_tensors.py:489` 的 `_is_dynamic_token_w8a8` 唯一匹配的组合（静态激活会被拒）。
+      张量契约：`weight` int8 `[out,in]`、`weight_scale` fp32 **`[out,1]`**，动态激活**不需要 `input_scale``。
+      ⚠ **NPU 走专用分支** `NPUCompressedTensorsW8A8Int8`（`:762`），不是通用那个。
+      量化式：`scale = absmax(W,dim=1)/127`，`q = round(W/scale).clamp(-127,127)` ——
+      用 127 而不是 128 保持对称，`q*scale` 复原时没有偏移项；scale 在 fp32 里算，
+      先在 bf16 里取 max 等于把 scale 自己也量化了。
+- [x] **P5.2 ignore list** —— 直接抄 checkpoint 的 `modules_to_not_convert` 原文（1509 条）：
+      KDA 34 层全部、indexer 全套、`hc_*` 全部、所有 norm/embed/router/lm_head
+- [x] ~~P5.3 288 专家校准~~ —— **不需要**。激活是动态的，没有静态激活 scale 要标定
+- [ ] **P5.4 上机第一关：能不能被加载**。格式是照代码契约写的，**还没真正加载过一次**。
+      起服务加载 `GLM-5.3-Flash-W8A8` 是接手这块的人的第一件事
+- [ ] **P5.5 出口判据**：GSM8K 回归到 BF16 基线 **1% 以内**。
+      基线就是 `$ROOT/goldens/gsm8k/` 那两轮（97.04 / 97.35%）。
+      **每侧 2 轮**才够（1 轮时 1pp 只有 1.5σ，2 轮 2.1σ），BF16 那侧已经有了
+- ⚠ **磁盘现在只剩 23 GB**（BF16 599 + W8A8 306）。再要腾空间只能动 BF16
 - [ ] P5.4 **出口判据**：精度回归到 BF16 基线 1% 以内
 - ⚠ `INF_NAN_MODE_FORCE_DISABLE=1` **必须设**，否则 W8A8 溢出产生 NaN
 
@@ -728,7 +751,8 @@ DSA 每步 170 次 aten dispatch，MoE 只要 25 次。
 
 ## 4. 待决与已知缺陷
 
-- [ ] **P5 的磁盘**：BF16(643) + W8A8(333) = 976/984 GB → 必须先删 FP8 源
+- [x] ~~**P5 的磁盘**~~ —— FP8 源已删，W8A8 已转出，实际占 306.1 GiB（不是估的 333）。
+      **现在余 23 GB**，没有再腾挪的余地了
 - [ ] **索引缓存改 bf16 后显存翻倍**：每槽 256 B（打包 fp8 是 128+4=132 B）。
       按 11 个 DSA 层折算约 704 vs 363 B/token，相对 MLA KV 的约 11.3 KB/token 是 +3% 量级。
       **这是从 `mem_cache/index_key_cache.py:33-38` 的 buffer 形状推算的，未实测**；
