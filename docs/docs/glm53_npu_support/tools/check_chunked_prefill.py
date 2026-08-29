@@ -93,6 +93,37 @@ def ask(host, port, model, tok, prompt, n_new):
     }
 
 
+def background_load(host, port, model, tok, stop, results):
+    """Keep other requests decoding while the long prompt is being chunked.
+
+    This is the case that a single-request test cannot reach. Between chunk N and
+    chunk N+1 the long request is stashed out of the running batch while everything
+    else keeps decoding, so its KDA mamba slot has to survive other requests' writes.
+    A single-request test never has anything else in the batch.
+    """
+    import threading
+
+    prompt = "Count from one to twenty in words, one per line.\n1. one\n"
+    ids = tok(prompt, add_special_tokens=True)["input_ids"]
+
+    def one():
+        while not stop.is_set():
+            try:
+                r = requests.post(
+                    f"http://{host}:{port}/generate",
+                    json={"input_ids": ids,
+                          "sampling_params": {"max_new_tokens": 64, "temperature": 0}},
+                    timeout=600, proxies=NO_PROXY)
+                results.append(r.json()["text"])
+            except Exception:
+                pass
+
+    threads = [threading.Thread(target=one, daemon=True) for _ in range(8)]
+    for t in threads:
+        t.start()
+    return threads
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
@@ -103,13 +134,31 @@ def main() -> int:
                     help="the server's --chunked-prefill-size")
     ap.add_argument("--out", type=Path)
     ap.add_argument("--against", type=Path)
+    ap.add_argument("--concurrent", action="store_true",
+                    help="keep 8 other requests decoding through the chunked prefill")
     args = ap.parse_args()
 
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(args.model)
     prompt = build_prompt(tok, args.tokens, args.boundary)
+
+    bg_results, threads, stop = [], [], None
+    if args.concurrent:
+        import threading
+        import time
+
+        stop = threading.Event()
+        threads = background_load(args.host, args.port, args.model, tok, stop, bg_results)
+        time.sleep(5)  # let the background batch fill before the long prefill starts
+
     got = ask(args.host, args.port, args.model, tok, prompt, 24)
+
+    if stop is not None:
+        stop.set()
+        bad = [t for t in bg_results if "two" not in t]
+        print(f"background: {len(bg_results)} completions during the chunked prefill, "
+              f"{len(bad)} degraded")
 
     print(f"prompt {got['n_prompt']} tokens, boundary at {args.boundary} "
           f"-> {'SPLIT' if got['n_prompt'] > args.boundary else 'NOT split (raise --tokens)'}")

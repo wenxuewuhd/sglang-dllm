@@ -109,6 +109,17 @@ DSv4 那个跑三轮是因为 GPQA 只有 **198 题**（单轮 ±6pp），量级
 - ⚠ **服务级 profiling 会把服务打挂**（16 rank 全段错误），采到的数据也是废的。
   要 profile 走 `layer_check/kernel_profile.py` 那条单模块路线
 
+## 欠一次整机窗口的两件事
+
+1. **chunked prefill 的并发场景**（`tools/check_chunked_prefill.py --concurrent`，已写好）。
+   单请求下已全绿（切分真发生、边界前的针召回、mean|dlp| 7.8e-4、贪心逐 token 相同），
+   但 **chunk 之间该请求被移出 running batch 而别人继续 decode** 这一幕，
+   单请求测试结构上碰不到。外加 3 个及以上 chunk（目前只验了 2 个）
+2. 性能改动之后的 e2e 复核
+
+⚠ 2026-08-29 14:00 起**整机被别的任务占走了**（16 die 各约 56 GB），
+本项目的服务已停。要机器得先协调。
+
 ## 下一步（已定顺序）
 
 1. **在 graph 下重做 P6 的性能排序** —— 现在所有条目都是 eager 时代量的，**排序会变**：

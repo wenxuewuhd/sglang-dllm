@@ -396,6 +396,18 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
         | 贪心续写 | **token 序列完全相同** |
 
         提示 9958 > `index_topk=2048`，**稀疏选择是真的走的**。
+
+  - [ ] **chunked prefill 还差两项，别当成全绿**（2026-08-29 想测，机器被别人占走没跑成）：
+        ① **3 个及以上 chunk** —— 上面只验了 2 个（9958 token / 8192）。
+        ② **并发下的 chunking，这一项是真风险**：chunk 之间该请求被
+        `stash_chunked_request` **移出 running batch**（`scheduler.py:3140`），
+        而其它请求继续 decode、继续写各自的 mamba 槽。
+        **它的 KDA 槽要在这期间安然存活，而单请求测试结构上碰不到这个场景**
+        （批里没有别人）。反向也要看：长请求的 chunk 插进来，会不会搞坏正在 decode 的短请求。
+        `tools/check_chunked_prefill.py --concurrent` 已经写好，**等下一个整机窗口跑**。
+        机制上的线索：stash 走的是 `maybe_cache_unfinished_req(..., chunked=True)` →
+        tree cache，而本配方下是 `ChunkCache`（日志 `impl=ChunkCache hybrid_ssm=True`，
+        说明它知道 SSM 状态）。
   - [x] **「未对齐 chunk 起点」—— 构造不出来，不是没验**（源码 + 实测）。
         两条路径都被挡住：① `chunked_prefill_size % page_size == 0` 是启动期断言
         （`server_args.py:10051`，实测传 5000 直接 raise）；② radix 前缀复用把命中长度
