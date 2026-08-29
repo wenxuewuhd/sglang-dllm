@@ -13,9 +13,20 @@ is shared, and numbers taken while someone else's training job is up are worthle
 
     $VENV/bin/python bench_graph_decode.py
 """
-import json, time
+import argparse
+import json
+import time
 from concurrent.futures import ThreadPoolExecutor
+
 import requests
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--concurrency", default="1,2,4,8,16",
+                help="comma-separated; must not exceed --max-running-requests")
+ap.add_argument("--decode-tokens", type=int, default=128)
+ap.add_argument("--port", type=int, default=30003)
+args = ap.parse_args()
+CONCURRENCY = [int(x) for x in args.concurrency.split(",")]
 
 NP = {"http": None, "https": None}
 G = "/mnt/workspace/y00359136/work/glm53_dev/env/goldens/logits"
@@ -23,10 +34,10 @@ pools = {
     "short (13 tok)": [d["ids"] for d in json.load(open(f"{G}/ref_server_eager_short_d100.json"))["data"]],
     "long (3256 tok)": [d["ids"] for d in json.load(open(f"{G}/ref_server_eager_long_d100.json"))["data"]],
 }
-DEC = 128
+DEC = args.decode_tokens
 
 def run(ids, n_new):
-    r = requests.post("http://127.0.0.1:30003/generate",
+    r = requests.post(f"http://127.0.0.1:{args.port}/generate",
         json={"input_ids": ids, "sampling_params": {"max_new_tokens": n_new, "temperature": 0, "ignore_eos": True}},
         timeout=1800, proxies=NP)
     r.raise_for_status()
@@ -39,10 +50,12 @@ def wall(pool, n, n_new):
     return time.time() - t0
 
 for name, pool in pools.items():
-    print(f"\n--- {name}, {DEC} decode tokens")
-    print(f"{'conc':>6}{'prefill s':>11}{'decode s':>10}{'ms/token':>10}{'decode tok/s total':>20}")
-    for n in (1, 2, 4, 8, 16):
+    print(f"\n--- {name}, {DEC} decode tokens", flush=True)
+    print(f"{'conc':>6}{'prefill s':>11}{'decode s':>10}{'ms/token':>10}{'decode tok/s total':>20}",
+          flush=True)
+    for n in CONCURRENCY:
         t_pre = wall(pool, n, 1)
         t_all = wall(pool, n, DEC + 1)
         t_dec = max(t_all - t_pre, 1e-9)
-        print(f"{n:>6}{t_pre:>11.2f}{t_dec:>10.2f}{1000 * t_dec / DEC:>10.1f}{n * DEC / t_dec:>20.1f}")
+        print(f"{n:>6}{t_pre:>11.2f}{t_dec:>10.2f}{1000 * t_dec / DEC:>10.1f}"
+              f"{n * DEC / t_dec:>20.1f}", flush=True)

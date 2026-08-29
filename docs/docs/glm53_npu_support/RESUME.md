@@ -84,15 +84,29 @@ kpool 开销该去的地方，而它们**全是 device 时间类的，图吃不�
 否则 3256 token × 16 并发的 5.2 万 prefill token 会把 decode 完全盖掉。
 脚本在 `tools/bench_graph_decode.py`（padding 那条是 `tools/check_graph_padding.py`）。
 
+## GSM8K：已过（P4 闭环）
+
+**97.35%**（1284/1319）、stop rate **100.00%**、抽取失败 0 —— 判据 97.50%，差 0.32 个 SE。
+run 1 是 97.04%，但那轮有 9 例是**抽取器**把 `\boxed{70\%}` 判成无答案，不是模型错，已修。
+一轮 1360 秒（128 并发）；**eager 下同样的事要 11 小时以上**。
+结果连同响应原文存在 `$ROOT/goldens/gsm8k/`。
+
+**不用再跑第三轮**：GSM8K 是固定的全部 1319 题、与 cookbook 同一套，题目抽样方差抵消，
+只剩解码随机性（上界 0.47pp），两轮差 0.30pp 已经一致。
+DSv4 那个跑三轮是因为 GPQA 只有 **198 题**（单轮 ±6pp），量级完全不同。
+**真正需要多轮的是 P5**（判据「回归到 BF16 1% 以内」）：每侧 1 轮时 1pp 只有 1.5σ，
+2 轮时 2.1σ —— **上面这两轮就是 P5 的 BF16 基线，别丢**。
+
 ## 下一步（已定顺序）
 
-1. **GSM8K** —— 出口判据 **97.50%**（全 1319 题）。⚠ 那个数字是 **thinking 打开**测的
-   （`temperature=1.0, top_p=0.95, max_tokens=32768`，`sgl-eval run gsm8k --thinking`）。
-   以现在 33 token/s、16 并发估，全量是几小时量级
-2. **在 graph 下重做 P6 的性能排序** —— 现在所有条目都是 eager 时代量的，**排序会变**：
+1. **在 graph 下重做 P6 的性能排序** —— 现在所有条目都是 eager 时代量的，**排序会变**：
    host 开销类的（`TASK_QUEUE_ENABLE=2`、减少 aten dispatch）已经被图吃掉，
-   device 时间类的（AI_CPU 回退、int64 算术、标量瓶颈 kernel）才继续值钱
-3. **P5 W8A8 量化**
+   device 时间类的（AI_CPU 回退、int64 算术、标量瓶颈 kernel）才继续值钱。
+   **已有的两个指向**：① 长上下文 64 并发就拐（见性能基线）；
+   ② GSM8K 这种短输出高翻台的负载实测只跑到 206–234 token/s，
+   而同并发的纯 decode benchmark 是 1680 —— 差在**每答完一题就要插一次 prefill，
+   而 prefill 没有捕获图**（`--disable-prefill-cuda-graph`），overlap 也还关着
+2. **P5 W8A8 量化**（磁盘只剩 23 GB，必须先删 FP8 源）
 
 ## 还没碰的（别当成已验）
 
