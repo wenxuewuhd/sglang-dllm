@@ -124,3 +124,27 @@ logprob 挪很远，max 报的是「谁碰巧翻了最差的那个 token」，�
 也会走它，代理回 **503**。`env.sh` 里 unset 了，但直接跑工具时不会经过它 ——
 `logit_check.py` 已经自己带 `proxies={"http": None}`。别的脚本要连本机服务的，
 **先 unset**。
+
+
+---
+
+## chunked prefill：为什么它需要一个单独的用例
+
+**第 4 级（长提示端到端）抓不到它。** 那一级用的提示是 3256 token，而
+`chunked_prefill_size` 默认 8192 —— **单条序列根本没被切过**。
+服务日志里的 `#pending-token > 0` 会让人以为切了，那是**批级**切分
+（多条序列共分一个 8192 预算），和「一条序列跨多次 forward」是两个机制。
+
+要真的切开，提示必须 **> `chunked_prefill_size`**。GLM 在这里比无状态 Transformer
+多两样东西跨边界：**34 层 KDA 的 conv/SSM 递归状态**，和 **DSA kpool 的增量写入**。
+任一处不传递，边界之前的内容就被静默遗忘。
+
+`tools/check_chunked_prefill.py` 用两个**失败方式不同**的探针：
+
+- **针探**：边界**之前**埋一个独特事实，末尾问它。状态没传过去就直接答不出来 —— 语义失败，藏不住
+- **logprob**：同一条提示在切与不切两档下打分。**判据看量级不看相等** ——
+  切分改变了 GEMM 的 M 维，而这台机器上 bf16 matmul 不是 batch-shape 不变的，
+  正确实现也会挪动一个形状地板（约 2e-2 mean）
+
+实测（2026-08-29，9958 token）：针探 FOUND、贪心续写逐 token 相同、
+mean|dlp| **7.767e-04**（比形状地板低 25 倍）。

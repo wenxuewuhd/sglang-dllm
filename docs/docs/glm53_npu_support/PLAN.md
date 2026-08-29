@@ -382,9 +382,27 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
         —— 事先怀疑会炸，实际没有。又一次"推断出的缺口"落空
   - [x] ~~ACL/graph capture（§2.9 有 host sync，**推断**会失败）~~ —— **推断错了**：decode 整条链
         （indexer + 稀疏注意力 + 缓存写入）捕获成功且逐位可复现，见 P6.6。§2.9 的 host sync 全在 extend 侧
+  - [x] **chunked prefill —— 已验，单序列跨 forward 是对的**（2026-08-29，`tools/check_chunked_prefill.py`）。
+        ⚠ **此前所有「长上下文」测试都没碰到它**：最长的提示 3256 token 而
+        `chunked_prefill_size=8192`，**单条序列从来没被切过**；日志里那些 `#pending-token > 0`
+        是**批级**切分（多条序列共分 8192 预算），和「一条序列跨 forward」是两个机制。
+        用 9958 token 的提示才真的切开（日志 `#new-seq: 1, #new-token: 8192, #pending-token: 1766`
+        → `#new-token: 1792`）：
+
+        | 检查 | 结果 |
+        |---|---|
+        | 边界**之前**埋的独特事实能否召回 | ✅ FOUND（34 层 KDA 的 conv/SSM 状态、kpool 增量写入都跨过了边界）|
+        | 切 vs 不切（`--chunked-prefill-size 32768`）的 logprob | **mean\|dlp\| 7.767e-04**，比形状地板 2e-2 低 **25 倍** |
+        | 贪心续写 | **token 序列完全相同** |
+
+        提示 9958 > `index_topk=2048`，**稀疏选择是真的走的**。
+  - [x] **「未对齐 chunk 起点」—— 构造不出来，不是没验**（源码 + 实测）。
+        两条路径都被挡住：① `chunked_prefill_size % page_size == 0` 是启动期断言
+        （`server_args.py:10051`，实测传 5000 直接 raise）；② radix 前缀复用把命中长度
+        **向下取整到页边界**（`radix_cache.py:222,227` 的 `(matched // page_size) * page_size`）。
+        **这条从待办里划掉。**
   - [ ] **仍未验证**：
-        TP>1；多 DSA 层共享 pool；未对齐 chunk 起点与 radix 前缀复用；
-        overlap scheduler 下 `seq_lens_cpu` 领先设备张量一步的场景；只测了 layer 3、一条 prompt
+        TP>1（单层 harness 意义上）；多 DSA 层共享 pool；只测了 layer 3、一条 prompt
   - [ ] **接 spec decode 前必须先解决**：`kpool_decode_update_index_cache` 假设每请求一行，
         MTP 一次多 draft token 会让同一 `req_pool_index` 的多行抢同一个 ring 槽。
         共享 CUDA kernel 有 `kpool_max_closed_pools` 那套多 token 逻辑，NPU 这条没有
