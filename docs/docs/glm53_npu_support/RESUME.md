@@ -97,6 +97,18 @@ DSv4 那个跑三轮是因为 GPQA 只有 **198 题**（单轮 ±6pp），量级
 **真正需要多轮的是 P5**（判据「回归到 BF16 1% 以内」）：每侧 1 轮时 1pp 只有 1.5σ，
 2 轮时 2.1σ —— **上面这两轮就是 P5 的 BF16 基线，别丢**。
 
+## 这一轮性能上已经落地的（细节见 PLAN P6.13 / P6.14）
+
+- **overlap scheduler 开了，1.23×，数值一步没动**（248 → 304 token/s，对 eager 仍逐位相同）。
+  它此前关着只是为了让 graph-vs-eager 的对拍只有一个变量。**已改成默认配方**
+- **prefill 图别去试开关**：去掉 `--disable-prefill-cuda-graph` 完全没用 ——
+  NPU 上 prefill 默认后端是 `tc_piecewise`，而 `server_args.py` 的兼容性规则第一条
+  「non-CUDA hardware (HIP/NPU/CPU/MPS/XPU)」把它整个否掉了。要开是**两件代码工作**：
+  在声明式 registry 里给 GLM 注册 full prefill capture，**并且先清掉 extend 侧的 host 同步**
+  （否则捕获期间必抛 107027）。收益上界大，但代价是真代码
+- ⚠ **服务级 profiling 会把服务打挂**（16 rank 全段错误），采到的数据也是废的。
+  要 profile 走 `layer_check/kernel_profile.py` 那条单模块路线
+
 ## 下一步（已定顺序）
 
 1. **在 graph 下重做 P6 的性能排序** —— 现在所有条目都是 eager 时代量的，**排序会变**：

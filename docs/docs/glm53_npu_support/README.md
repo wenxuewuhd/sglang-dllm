@@ -77,7 +77,8 @@ NPU Graph 捕获：五类层各自 + 两个完整 decoder 层捕进同一个图 
 
 | 文件 | 用途 | 什么时候看 |
 |---|---|---|
-| **[SETUP.md](./SETUP.md)** | 环境搭建复现文档 | **换机第一件事**。照着做到「算子可见性验收」通过 |
+| **[REPRODUCE.md](./REPRODUCE.md)** | **从零复现整条链**：拉代码 → 建环境 → 转权重 → 起服务 → 验精度，每步都给了期望值 | **第一次接触这个项目就看这个** |
+| **[SETUP.md](./SETUP.md)** | 环境搭建复现文档（REPRODUCE 的 §2 展开） | 建环境卡住时 |
 | **[PLAN.md](./PLAN.md)** | 活的计划 + 全部核实结论 | 环境好了之后。§2 算子结论，§3 阶段计划 |
 | **[REGRESSION.md](./REGRESSION.md)** | 回归阶梯：改完跑什么，各级覆盖什么、抓不到什么 | **每次改动之后** |
 | **[SHARED_CHANGES.md](./SHARED_CHANGES.md)** | 共享路径改动台账：动了谁、影响谁、还欠什么回归 | 改到非 NPU 专属文件时 |
@@ -89,7 +90,10 @@ NPU Graph 捕获：五类层各自 + 两个完整 decoder 层捕进同一个图 
 | `tools/fp8_to_bf16.py` | FP8 blockwise → BF16 逐 shard 反量化 | 换权重版本要重转时 |
 | `tools/golden_kda.py` / `golden_mhc.py` | 从 HF 参考实现生成 CPU golden | 模块级数值对拍 |
 | `tools/golden_kpool_indexer.py` + `check_kpool_indexer_npu.py` | kpool indexer 的两段式对拍：CPU 出 fp32 参考，NPU 跑真算子比选择集合 | 改完 kpool 接线后回归 |
-| `tools/logit_check.py` | teacher-forced logprob 对拍（参考存盘、迭代秒级） | 改完接线快速验精度 |
+| `tools/logit_check.py` | teacher-forced logprob 对拍。`--streaming` 出 fp32 参考、`--emit-floor`/`--floor` 做**测出来的**判据、`--decode-tokens` 覆盖 decode、`--prompt-set long` 让稀疏选择真的生效 | 改完接线快速验精度 |
+| `tools/run_gsm8k.py` | GSM8K 全量（thinking 口径，与 cookbook 的 97.50% 可比） | 出口判据 / P5 量化对账 |
+| `tools/bench_graph_decode.py` | 图模式 decode 吞吐，prefill 与 decode 分开量 | 性能对比 |
+| `tools/check_graph_padding.py` | 并发落在非捕获桶上时，padding 行会不会踩坏真实请求 | 动了图或 KDA 状态之后 |
 | `env.sh.example` | 环境变量模板 | 复制到 `$ROOT/env.sh` |
 | `GLM53_flash_ascend_support_assessment.html` | 最初的评估报告 | 参考。**若干判断已被推翻，见 PLAN.md §2.5** |
 
@@ -102,21 +106,23 @@ GPU 参考实现在 `upstream/xinyuan/glm-5.3-flash-support @ 0b9c38484e`（本�
 一期目标：**A3 单节点 TP16 / 纯文本 / BF16 打通 → W8A8(compressed-tensors) 闭环精度**。
 多模态、MTP、长上下文 CP 一期都不做。
 
-## 当前状态（2026-08-28）
+## 当前状态（2026-08-29）
 
 | 阶段 | 状态 |
 |---|---|
-| P0 环境 / 算子可见性 / DSv4 冒烟与精度 | ✅ GPQA 73.74%（对标 73.23%） |
+| P0 环境 / 算子可见性 / DSv4 冒烟 | ✅ GPQA 73.74%（对标公开值 73.23%，198 题）|
 | P1 分支合流（rebase 到 `033446bb05`） | ✅ 回归 GPQA 73.23% |
 | P2 FP8 → BF16 权重转换 | ✅ 599 GB，全量比对通过 |
-| P3 逐模块对拍 | 进行中：KDA ✅ / mHC ✅ / **kpool ✅ 端到端跑通** / NoPE MLA 部分 |
-| P4 端到端 · P5 W8A8 · P6 性能 | 未开始 |
+| P3 逐模块对拍 | ✅ 五类层（DSA / KDA / MoE / mHC / dense FFN）端到端全验 |
+| **P4 端到端** | ✅ **闭环**。TP16 整网跑通；logprob 对拍 8/8 在实测地板内；**GSM8K 97.35%**（判据 97.50%）|
+| **P6 NPU Graph** | ✅ 45 层整网捕获；同 batch 宽度下与 eager **逐位相同**；decode **约 8×** |
+| P5 W8A8 | ☐ 未开始（**磁盘要先删 FP8 源**）|
+| P6 性能优化 | ☐ 进行中：图下的排序要重做 |
 
-**当前关键路径**：P3.4 kpool —— 已无阻塞，**数值门槛已通过**。A3 无 fp8，索引缓存改存 **bf16**
-（不是 int8，理由见 PLAN §2.7），打分交给 `npu_lightning_indexer`。对真实权重的 golden，
-候选**正好落在噪声地板上**（SLACK 1.0），同样 bf16 输入下与 fp32-torch 参考逐位相同。
-详见 PLAN §2.3、§2.6、**§2.8**。
+**算子开发需求 0 项** —— 五条推断出来的缺口逐条上机核实，五条全部证伪，
+`operator_handoff/` 已清空。
 
-**给算子团队的工单**在 [`operator_handoff/`](./operator_handoff/) —— **四个原始需求全部撤销，
-工单包已清空，不需要任何算子开发**。前三个是算子本就存在；OP-1 是找错了近名算子；
-OP-3 的算子限制是真的，但**调用点不在 GLM 的路径上**。
+**当前关键路径**：图模式下的性能重排。两个已量出来的方向 ——
+① **prefill 没进图**（GSM8K 那种短输出高翻台负载实测 875 个 prefill 批 / 每批仅 163 token，
+而 `--disable-overlap-schedule` 下每次 prefill 都完全停住 decode）；
+② **长上下文 64 并发就拐**（kpool 的 device 时间，图吃不掉，见 P6.7 / P6.10 / P6.11）。

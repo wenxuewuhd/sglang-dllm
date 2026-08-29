@@ -99,9 +99,14 @@ device 时间类的（AI_CPU 回退、int64 算术、标量瓶颈 kernel）才�
 - 参考环境 `$ROOT/.venv-ref`：transformers 5.16.1 + CPU torch。**绝不能装进 `.venv-glm53`**（sglang 钉 5.12.1）
 
 ### 磁盘
-- `/mnt/workspace` 984 GB，已用 915 / **余 70 GB**
-- GLM FP8 306 GiB（保留至 P4 验过）+ BF16 **599 GB**
-- ⚠ P5 的 W8A8 约 333 GB：`643 + 333 = 976 / 984`，**必须先删 FP8 源**
+- `/mnt/workspace` 984 GB，**已用 655 / 余 329 GB**（2026-08-29）
+- **FP8 源已删**（2026-08-29，P4 闭环后）：62 个 shard / 306 GB，
+  **元数据 28 MB 保留**（config / tokenizer / chat_template.jinja / index.json），
+  revision 溯源不丢。删前核过 BF16 自足：62/62 shard、0 缺失、38770 张量、
+  除 `README.md` 外元数据齐全
+- GLM BF16 **599 GB**（`du` 报 642.7 GB）
+- ⚠ **P5 的 W8A8 约 333 GB，而现在余 329 GB —— 余量非常薄**。
+  接手量化的人要先规划好，中途撑不住的话只能再动 BF16
 
 ### 模型结构
 - 45 层 = **34 KDA**（`linear_attention`）+ **11 DSA**（`deepseek_sparse_attention`，层号 3,7,11,…,43），另有第 45 层 MTP
@@ -455,6 +460,49 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
 - ⚠ `INF_NAN_MODE_FORCE_DISABLE=1` **必须设**，否则 W8A8 溢出产生 NaN
 
 ### P6 · 性能 ☐（可与 P3–P5 并行）
+
+⚠ **服务级 profiling 这条路目前不通（实测，2026-08-29）**：对跑着的服务 POST
+`/start_profile`（`profile_by_stage=True` + `record_shapes=True`、16 rank、128 并发）
+**把 16 个 scheduler 全部段错误打挂**，而且采到的数据本身是废的 ——
+analyse 报 `no such table: TASK` / `The collected data has been lost`。
+采集期间吞吐直接冻住（90 秒窗口内 0 个请求完成），6 个 step 没跑完，profiler 没能收尾。
+**要 profile 就走 `layer_check/kernel_profile.py` 那条单模块路线**（Level1 + PipeUtilization，
+已验证可用）；服务级的先别碰，真要碰就降到低并发、去掉 `record_shapes`、
+并且**准备好服务会挂**。
+**P6.13 overlap scheduler：开，实测 1.23× 且数值不变**（2026-08-29，A/B，200 题 GSM8K、128 并发）：
+
+| | 墙钟 | q/s | token/s | 准确率 |
+|---|---|---|---|---|
+| `--disable-overlap-schedule`（此前的配方）| 186 s | 1.07 | 248 | 199/200 |
+| **去掉它** | **139 s** | 1.44 | **304** | 199/200 |
+
+**按 token 吞吐比 1.23×**（q/s 会被两轮生成长度不同污染，token/s 才是公允的）。
+**而且数值一步没动**：对 eager 基线仍然 `max|dlp| = 0.000e+00`（prefill + 200 个 decode token）。
+PLAN 里「overlap 下 `seq_lens_cpu` 领先设备张量一步」那个担忧**在 GLM 上没有兑现**。
+→ **overlap 应该常开**，`launch_glm_bf16.sh.example` 已改。
+⚠ 它此前是关着的，只是因为要让 graph-vs-eager 的对拍只有一个变量。
+
+**P6.14 prefill 图在 NPU 上不是一个开关能解决的（源码定论）**：
+去掉 `--disable-prefill-cuda-graph` **没有任何作用** —— 实测 `disable_prefill_cuda_graph: False`
+但 `'prefill': {'backend': 'disabled'}`。原因在 `server_args.py` 的
+`_disable_tc_piecewise_cudagraph_if_incompatible()`：NPU 上 prefill 的默认后端是
+`tc_piecewise`（`cuda_graph_config.py:110` 的 `default_prefill_backend()`），
+而规则表里第一条就是 **「non-CUDA hardware (HIP/NPU/CPU/MPS/XPU)」，把 tc_piecewise 整个否掉**。
+`full` 那条路是「opt-in per model architecture via the declarative registry」
+（注释指向 `arg_groups/overrides.py` 的 `_inkling_overrides`）。
+
+所以要让 prefill 进图，是**两件代码工作**，不是调参：
+① 在那个声明式 registry 里为 GLM 注册 full prefill capture；
+② **先把 extend 侧的 host 同步清掉** —— `visible_pool_runs` 里的 `int(...max())`、
+`_kpool_extend_rows_npu` 的 host 侧构造。捕获期间 `.item()`/`.cpu()` 会抛 **107027**（已实测），
+不清掉一定失败。
+**收益上界很大**（875 个 prefill 批 / 每批仅 163 token），但代价是真代码。
+
+⚠ 顺带：**问题「prefill 占多少」根本不需要 profiler** —— 服务日志每个 batch 都有时间戳，
+不受 profiler 扰动。GSM8K 那 23 分钟窗口实测：**875 个 prefill 批 vs 约 6840 个 decode step**，
+每批 prefill 平均只有 **163 token**（约 1–2 道题）。`--disable-overlap-schedule` 下
+prefill 不能与 decode 重叠，**每次 prefill 都是 decode 流的一次完全停顿**。
+
 
 **图模式下的第一份基线（2026-08-29，实测，TP16、`ignore_eos`、贪心、128 并发配方）。**
 prefill 与 decode 分开量：先跑 `max_new_tokens=1` 拿 prefill 墙钟，再跑 129 相减 ——
