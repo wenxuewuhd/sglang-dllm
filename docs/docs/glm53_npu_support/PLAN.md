@@ -16,9 +16,10 @@
 | 环境 / 分支合流 / BF16 权重转换 | ✅ P0–P2 |
 | **五类层逐层对拍**（DSA / KDA / MoE / mHC / dense FFN） | ✅ **全部端到端已验**，真实 TP16 形状，回归脚本在 `layer_check/` |
 | **NPU Graph 捕获** | ✅ 五类层各自 + **两个完整 decoder 层捕进同一个图**（走真实 `NPUGraphRunner`）+ 多 bs 共池 + 2 卡 HCCL |
-| **整网** | ❌ **一次都没跑通过**。所有验证都是单 die、单层/双层、无 16 卡 HCCL |
+| **整网** | ✅ **2026-08-29 09:20 跑通**。TP16 真实 HCCL、45 层、prefill + decode、并发 ragged 批。见 P4.1 |
 
-**当前门槛：P4.1 整网启动。** 不是技术问题，是**机器**问题 ——
+**当前门槛：P4.2 精度出口（GSM8K 97.50%）与开 graph。** 整网已跑通。
+起服务仍然**必须独占整机** ——
 GLM BF16 只能 TP16（TP8 每卡要 74.9 GB，放不下），而 `bootstrap.py:339` 要求
 **每张卡空闲显存 ≥ 90%**，所以**必须独占整机**。
 
@@ -370,15 +371,19 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
 - [ ] **P3.5 出口判据** —— 四模块逐层 golden 对齐
 
 ### P4 · BF16 端到端 ☐ ← **当前战线，卡在机器不可独占**
-- [ ] P4.1 TP16 / 32K / 纯文本 / 关 NPU Graph 启动
-      **关 graph 只是 bring-up 顺序，不是终态** —— 开 graph 是 P6.6，一定要做。
-      P4 关掉的理由：捕获会把「算错」变成更难查的「算错」（静态 shape/地址、
-      host 侧控制流被烘进图里或直接打断捕获），而 kpool 这条路上到处是 host 侧控制流
-      （`_compress_write_extend` 在 python 循环里读 `extend_seq_lens_cpu[i]`；
-      `moe_runner/ascend.py:270` 的 D2H 同步）。先拿到一个可调试的正确基线。
-      另外 `npu_lightning_indexer` 在捕获下能否用**尚未验证**（§2.6）；
-      decode 侧形状是静态的（每 batch 一行、`sparse_count` 固定），**推断**可捕获，
-      prefill 的分段数随位置变化但 prefill 本来就不捕获
+- [x] **P4.1 TP16 / 32K / 纯文本 / 关 NPU Graph 启动** —— ✅ **2026-08-29 09:20 跑通**
+      - 权重 37.25 GB/die，`max_total_num_tokens=1195072`，可用 7.66 GB
+        （比 fp8 索引缓存那版少 1.53 GB —— **bf16 索引缓存的实测代价**，此前只有推算）
+      - 短 prompt：`"The capital of France is"` → `" Paris. In French, Paris is spelled ..."`
+      - **长 prompt 3652 token > `index_topk=2048`，稀疏选择真的走了**，答案正确。
+        短 prompt 走的是 `skip_logits_computation`，**测不到 kpool**，别拿它当验证
+      - 4 个并发 ragged 请求（131/371/1211/2711）全部答对，同一批里既有稀疏也有跳过
+      - 日志无异常（只有启动时 `/freeze_gc` 的连接竞态，无害）
+      - ⚠ 耗时约 **480 ms/token**（eager、无 graph、无预热），**不是性能结论**
+      **拉通过程中修的三个 bug**（都是「一次没执行过」暴露的，见 git log）：
+      `IndexerKPool.forward_npu` 缺失、`AscendHybridLinearAttnBackend.forward_metadata` 缺失、
+      `HybridLinearKVPool` 不转发 `set_index_k_bf16`。后两个是**同一类**：
+      GLM 的顶层对象是包装，而新方法加在了被包的那个上 —— **单层 harness 结构上发现不了**
 - [ ] P4.2 **出口判据**：**GSM8K 97.50%**（GPU 分支 cookbook 口径：全 1319 题、stop rate 100%、4×GB300 TP4/EP4）
       - ⚠ **该数字是 thinking 打开测的**（`temperature=1.0, top_p=0.95, max_tokens=32768`，`sgl-eval run gsm8k --thinking`）
       - ⚠ cookbook 的速度数字带 `SGLANG_SIMULATE_ACC_LEN=3`，**只能当吞吐口径**
