@@ -18,12 +18,15 @@
 | **NPU Graph 捕获** | ✅ 五类层各自 + **两个完整 decoder 层捕进同一个图**（走真实 `NPUGraphRunner`）+ 多 bs 共池 + 2 卡 HCCL |
 | **整网** | ✅ **2026-08-29 09:20 跑通**。TP16 真实 HCCL、45 层、prefill + decode、并发 ragged 批。见 P4.1 |
 
-**当前门槛：P4.2 精度出口（GSM8K 97.50%）与开 graph。** 整网已跑通。
-起服务仍然**必须独占整机** ——
-GLM BF16 只能 TP16（TP8 每卡要 74.9 GB，放不下），而 `bootstrap.py:339` 要求
-**每张卡空闲显存 ≥ 90%**，所以**必须独占整机**。
+**当前门槛：eager 基线的判定** —— logits 对拍缺一个**地板**，
+已有的数字（`mean|dlp|` 0.013–0.25）既不能说通过也不能说失败。见 `RESUME.md`。
 
-**下一步的顺序**：整网 eager 跑通 → 开 graph → 在 graph 下重做性能。
+**下一步的顺序**：拿到地板判定 eager → 开 graph（判据是**逐位相同**，不是容差）
+→ 补 decode 与长上下文 → 在 graph 下重做性能 → GSM8K。
+⚠ **GSM8K 在 eager 下不可行**（480 ms/token，全量 11 小时以上），必须等 graph。
+
+⚠ 起服务**必须独占整机**：GLM BF16 只能 TP16（TP8 每卡要 74.9 GB，放不下），
+而 `bootstrap.py:339` 要求每卡空闲显存 ≥ 90%。**停服务后显存不是立刻回收的。**
 ⚠ 现有的性能数字全是 eager 时代的，**开 graph 后要重测**：host 开销类的优化
 （`TASK_QUEUE_ENABLE`、减少 aten dispatch 次数）会被图吃掉，
 device 时间类的（AI_CPU 回退、int64 算术、标量瓶颈 kernel）才继续值钱。

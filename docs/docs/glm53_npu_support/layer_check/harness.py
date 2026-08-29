@@ -29,8 +29,7 @@ from typing import Dict, Optional
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "operator_handoff"))
-from reference.tolerance import (  # noqa: E402
+from tolerance import (  # noqa: E402
     ABS_MIN,
     SLACK,
     noise_floor,
