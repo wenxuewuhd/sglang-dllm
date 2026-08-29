@@ -90,6 +90,8 @@ kpool 的 10 个 Triton kernel 里 7 个已实测可在 triton-ascend 上跑且�
 |---|---|---|
 | **[SETUP.md](./SETUP.md)** | 环境搭建复现文档 | **换机第一件事**。照着做到「算子可见性验收」通过 |
 | **[PLAN.md](./PLAN.md)** | 活的计划 + 全部核实结论 | 环境好了之后。§2 算子结论，§3 阶段计划 |
+| **[REGRESSION.md](./REGRESSION.md)** | 回归阶梯：改完跑什么，各级覆盖什么、抓不到什么 | **每次改动之后** |
+| **[SHARED_CHANGES.md](./SHARED_CHANGES.md)** | 共享路径改动台账：动了谁、影响谁、还欠什么回归 | 改到非 NPU 专属文件时 |
 | `probe/` | 探测脚本 | `p0_5_ops.py` 验环境；`p0_6_*.py` 验算子 shape；`p3_4_lightning_indexer.py` 验 kpool 打分算子 |
 | `launch_dsv4_a3.sh.example` | DSv4-Flash 起服务脚本（A3 TP16/DP16+DeepEP） | 冒烟 / 精度回归 |
 | **[`operator_handoff/`](./operator_handoff/)** | **给算子团队的工单**：规格 + 纯 torch 参考 + pytest + 验收判据 | 派算子开发时 |
