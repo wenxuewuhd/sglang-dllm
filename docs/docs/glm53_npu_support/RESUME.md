@@ -1,61 +1,86 @@
-# 中断交接（2026-08-28 20:27 暂停，约定 22:00 恢复）
+# 接手指南（2026-08-29 上午，整网已跑通）
 
-会话到达上限，**我和四个 agent 同时停在半路**。这份文件记的是「停在哪、什么能信、什么不能信」。
-恢复时先读这个，再读 PLAN.md。
-
----
-
-## ⚠ 第一件事：工作树里有被中断的改动，已 stash
-
-```
-git stash list      # 找到 "WIP 2026-08-28 20:27 三个被中断的 agent"
-```
-
-三个文件，**都没验证完，其中一个已知有竞态**：
-
-| 文件 | 谁在改 | 状态 |
-|---|---|---|
-| `layers/attention/dsa/kpool_fp8_index.py` | B（共享路径优化） | ⚠ **最危险**。共享代码，CUDA 也走。agent 停下前的最后一句是「**我在自己写的 kernel 里发现一个真实隐患：三处 store 的地址区间重叠，在同一个 CUDA CTA 内跨线程竞态，正在改成不相交的 mask**」——**改到一半，别直接用** |
-| `hardware_backend/npu/attention/kpool_indexer_npu.py` | A 或 C | 未验证 |
-| `hardware_backend/npu/attention/ascend_kda_backend.py` | C | 未验证 |
-
-**恢复时不要无脑 `git stash pop` 就往下做。** 先判断每一处改动属于哪个任务、验证做到了哪一步。
-已经提交的东西（到 `651d473b7b` 为止）都是验证过的，可以信。
+新 session 从这里开始，然后读 `PLAN.md`。**上一份交接（20:27 那次中断）的内容已经全部消化，本文件是新的。**
 
 ---
 
-## 四个 agent 停在哪
+## 一句话现状
 
-用户已明确：**NPU Graph 是硬要求，不是选项**。碰到挡路的先讨论，不接受「不可行」的结论。
+**GLM-5.3-Flash 在 A3 上整网跑通了**（TP16、45 层、真实 HCCL、prefill + decode、并发 ragged 批）。
+**算子开发需求 0 项**（五条推断缺口全部证伪，工单包已清空）。
+**图捕获五类层 + 整层同图全部验通**，但**还没在整网上开过**。
 
-| # | 任务 | die | 停下前的最后状态 |
-|---|---|---|---|
-| **A** | **打通图捕获**（门槛项） | 0/1 | 「**是确定性的。我来隔离一下是 metadata 路径的问题，还是 prefill 之后第一次 decode 的效应**」——已经复现出某个确定性现象，正在二分定位 |
-| **B** | kpool 共享路径：int64→int32 + 重写 tail kernel | 2/3 | 见上，**kernel 改到一半且已知有竞态** |
-| **C** | 扫四类层找 AI_CPU 回退与低效 kernel | 8/9 | **新发现**：「**同样 8192 个 token，ragged prefill 要 15.90 ms，单序列只要 10.78 ms**」（约 1.5×）——正在定位差异去了哪，然后要看 DSA |
-| **D** | 预热策略 + `TASK_QUEUE_ENABLE` 正确性 | 10/11 | 刚起步，没有产出 |
+## 服务现在还开着
 
-**C 那条 ragged prefill 的发现值得单独跟进** —— 真实服务就是 ragged batch，1.5× 不是小数目，而且它是这轮唯一一条全新的、还没被记进 PLAN 的性能线索。
+端口 **30003**，eager（`--disable-cuda-graph`），日志
+`$ROOT/run/glm_bf16_0905.log`。要停就 `pkill -f "[s]glang.launch_server"`
+（**注意方括号**，否则会把自己的 shell 一起打掉，我踩过两次）。
 
----
+⚠ **停服务后显存不是立刻回收的。** `bootstrap.py:339` 要求每卡空闲 ≥ 90%，
+不满足直接 raise —— 停完不到一分钟就起会失败，我踩过。
 
-## 恢复时的建议顺序
+## 卡是共用的
 
-1. **处理 stash**（判断每处改动的归属与完成度，别直接 pop 就用）
-2. **重启 A**（图捕获是门槛，决定后面优化哪一类）
-3. **重启 C**，让它先把 ragged prefill 那 1.5× 查完
-4. **重启 B**，从「三处 store 地址重叠的竞态」接着修，改完必须跑
-   `tools/check_kpool_indexer_e2e_npu.py` 确认 overlap 还是
-   1.00000 / 0.99787 / 0.99722 / 0.99616（这是纯实现改动，数值不该变）
-5. **重启 D**（最独立，随时可以插）
-
-die 分配沿用：A→0/1，B→2/3，C→8/9，D→10/11。
+另一个用户（`l00960396`）会不定时起 16-die 的 DSv4 训练。
+**GLM BF16 只能 TP16**（TP8 每卡要 74.9 GB，放不下），所以**整网必须独占整机**。
+单卡的验证任务可以并行，但要先 `npu-smi info` 看一眼，并且**跑完让进程干净退出**。
 
 ---
 
-## 当前整体进度（详见 PLAN.md）
+## 当前正在做的事：logits 对拍（第 1 级回归）
 
-- **算子开发：0 项。** 五条推断出来的缺口全部证伪，工单包已清空
-- **逐层对拍：DSA / KDA / MoE / mHC / dense FFN 全部端到端已验**，都在真实 TP16 形状上
-- **整网从未跑过。** 所有验证都是单 die、单层、无 HCCL
-- 共享路径改动记在 `SHARED_CHANGES.md`，其中 **DSv4 的 GPQA 回归还欠着**
+见 `REGRESSION.md` 的六级阶梯。现在卡在**地板**上。
+
+**已有**：`scratchpad/logit_ref_bf16.json`（CPU bf16 参考，8 个短提示）。
+对服务的结果：`mean|dlp|` 0.013–0.25，`max` 2.97（都在 token 0），
+**dNLL 很小且正负混杂**（-0.167 ~ +0.095）。
+
+**结论：既不能说通过，也不能说失败** —— 缺地板。
+
+**不要用工具里原来那句 `<1e-2`** —— 那是拍脑袋写的，已删。实测：MoE 路由在
+fp32/bf16 之间会翻，layer 3 就 12.5%、layer 41 到 63.3%，**地板是离散的路由差异、
+随深度涨到 1.8e-1 量级**。
+
+### 下一步：用 trace 算地板（fp32 那条已放弃）
+
+**fp32 整模型 `from_pretrained` 跑不完** —— 实测加载到 26% 吃掉 1.26 TB 并开始换页，已杀。
+
+改走 `layer_check/trace_reference.py`：**流式**建模型（meta device 逐层物化再退回，
+峰值只有一层），能同时出 fp32 与 bf16 两份 45 层 hidden state，
+128 token 约 3.5 分钟、峰值 RSS 646 GB。
+`harness.py` 的 `first_divergence` 能逐层报误差与该层地板。
+
+⚠ trace 比的是 hidden state 不是 logprob，**量级可比、不能直接换算**。
+
+`tools/logit_check.py` 已加 `--against`：`compare --ref A.json --against B.json`
+可以两份参考互比（不打服务），这是算地板用的。
+
+---
+
+## 之后的顺序（已定）
+
+1. **拿到地板，判定 eager 基线** ← 现在这里
+2. **开 graph**，用 `logit_check.py --ref-source server` 录 eager 参考再对。
+   **判据是逐位相同**，不是容差 —— 单层实测 replay 与 eager bit-identical，
+   不等就是有东西被烘进图里
+3. **补 decode 与长上下文**（回归阶梯第 2、4 级）
+4. **GSM8K**：eager 下**不可行**（480 ms/token → 全量要 11 小时以上），必须等 graph
+
+---
+
+## 欠账
+
+`SHARED_CHANGES.md` 有 5 条已改 + 3 条待决。其中：
+- **DSv4 的 GPQA 回归没跑**（swiglu_limit 那条改动欠的，基线 73.23–73.74%）
+- **待决 ②** `seq_lens_cpu_list` 在捕获时被烘死 —— GLM 逃过，
+  但**对任何走 FIA 的非 DSA 昇腾模型是活的静默 bug**
+- `git stash` 里有 kpool 共享路径的半成品（tail kernel，作者已判定原方案是错的；
+  但**实测那 4.73 ms 全部来自被 clamp 的 gather load，去掉就是 5.557 → 0.282 ms**）
+
+## 三条最贵的教训
+
+1. **短 prompt 测不到 kpool** —— `seq_len < index_topk=2048` 时 indexer 直接全选。
+   「Paris 答对了」只证明 45 层能串起来
+2. **单层全绿不等于整网对** —— 整网拉通修的三个 bug 里两个是
+   「顶层对象是包装，新方法加在了被包的那个上」，单层 harness 直接构造内层，**结构上发现不了**
+3. **工具里拍脑袋的阈值比没有阈值更危险** —— 它让人对着错的基准下判断

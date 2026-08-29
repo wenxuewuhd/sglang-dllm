@@ -272,6 +272,51 @@ curl -s http://127.0.0.1:${PORT}/generate -H 'Content-Type: application/json' \
 
 ---
 
+## 10. 参考环境 `.venv-ref`（CPU，HF golden 的唯一来源）
+
+`layer_check/`、`tools/golden_*.py`、`tools/logit_check.py` 的**参考侧全部依赖它**。
+换机不建它，所有对拍都做不了。
+
+⚠ **必须是独立 venv**：sglang 钉死 `transformers==5.12.1`，而 `glm5_next`
+**只在 5.16.1 才有**（5.16.0 没有）。装到一起两边都坏。
+官方权重 repo **不带** `modeling_*.py`，`trust_remote_code` 这条路是空的。
+
+```bash
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY   # 代理只对 github/anthropic 有效
+python3.12 -m venv $ROOT/.venv-ref
+$ROOT/.venv-ref/bin/pip install -i <华为源> \
+    torch==2.10.0 --index-url <CPU 轮子源>            # CPU 版，不要 torch_npu
+$ROOT/.venv-ref/bin/pip install -i <华为源> transformers==5.16.1 accelerate safetensors
+```
+
+实测装成的版本（`$ROOT/.venv-ref`）：
+
+| 包 | 版本 |
+|---|---|
+| python | 3.12.9 |
+| torch | **2.10.0+cpu** |
+| transformers | **5.16.1** |
+| accelerate / safetensors / tokenizers / numpy | 1.14.0 / 0.8.0 / 0.23.1 / 2.5.2 |
+
+### 用它的两个坑
+
+**① 模型类不是 `AutoModelForCausalLM`。** GLM-5.3-Flash 的架构是
+`Glm5NextForConditionalGeneration`（带视觉塔），5.16.1 **定义了它但没注册到那个 auto class**，
+而且**顶层没导出**，只能从模块里拿：
+
+```python
+from transformers.models.glm5_next import Glm5NextForConditionalGeneration
+```
+
+用 `AutoModelForCausalLM` 会得到 `Unrecognized configuration class`。
+
+**② 整模型别直接 `from_pretrained`。** bf16 要 599 GB（1.8 TB 机器上勉强可以），
+**fp32 要 1.2 TB —— 实测加载到 26% 就吃掉 1.26 TB 并开始换页，跑不完**。
+需要 fp32 参考时走**流式**：`layer_check/trace_reference.py` 在 meta device 上建模型、
+逐层物化再退回，**峰值只有一层**，45 层 128 token 约 3.5 分钟。
+
+---
+
 ## 附录 A：踩坑速查
 
 | 现象 | 原因 / 解法 |

@@ -53,11 +53,19 @@ def token_ids(model_dir: str, text: str) -> list[int]:
 def run_reference_hf_cpu(model_dir: str, dtype: str) -> list[dict]:
     """One teacher-forced forward per prompt; returns logprob of each realised token."""
     import torch
-    from transformers import AutoModelForCausalLM
+
+    # Not AutoModelForCausalLM: GLM-5.3-Flash's architecture is
+    # Glm5NextForConditionalGeneration (it has a vision tower), which
+    # transformers 5.16.1 defines but does not register with that auto class, so
+    # AutoModelForCausalLM raises "Unrecognized configuration class". The class
+    # is also absent from the package's top-level exports; it has to come from
+    # the module. Text-only inference still goes through it -- the language
+    # model and the lm_head both live there.
+    from transformers.models.glm5_next import Glm5NextForConditionalGeneration
 
     torch_dtype = {"bf16": torch.bfloat16, "fp32": torch.float32}[dtype]
     print(f"loading {model_dir} on CPU as {dtype} (this is the slow part)", flush=True)
-    model = AutoModelForCausalLM.from_pretrained(
+    model = Glm5NextForConditionalGeneration.from_pretrained(
         model_dir, dtype=torch_dtype, device_map="cpu", trust_remote_code=True
     ).eval()
 
@@ -132,9 +140,22 @@ def compare(ref: list[dict], got: list[dict]) -> int:
         print(f"  at prompt {worst_where[0]} token {worst_where[1]}")
     else:
         print()
-    # A bf16 forward through 45 layers moves logprobs by ~1e-2; an order past that is
-    # a different function, not a different rounding.
-    print("guide: <1e-2 is bf16 rounding, >1e-1 means the two paths disagree")
+    # No fixed threshold. An earlier version of this file guessed "<1e-2 is bf16
+    # rounding", and that guess is wrong for this model by more than an order of
+    # magnitude: MoE routing flips between an fp32 and a bf16 evaluation from the
+    # first MoE layer onward -- 12.5% of tokens at layer 3, 63.3% by layer 41 --
+    # so the floor is a discrete routing difference, not rounding, and it widens
+    # with depth.
+    #
+    # Measure the floor instead, the way ACCEPTANCE.md does it:
+    #
+    #     reference --dtype fp32 --out ref32.json
+    #     reference --dtype bf16 --out ref16.json
+    #     compare --ref ref32.json --against ref16.json     <- this is the floor
+    #     compare --ref ref32.json --port 30003             <- this is the candidate
+    #
+    # The candidate passes when its number is within SLACK (2.0) of the floor's.
+    print("no fixed threshold -- compare this against the measured floor, see --against")
     return 0
 
 
@@ -148,6 +169,12 @@ def main() -> int:
     ap.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=30003)
+    ap.add_argument(
+        "--against",
+        type=Path,
+        help="compare --ref against this second reference file instead of a live "
+        "server. Two references of different dtype give the noise floor.",
+    )
     args = ap.parse_args()
 
     if args.mode == "reference":
@@ -168,6 +195,10 @@ def main() -> int:
         raise SystemExit("compare mode needs --ref")
     saved = json.loads(args.ref.read_text())
     print(f"reference: {saved['source']} ({saved['dtype']})")
+    if args.against is not None:
+        other = json.loads(args.against.read_text())
+        print(f"against:   {other['source']} ({other['dtype']})")
+        return compare(saved["data"], other["data"])
     return compare(saved["data"], run_reference_server(args.model, args.host, args.port))
 
 
