@@ -190,6 +190,34 @@ DeepseekV2/V4 的 MoE 前向确认 `fused` 判定没变。
 
 ---
 
+## 5. `mem_cache/memory_pool.py` —— `HybridLinearKVPool` 转发 `set_index_k_bf16`
+
+**改动**：给 `HybridLinearKVPool` 加一个 `set_index_k_bf16` 转发，和它已有的
+`set_index_k_scale_buffer` 完全同形（含 `_transfer_full_attention_id` 的层号翻译）。
+
+**为什么**：GLM 的 pool 是 `HybridLinearKVPool` **包着** `NPUDSATokenToKVPool`，
+而 `get_token_to_kv_pool()` 返回的是**外层**。bf16 索引缓存的写入方法只加在了内层，
+于是整网第一次 prefill 到 layer 3 就 `AttributeError`（16 个 rank 同时报）。
+
+**为什么单层验证没发现**：`layer_check` 里直接构造 `NPUDSATokenToKVPool` 并直接调它，
+**绕过了包装**。这和图捕获那轮发现的 `AscendHybridLinearAttnBackend.forward_metadata`
+是**同一类** —— 「GLM 的顶层对象是个包装，而我们的新方法加在被包的那个上」。
+
+**为什么不在 NPU 侧绕过包装**：外层转发时会做 `_transfer_full_attention_id`
+（全局层号 → 11 个 DSA 层里的下标）。绕过包装直接调内层就得自己复制这个翻译，很脆。
+
+**谁受影响**：**没有人**。它委托的 `set_index_k_bf16` 只存在于 `NPUDSATokenToKVPool`，
+CUDA 上没有任何调用者能走到这里。纯增量。
+
+**回归**：CUDA 不需要。昇腾上由整网启动本身验证。
+
+**顺带做的排查**：把 indexer 用到的 9 个 pool 成员、注意力本体用到的 4 个、
+backend 的 2 个，逐个对 `HybridLinearKVPool` / `AscendHybridLinearAttnBackend` 核过，
+**同类缺口没有别的了**。（`page_size` / `slots_per_page` 是实例属性，
+类级 `hasattr` 看不到，已单独确认 `:1696` 与 `:4825` 会设。）
+
+---
+
 ## 待决：三处只报告、没改的问题（图捕获那一轮发现）
 
 这三处**没有改动**，记在这里是因为**都会影响 GLM 之外的东西**，改不改要先定。

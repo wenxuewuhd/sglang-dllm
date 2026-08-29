@@ -4197,6 +4197,16 @@ class HybridLinearKVPool(KVCache):
             layer_id, loc, index_k, index_k_scale
         )
 
+    def set_index_k_bf16(
+        self, layer_id: int, loc: torch.Tensor, index_k: torch.Tensor
+    ) -> None:
+        # The bf16 index cache has no separate scale, so it needs its own writer
+        # rather than set_index_k_scale_buffer. Only NPUDSATokenToKVPool defines
+        # the target; nothing on CUDA reaches this.
+        assert self.use_dsa, "set_index_k_bf16 called when use_dsa is False"
+        layer_id = self._transfer_full_attention_id(layer_id)
+        self.full_kv_pool.set_index_k_bf16(layer_id, loc, index_k)
+
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         assert (
             self.use_dsa
