@@ -94,6 +94,7 @@ NPU Graph 捕获：五类层各自 + 两个完整 decoder 层捕进同一个图 
 | `tools/run_gsm8k.py` | GSM8K 全量（thinking 口径，与 cookbook 的 97.50% 可比） | 出口判据 / P5 量化对账 |
 | `tools/bench_graph_decode.py` | 图模式 decode 吞吐，prefill 与 decode 分开量 | 性能对比 |
 | `tools/check_graph_padding.py` | 并发落在非捕获桶上时，padding 行会不会踩坏真实请求 | 动了图或 KDA 状态之后 |
+| `layer_check/check_extend_rows.py` | `_extend_rows` 的设备侧形式与它取代的 host 循环是否逐元素相等（CPU 上跑，不需要机器）| 改了 kpool 的行分段之后 |
 | `tools/check_chunked_prefill.py` | 单条序列跨 forward 被切开之后还对不对（针探 + logprob 双探针）| 动了 KDA 状态传递或 kpool 增量写入之后 |
 | `env.sh.example` | 环境变量模板 | 复制到 `$ROOT/env.sh` |
 | `GLM53_flash_ascend_support_assessment.html` | 最初的评估报告 | 参考。**若干判断已被推翻，见 PLAN.md §2.5** |

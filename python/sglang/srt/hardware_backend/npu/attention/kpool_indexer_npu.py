@@ -296,19 +296,47 @@ class KPoolNPUIndexerMixin:
             )
             offset += q_len
 
-    def _kpool_extend_rows_npu(self, forward_batch, device):
-        """Per-query-row sequence length and owning request, for the segmentation."""
-        seq_lens, req_index = [], []
-        for i in range(forward_batch.batch_size):
-            q_len = int(forward_batch.extend_seq_lens_cpu[i])
-            if q_len == 0:
-                continue
-            seq_len = int(forward_batch.seq_lens_cpu[i])
-            seq_lens.append(torch.arange(seq_len - q_len + 1, seq_len + 1))
-            req_index.append(torch.full((q_len,), i))
-        return (
-            torch.cat(seq_lens).to(device=device, dtype=torch.int32),
-            torch.cat(req_index).to(device=device, dtype=torch.int32),
+    @staticmethod
+    def _extend_rows(extend_seq_lens, seq_lens, n_rows: int):
+        """Per-query-row sequence length and owning request, from device tensors.
+
+        Row ``r`` of request ``i`` (0-based within the request) sees
+        ``seq_len_i - q_len_i + r + 1`` keys, which is what the old host-side
+        ``arange(seq_len - q_len + 1, seq_len + 1)`` per request produced.
+
+        Everything here has a shape fixed by ``n_rows`` and the batch width, and
+        nothing is read back to the host. That is the point: the host-side version
+        rebuilt these two tensors in Python every forward and copied them over, and
+        a graph capture would have baked one forward's values in permanently.
+
+        ``ends`` is the cumulative row count, so ``(pos >= ends).sum()`` is the
+        index of the first request whose rows have not run out at ``pos``. Requests
+        contributing zero rows leave ``ends`` unchanged and are therefore skipped,
+        which matches the ``q_len == 0: continue`` they used to get. The comparison
+        is against ``ends`` rather than starts for exactly that reason -- starts
+        would land on the empty request instead of the next one.
+        """
+        ends = extend_seq_lens.cumsum(0)
+        pos = torch.arange(n_rows, device=ends.device, dtype=ends.dtype)
+        # [n_rows, batch] of bools: cheap at these sizes (8192 x 128 worst case), and
+        # unlike searchsorted it uses only ge and sum, which are ordinary AI Core ops.
+        req_index = (pos.unsqueeze(1) >= ends.unsqueeze(0)).sum(1)
+        starts = ends - extend_seq_lens
+        row_in_req = pos - starts[req_index]
+        rows = seq_lens[req_index] - extend_seq_lens[req_index] + row_in_req + 1
+        return rows.to(torch.int32), req_index.to(torch.int32)
+
+    def _kpool_extend_rows_npu(self, forward_batch, n_rows: int):
+        """Per-query-row sequence length and owning request, for the segmentation.
+
+        ``n_rows`` comes from the caller's query tensor rather than from
+        ``extend_seq_lens_cpu``: that field is a Python list, and its length is
+        the batch, not the row count.
+        """
+        return self._extend_rows(
+            forward_batch.extend_seq_lens.to(torch.int64),
+            forward_batch.seq_lens.to(torch.int64),
+            n_rows,
         )
 
     def forward_npu(
@@ -386,7 +414,7 @@ class KPoolNPUIndexerMixin:
                 key, gate_score, forward_batch, layer_id, block_tables, pool
             )
             seq_lens_row, req_index_row = self._kpool_extend_rows_npu(
-                forward_batch, x.device
+                forward_batch, x.shape[0]
             )
 
         if not return_indices:

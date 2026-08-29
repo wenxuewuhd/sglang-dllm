@@ -523,9 +523,34 @@ PLAN 里「overlap 下 `seq_lens_cpu` 领先设备张量一步」那个担忧**�
 
 所以要让 prefill 进图，是**两件代码工作**，不是调参：
 ① 在那个声明式 registry 里为 GLM 注册 full prefill capture；
-② **先把 extend 侧的 host 同步清掉** —— `visible_pool_runs` 里的 `int(...max())`、
-`_kpool_extend_rows_npu` 的 host 侧构造。捕获期间 `.item()`/`.cpu()` 会抛 **107027**（已实测），
-不清掉一定失败。
+② 清掉 extend 侧挡住捕获的东西。**⚠ 原先「extend 仍有 host 同步」这个说法是错的，已作废**
+（2026-08-29 逐行审计）：`kpool_indexer_npu.py` 里 **`.item()` / `.cpu()` / `.tolist()`
+一个都没有**，`visible_pool_runs` 的 `int(pool_lens.max())` 早就删了，
+而 `_kpool_extend_rows_npu` 读的是 `*_cpu` 字段 —— 那本来就在 host 上，不是 D2H 等待。
+（搜到的 `.item()` 在 `ascend_torch_native_backend.py` 和 `ascend_dsv4_backend.py`，
+**都不在 GLM 的路径上**。）
+
+**真正挡住捕获的是两件别的事**：
+
+  - [x] **`_kpool_extend_rows_npu` 的 host 侧构造 —— 已改成设备侧、静态形状**。
+        原来每次 forward 都在 Python 里循环 batch、每请求一个 `arange`、`cat`、再拷到设备；
+        **捕获会把某一次 forward 的值永久烘进图里**。新形式是纯张量算术，
+        形状由行数固定：`ends = extend_seq_lens.cumsum(0)`，
+        `req_index = (pos[:,None] >= ends[None,:]).sum(1)`。
+        **对 `ends` 而不是 starts 比较是有原因的** —— 零长度请求会让 starts 落在空请求上
+        而不是下一个，而旧代码是 `q_len == 0: continue` 跳过它的。
+        用 `ge`+`sum` 而不是 `searchsorted`，因为前者确定是普通 AI Core 算子。
+        **回归 `layer_check/check_extend_rows.py`：3006 个用例逐元素相等**
+        （含零长度请求、部署形状、全空），而且测的是**从模块里抽出来的仓库源文本**，不是抄件。
+        ⚠ **只证明了算术等价，没证明它在设备上可捕获或更快** —— 那需要机器。
+  - [ ] **`visible_pool_runs` 的 `nonzero()`** —— 这才是硬骨头。它的**输出形状是动态的**
+        （run 的个数随数据变），而捕获要求静态形状；图捕获 README 实测 `nonzero` 被拒。
+        要么补齐到最坏情况（每行一个 run）再带一个计数，但下游
+        `npu_fused_infer_attention_score` 的 per-run `actual_seq_lengths` 怎么接受填充
+        需要设计。**先别动，需要一次带机器的设计验证。**
+  - [ ] `_kpool_compress_write_extend_npu` 仍是 host 侧循环（每请求形状不同的散写），难度更高
+
+捕获期间 `.item()`/`.cpu()` 会抛 **107027**（已实测）。
 **收益上界很大**（875 个 prefill 批 / 每批仅 163 token），但代价是真代码。
 
 ⚠ 顺带：**问题「prefill 占多少」根本不需要 profiler** —— 服务日志每个 batch 都有时间戳，
