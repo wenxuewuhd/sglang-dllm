@@ -36,6 +36,21 @@ export SGLANG_OPT_USE_FUSED_HASH_TOPK=False
 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 ulimit -n 65536
 
+# 图相关的两行（2026-08-29 起是默认配方，实测 decode ~7.7x）：
+#   --disable-prefill-cuda-graph  prefill 侧还有 host 同步（`visible_pool_runs` 里的
+#                                 int(...max())、`_kpool_extend_rows_npu` 的 host 侧构造），
+#                                 一期不捕获 prefill
+#   --cuda-graph-max-bs-decode 16 不加的话 max_bs 默认 **256**，会去捕 36 个 bs 桶
+#                                 （1..256），而 --max-running-requests 16 决定了大于 16
+#                                 的桶永远用不上。16 给出 [1,2,4,8,12,16]，6 个桶捕完
+#                                 只要 15 秒、图池 0.8 GB
+# 要回 eager 基线（对拍用）就把这两行换成 --disable-cuda-graph。
+#
+# ⚠ 换配置重启前，**等 npu-smi 自己说话**，别看秒表：kill 后 3 秒重起，
+# `bootstrap.py:339` 的 90% 检查会放行，然后在加载权重时炸 OOM。16 个 die 全部
+# 回到约 3 GB 实测要 2–3 分钟：
+#   until [ "$(npu-smi info | grep -oP '\d+(?=\s*/ 65536)' | awk '$1>6553{c++}END{print c+0}')" = 0 ]; do sleep 15; done
+
 PORT=${PORT:-30003}
 exec $VENV/bin/python -m sglang.launch_server \
     --model-path /mnt/workspace/models/GLM-5.3-Flash-BF16 \
@@ -49,7 +64,8 @@ exec $VENV/bin/python -m sglang.launch_server \
     --context-length 32768 \
     --mem-fraction-static 0.85 \
     --disable-radix-cache \
-    --disable-cuda-graph \
+    --disable-prefill-cuda-graph \
+    --cuda-graph-max-bs-decode 16 \
     --disable-overlap-schedule --skip-server-warmup \
     --watchdog-timeout 9000 \
     --host 127.0.0.1 --port ${PORT}

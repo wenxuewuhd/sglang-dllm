@@ -17,13 +17,27 @@
 | **五类层逐层对拍**（DSA / KDA / MoE / mHC / dense FFN） | ✅ **全部端到端已验**，真实 TP16 形状，回归脚本在 `layer_check/` |
 | **NPU Graph 捕获** | ✅ 五类层各自 + **两个完整 decoder 层捕进同一个图**（走真实 `NPUGraphRunner`）+ 多 bs 共池 + 2 卡 HCCL |
 | **整网** | ✅ **2026-08-29 09:20 跑通**。TP16 真实 HCCL、45 层、prefill + decode、并发 ragged 批。见 P4.1 |
+| **eager 精度判定**（回归阶梯第 1 级） | ✅ **8/8 在测出来的地板内**，最差 0.91×。见 `REGRESSION.md` |
+| **整网 NPU Graph** | ✅ **2026-08-29 11:06 跑通**。45 层 / 6 个 bs 桶 / 16 卡 HCCL 全在图内；同 batch 宽度下与 eager **逐位相同**；decode **约 7.7×**。见 P6.6b |
 
-**当前门槛：eager 基线的判定** —— logits 对拍缺一个**地板**，
-已有的数字（`mean|dlp|` 0.013–0.25）既不能说通过也不能说失败。见 `RESUME.md`。
+**eager 基线的 logits 判定：已通过**（2026-08-29）。地板测出来了 ——
+fp32 与 bf16 跑同一件事，逐提示 mean|dlp| **9.6e-3 ~ 2.85e-1**；
+eager 服务对 fp32 CPU 参考 **8/8 在地板 × 2.0 之内，最差 0.91×**。
+原先说不清的那些数字（0.013–0.25）从来就不可疑，缺的只是地板。方法与数据见 `REGRESSION.md`。
 
-**下一步的顺序**：拿到地板判定 eager → 开 graph（判据是**逐位相同**，不是容差）
-→ 补 decode 与长上下文 → 在 graph 下重做性能 → GSM8K。
-⚠ **GSM8K 在 eager 下不可行**（480 ms/token，全量 11 小时以上），必须等 graph。
+**eager 基线已全部录进 `$ROOT/goldens/logits/`**，覆盖回归阶梯 1、2、4 三级
+（短提示 prefill / 每条 100 token 贪心 decode / **3256 token 长提示**，
+后者 `> index_topk=2048`，稀疏选择真的走了，段落里六个事实全答对）。
+**这是刻意提前录的** —— graph 一起来 eager 服务就没了。
+
+**graph 已开且已对齐**（2026-08-29 11:06）：同一 batch 宽度下 graph 与 eager **逐位相同**
+—— 8 条短提示 prefill、1000 个 decode token、2 条 3255/3252 token 长提示 + 200 decode token，
+`max|dlp|` 全部 `0.000e+00`。decode **33–35 token/s，对 eager 的 4.2–4.6 约 7.7×**。详见 P6.6b。
+
+**下一步的顺序**：**GSM8K**（现在才可行）→ 在 graph 下重做 P6 的性能排序 → P5 量化。
+⚠ 现有的性能条目全是 eager 时代量的，**排序会变**：host 开销类的（`TASK_QUEUE_ENABLE`、
+减少 aten dispatch）已经被图吃掉了，device 时间类的（AI_CPU 回退、int64 算术、标量瓶颈 kernel）
+才继续值钱。
 
 ⚠ 起服务**必须独占整机**：GLM BF16 只能 TP16（TP8 每卡要 74.9 GB，放不下），
 而 `bootstrap.py:339` 要求每卡空闲显存 ≥ 90%。**停服务后显存不是立刻回收的。**
@@ -373,7 +387,7 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
       （max|gate_up| = 2.17，limit 是 10），要验 clamp 必须放大输入
 - [ ] **P3.5 出口判据** —— 四模块逐层 golden 对齐
 
-### P4 · BF16 端到端 ☐ ← **当前战线，卡在机器不可独占**
+### P4 · BF16 端到端 ☐ ← **当前战线：eager 已判定通过，等开 graph**
 - [x] **P4.1 TP16 / 32K / 纯文本 / 关 NPU Graph 启动** —— ✅ **2026-08-29 09:20 跑通**
       - 权重 37.25 GB/die，`max_total_num_tokens=1195072`，可用 7.66 GB
         （比 fp8 索引缓存那版少 1.53 GB —— **bf16 索引缓存的实测代价**，此前只有推算）
@@ -390,8 +404,14 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
 - [ ] P4.2 **出口判据**：**GSM8K 97.50%**（GPU 分支 cookbook 口径：全 1319 题、stop rate 100%、4×GB300 TP4/EP4）
       - ⚠ **该数字是 thinking 打开测的**（`temperature=1.0, top_p=0.95, max_tokens=32768`，`sgl-eval run gsm8k --thinking`）
       - ⚠ cookbook 的速度数字带 `SGLANG_SIMULATE_ACC_LEN=3`，**只能当吞吐口径**
-- [ ] **迭代期用更快的信号**（不是最终判据）：`tools/logit_check.py` 的 teacher-forced logprob 对拍
-      （一次前向、无采样噪声、能定位）；以及 prefill-vs-decode 的 KL 一致性
+- [x] **P4.3 迭代期的快信号 —— 已建立**（不是最终判据）：`tools/logit_check.py` 的
+      teacher-forced logprob 对拍，**地板已实测**、判定已自动化（`--emit-floor` / `--floor`）。
+      eager **8/8 通过**，最差 0.91×。工具这轮补了四件事：
+      `--streaming`（fp32 参考唯一可行的做法，整模型 `from_pretrained` 要 1.2 TB）、
+      `--prompt-set long`（3256 token，唯一能让稀疏选择生效的一档）、
+      `--decode-tokens`（贪心续写，覆盖 prefill logprob 完全够不到的 decode 路径）、
+      `--floor`（判定必须显式传进来，不给默认阈值）
+  - [ ] prefill-vs-decode 的 KL 一致性 —— 还没做
 
 ### P5 · W8A8 compressed-tensors ☐
 - [ ] P5.1 recipe：weight per-channel + act per-token **dynamic**（静态会被 raise）
@@ -401,6 +421,29 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
 - ⚠ `INF_NAN_MODE_FORCE_DISABLE=1` **必须设**，否则 W8A8 溢出产生 NaN
 
 ### P6 · 性能 ☐（可与 P3–P5 并行）
+
+**图模式下的第一份基线（2026-08-29 11:2x，实测，TP16、`ignore_eos`、贪心）。**
+prefill 与 decode 是分开量的：先跑 `max_new_tokens=1` 拿 prefill 墙钟，再跑 129 相减 ——
+3256 token × 16 并发的 prefill 是 5.2 万 token，混在一个端到端数字里会把 decode 完全盖掉。
+
+| 上下文 | 并发 | prefill 墙钟 | decode ms/token | decode 合计 token/s |
+|---|---|---|---|---|
+| 13 token | 1 | 0.42 s | **27.5** | 36.4 |
+| 13 token | 4 | 2.04 s | 27.8 | 143.8 |
+| 13 token | 16 | 2.41 s | 35.6 | **449.0** |
+| 3256 token | 1 | 0.81 s | **28.6** | 34.9 |
+| 3256 token | 8 | 5.91 s | 38.2 | 209.3 |
+| 3256 token | 16 | 11.59 s | 73.1 | **219.0** |
+
+**对 eager 的 220–238 ms/token（4.2–4.6 token/s），bs=1 是约 8×。**
+prefill 约 4000–4500 token/s（3256 token 单请求 0.81 s；16 并发 5.2 万 token 11.6 s）。
+⚠ 相减法有噪声（长上下文 4 并发那格量出 20.9 ms/token，比 1 并发还快，是噪声不是真的）；
+⚠ 这台机器共用，别人起训练时的数字不可用。
+
+**长上下文的 decode 代价是真的**：13 token 上下文 16 并发是 35.6 ms/token，
+3256 token 上下文同样并发是 73.1 ms/token —— **翻倍**。这正是 P6.7/P6.10/P6.11
+那几条 kpool 开销该去的地方，而它们全是 device 时间类的，**图吃不掉**。
+
 排序按实测/静态估算的影响。**前三项都不是算子开发，算子已存在。**
 - [x] P6.1 **mHC** —— **收益已实测**。torch 的 pre 是 **155 次 aten 调用**，融合后 **8 次**；
       155 × 2 站点 × 45 层 = 13,950，和原先估的 ~12,600 次 launch 对得上。
@@ -439,17 +482,53 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
       **AI CPU 回落的算子可以捕获**（`aclnnIndex` 在图里正常跑）—— 这条原先被推断成阻塞项，现已证伪。
       `npu_lightning_indexer` 与 `npu_sparse_flash_attention` 在捕获下均可用（§2.6 的未决项之一，已关闭）。
 
-  - [ ] **P6.6 没覆盖的（全部还是未知，不要当成已验）**：
-        ① **整网捕获从没做过** —— 45 层一个图、11 个 DSA 层共享一个 pool、KDA 与 DSA 交替、
-        多个 bs 的图共用一个 memory pool。这里做的全是**单层单 die**，P4.1 整网启动本身还没跑过
-        ② **HCCL 本身已经不是阻塞了**（实测，die 14+15 两卡，`graph_capture/cap_hccl.py`）：
-        `dist.all_reduce` 捕获成功、replay 逐位正确，而且**只改对端的输入**时 replay 也跟着变
-        —— 说明集合通信是真的在重放，不是把结果烘死了。⚠ **只测了 2 卡**：TP16 的 16 卡、
-        每层一次、45 层叠加，仍未验
-        ③ `enable_torch_compile` + `npugraph_ex` 那条路（`patch_model_npu`）没碰
-        ④ MTP / spec decode 下的捕获（`kpool_decode_update_index_cache` 每请求一行的假设在那里不成立，
+- [x] **P6.6b 整网图模式 —— 已跑通并逐位对齐**（2026-08-29 11:06，实测，TP16 真机）。
+      原①②⑤三条已关闭：
+
+      | 问 | 结果 |
+      |---|---|
+      | 45 层整网能不能捕获 | ✅ 6 个 bs 桶 `[1,2,4,8,12,16]`，**15 秒捕完，图池 0.8 GB** |
+      | 16 卡 HCCL 在图里 | ✅ 45 层 × 每层一次全部在图内重放（原先只有 2 卡实测） |
+      | KV pool 是否受影响 | ✅ `max_total_num_tokens=1195072`，与 eager **一模一样** |
+      | replay 与 eager 数值 | ✅ **逐位相同**，见下 |
+
+      **对拍：在同一个 batch 宽度下，graph 与 eager 逐位相同（`max|dlp| = 0.000e+00`）**
+      —— 8 条短提示的 prefill、**1000 个 decode token**、
+      以及 **2 条 3255/3252 token 的长提示**（`> index_topk=2048`，稀疏选择真的走了）
+      加 200 个 decode token，无一例外。参考是开图前专门录的 eager 基线
+      （`$ROOT/goldens/logits/`）。
+
+      **decode 性能：约 33–35 token/s，eager 是 4.2–4.6 → 约 7.7×**（bs=1 单流，
+      稳态；紧跟 prefill 的第一个 decode batch 不算）。**GSM8K 因此变得可行了。**
+
+- [x] **P6.6c batch 宽度会挪动 decode 结果，但不是 padding 的锅**（实测）。
+      raw_bs 从 1 换到 3–16，同一条请求的 decode **不再逐位相同**：
+
+      | raw_bs | 桶 | padding 行 | 逐位相同 | max\|dlp\| | mean\|dlp\| |
+      |---|---|---|---|---|---|
+      | 1 | 1 | 0 | 1/1 | **0.000e+00** | **0.000e+00** |
+      | 3 | 4 | 1 | 2/3 | 1.174e-01 | 7.401e-03 |
+      | 5 | 8 | 3 | 2/5 | 1.060e-01 | 6.329e-03 |
+      | 7 | 8 | 1 | 5/7 | 2.826e-01 | 2.049e-02 |
+      | 8 | 8 | **0** | 4/8 | 3.879e-01 | 2.162e-02 |
+      | 13 | 16 | 3 | 7/13 | 4.792e-01 | 2.170e-02 |
+      | 16 | 16 | **0** | 9/16 | 3.163e-01 | 2.065e-02 |
+
+      **padding 行数和误差没有关系** —— `bs=8` 与 `bs=16` **一行 padding 都没有**，
+      误差却和有 3 行 padding 的 `bs=13` 一样大；只有 1 行 padding 的 `bs=3`
+      反而最小。变量是 **batch 宽度**，不是 padding。P6.6a 修的那条（padding 踩坏
+      KDA 状态）在整网上**站得住**。
+      **量级对得上独立测出来的形状地板**：CPU 上「同为 bf16、同样的数学、只改 GEMM 形状」
+      实测 mean|dlp| ≤ 2.6e-2（`REGRESSION.md`），这里是 2.1e-2。
+      **同源**：bf16 GEMM 不是 batch-shape 不变的，ulp 级扰动被 MoE 路由放大成离散翻转。
+      分叉处的续写**两边都是通顺且正确的文本**（人工看过中英各一条），不是状态被写坏。
+
+  - [ ] **P6.6 仍未覆盖**：
+        ① `enable_torch_compile` + `npugraph_ex` 那条路（`patch_model_npu`）没碰
+        ② MTP / spec decode 下的捕获（`kpool_decode_update_index_cache` 每请求一行的假设在那里不成立，
         见 P3.4）；DeepEP-normal 的 MoE（部署配方是 `--moe-a2a-backend none`，走的是已验的 TP dispatcher）
-        ⑤ 耗时**一个都没测** —— 机器上有别人的训练任务，这轮只判功能
+        ③ **prefill 图没开**（`--disable-prefill-cuda-graph`）—— extend 侧的 host 同步还在
+        ④ overlap scheduler 仍然关着；开了之后 `seq_lens_cpu` 领先设备张量一步的场景没验
 
 - [x] **P6.6a padding batch 踩坏 KDA 状态 —— 已修**（`ascend_kda_backend.py` 的 `_causal_conv1d_decode`）。
       图宽度固定，raw_bs 小于捕获 bs 时 runner 补齐尾部行并传 `num_padding`
