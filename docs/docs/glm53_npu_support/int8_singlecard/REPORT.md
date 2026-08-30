@@ -1305,6 +1305,49 @@ PLAN P6.6c 当初记的是「batch 宽度会挪动 decode 结果，**但不是 p
 本轮的反例是 §6.7 的 `mean|dlp| = 1.01× 地板` —— 那就是「端到端判据没有分辨率时硬用它」，
 结论只能是「判不出来」。而这里下沉之后拿到的是确定性的通过 + 有牙的负对照。
 
+### 7b.17 `tensor.is_cuda` 在这台机器上是 `True`，所以「CUDA 专用快路径」可能正在你的 profile 里跑
+
+⚠ **这条会直接作废性能归因**，所以列在测量的坑里而不是 bug 里 [实测，本机复现]。
+
+`hardware_backend/npu/utils.py:152` 导入 `torch_npu.contrib.transfer_to_npu` 之后：
+
+| 判据 | NPU 上 | |
+|---|---|---|
+| `tensor.is_cuda` | **`True`** | ❌ 撒谎，**连 import 之前建的张量也变** |
+| `tensor.device.type` | `'npu'` | ✅ |
+| `sglang.is_cuda()` | `False` | ✅ |
+| `torch.cuda.is_available()` | `False` | ✅ **但只是因为 `utils.py:155` 手工补了回来** |
+
+**最后一行才是这条的形状。** 那行补丁的注释原文是
+`# Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True` ——
+**别名早就被知道、写在注释里了，补的是撞上的那一个实例，没人问「同一个 import 还改了什么」。**
+（多卡那条线因此被打死过服务：一个客户端传的合法 `top_logprobs_num` 让 NPU 滑进 CUDA 专用的
+融合 Triton kernel，`bishengir-compile` SIGSEGV，八个 rank 全死。已修，`9b4f8bbfa7`。）
+
+#### 本线扫了一遍，结论是「没被污染，但有条件」
+
+- **我改过的七个文件里 `.is_cuda` 出现 0 次。**
+- MoE / KDA / DSA / quantization 调用链上有 **4 处**，**在本构型下全部不可达**：
+
+| 位置 | 为什么本构型走不到 |
+|---|---|
+| `kpool_fp8_index.py:607` | 只被 `dsa_indexer_kpool.py`（CUDA 版 indexer）调用；NPU 走 `kpool_indexer_npu.py` 自己的那份 |
+| `expert_pack.py:36`（`_clamped_swiglu`） | 只被 ExpertPack / GGUF 加载器调用；本构型是 compressed-tensors |
+| `unquant.py:273 / :310` | `get_bf16_gemm_backend().is_cutedsl()` 排在 `x.is_cuda` **前面**，短路 |
+
+⚠ **「不可达」是本构型的性质，不是代码的性质。** 换量化格式、换 indexer，这三处立刻变成活的。
+⚠ 顺带：`expert_pack.py:36` 那处如果活了，NPU 会滑进 CUDA 的 `silu_and_mul_clamp` ——
+**正是 §7.2 / §7.7 折腾了两轮的那个 clamp+swiglu**。
+
+#### 一般化
+
+**一个「打死进程」的实例是运气好的那种**：它自己暴露了。`srt/` 下还有约 88 处张量级
+`.is_cuda`，**其余更可能是「安静地选错路径」** —— 而这正是本节反复在抓的形态。
+
+**新代码不要用 `tensor.is_cuda` 判平台**，用 `device.type` 或 `sglang.is_cuda()`。
+**做性能归因之前先扫一遍你量的那条路**：如果某个「CUDA 专用」分支其实在跑，
+你量到的 kernel 组成和你以为的不是一回事。
+
 ## 8. 还没做的，以及两条**没验证**的
 
 ### 8.1 ⚠ 两条改动的一部分路径本部署验证不了
