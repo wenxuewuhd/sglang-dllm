@@ -1048,6 +1048,23 @@ DSA 每步 170 次 aten dispatch，MoE 只要 25 次。
       四种形状**输出全部逐位相同** —— 这同时证明了 **triton-ascend 遵守「被屏蔽的通道不访问内存」
       这个契约**，而那正是去掉 clamp 的前提。收益随行数增长、小行数归零，符合「每 program 的
       寻址开销」这个解释。
+      **这个模式在别处扫过一遍了**（`glm53_int8_1card` 按同样的判据查了自己的热路径，
+      结论是**否定的**，值得记下来免得有人重扫）：
+      - 它那 25 个小向量算子**根本不是 Triton** —— 是 `torch_causal_conv1d_update_npu`
+        拼出来的 aten 算子（`Slice+Mul+ReduceSum+ConcatD`）。同样是「时间不在字节里」，
+        但**病因不同**：这条是**寻址退化**（改一行表达式），那条是**算子个数**（要换算子）
+      - 全包 80 处 `tl.minimum/maximum` 里绝大多数是 softmax 累加器
+        （`new_e_max = tl.maximum(...)`），**不是地址表达式**
+      - 唯二同形状的两处在 `flash_block_score_decode.py:911/919-920`，
+        但 **GLM 走不到**（我们的 NPU/DSA 代码一处都不 import，GLM 用厂商的
+        `npu_lightning_indexer`）。⚠ **而且它在 wheel 里不在本仓库**
+        （`sgl_kernel_npu/indexer/`）—— 即使哪天可达，也不能在树内改，得打补丁或走上游
+
+      **这条修复的价值两边差 32 倍，而且是量化过的**：prefill 侧（8192 行）值 **32.6×**；
+      而在对方 bs=1 decode 的 profile 里，这个 kernel 是 **50.1 µs/step、11 次、4.6 µs/次** ——
+      **已经贴在启动开销上，可省的是 0**。与本表 `rows=16 → 1.0×` 是同一件事的两个独立观测。
+      **「同一个优化在两边价值差很远」这次有了数。**
+
       ⚠ **在共享代码里**（`kpool_fp8_index.py`），CUDA 路径同样走这个 kernel。
       掩码 load 的契约在 CUDA 上同样成立，且 clamp 本就来自上游原始提交
       （`0b9c38484e`，CUDA 上开发）而非为昇腾加的防御 —— 但**本线没有 CUDA 机器可验**。
