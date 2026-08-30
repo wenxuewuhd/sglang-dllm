@@ -54,7 +54,8 @@
 
 ## 1. 一句话
 
-**单卡 bs=1 decode = 42.8 ms/token，权重带宽 roofline 是 17.94 ms，即 2.39× [实测]。**
+**单卡 bs=1 decode 起始 42.8 ms/token，权重带宽 roofline 是 17.94 ms，即 2.39× [实测]。
+三条逐位不变的优化之后是 37.6 ms（−12.0%），见 §6。**
 时间的 39% 在 KDA、28% 在 MoE，而 **MoE 读专家权重的那两个 `GroupedMatmul` 已经贴在
 带宽地板上（1.03×）** —— 注意这 1.03× 只属于那两个 kernel，不是整个 MoE 家族（家族是 1.56×，
 差额几乎全是路由簿记，见 §2）。
@@ -313,197 +314,323 @@ ConcatD  KDA              34    297.3  0.7% 77.5%      8.7       0.8       0.6  
 
 ## 6. 做了哪些优化，各自实测收益
 
-基线链条（一次只动一个变量）：
+**三条落地，全部逐位不变。** 基线链条一次只动一个变量；每一步都有 profiler 的 device 时间和
+墙钟两个独立仪器，**每一步都吻合** —— 这不是巧合，§1 说过这条链路 100% device-bound。
 
-| 构型 | device ms/step [profiler] | 墙钟 ms/token [bench] | 相对基线 |
-|---|---|---|---|
-| **A** e16，仓库原样 | **42.823** | **42.8** | — |
-| **B** = A + §6.1 零 rope 修复 | **39.741** | **39.8** | **−7.2%** |
-| **C** = A + §6.2 KDA 量化 | **37.653** | **37.7** | **−12.1%** |
-| **D** = B + C | — | **35.8** | **−16.4%** |
+| 构型 | device ms/step | 墙钟 ms/token | kernel/step | 相对上一行 |
+|---|---|---|---|---|
+| **A** 仓库原样（e16） | 42.823 | 42.8 | 3578 | — |
+| **B** = A + §6.1 零 rope 不再每层物化 | 39.741 | 39.8 | 3556 | −7.2% |
+| **C** = B + §6.2 KDA conv state fp32 + padding clamp | 38.727 | 38.6 | 3352 | −2.5% |
+| **D** = C + §6.3 MoE 两个循环不变量 | **37.679** | **37.6** | **3220** | −2.7% |
+| | **−12.0%** | **−12.1%** | **−358** | |
 
-bs=16 同样的链条：A 75.4 → B 72.9 → C 65.5 → **D 65.1 ms/token**。
+bs=16 同链条：75.4 → 72.9 → 71.4 → **70.3 ms/token**。
 
-**推荐落地的是 B**（只有 §6.1 那一处修复）。§6.2 的 KDA 量化**测了但不采纳**，理由见 §6.2。
+**精度**：§6.1 与 §6.3 端到端逐 token 相同（3 条提示 × 64 token，3/3）；
+§6.2 由 `check_kda` 判定 **18/18 张量逐位相同**（float64 `==`）。**没有一条动了数值。**
 
-两个仪器（profiler device 时间、墙钟）**逐点吻合**，这不是巧合 —— §1 说过这条链路 100% device-bound。
+### 6.1 修掉 NoPE 零 rope 被静默物化 [−3.08 ms/step，−7.2%]
 
-### 6.1 修掉 NoPE 零 rope 被静默物化 [实测，−3.08 ms/step = −7.2%]
+`ascend_backend.py` 的 `_nope_zero_rope`：GLM 是 NoPE 模型，但
+`npu_sparse_flash_attention` 拒绝缺省的 rope、零宽度的 rope 和除 64 外的一切宽度，
+所以那里喂一个全零 rope。原实现用 **stride-0 的 `expand`** 想省掉那份缓存，
+并在 docstring 里写了 ⚠：「算子文档说不支持非连续输入，所以这个 aliasing 是观察到的行为」。
 
-`hardware_backend/npu/attention/ascend_backend.py` 的 `_nope_zero_rope`：
-GLM 是 NoPE 模型（`qk_rope_head_dim=0`），但 `npu_sparse_flash_attention` 拒绝缺失的 rope、
-零宽度的 rope 和除 64 以外的一切宽度，所以那里喂了一个全零 rope。
-为了不真的分配一份「装满零的第二套 paged cache」，原实现用了 **stride-0 的 `expand`**，
-并且在 docstring 里写了一条 ⚠：「算子文档说不支持非连续输入，所以这个 aliasing 是
-观察到的行为，不是承诺的行为」。
+**那条 ⚠ 兑现了，但不是以算错的方式，而是以静默变慢的方式。** torch_npu 调 aclnn 前把输入
+变连续，于是这个 expand **每次调用都被真的物化**：`[1,64,1,64] → [19403,64,1,64]`，
+`aiv_mte3_ratio = 0.945`（纯 store），每个 DSA 层每步写 **159 MiB 的零**。
 
-**那条 ⚠ 兑现了，但不是以算错的方式，而是以静默变慢的方式。**
-torch_npu 在调 aclnn 之前把输入变连续，于是这个 expand **每次调用都被真的物化**：
+**最值钱的性质：它是 O(KV pool)。** pool 从 124 万开到 152 万 token，这一项 0.70 → **1.34 ms/step**；
+bs=1 和 bs=16 几乎一样贵，**大 batch 摊不掉**。
 
-- `BroadcastTo`，in `[1,64,1,64]` bf16（16 KiB）→ out `[19403,64,1,64]`（**159 MiB**），
-  `aiv_mte3_ratio = 0.945`（纯 store，不算不搬别的）
-- 每个 DSA 层每步一次 × 11 层 = **每 token 写 1.75 GiB 的零**
-- 直接成本 **0.80 ms/step**（k 侧 701 µs + q 侧 96 µs）
+**收益是它自己那 0.80 ms 的 3.9 倍**，差额的机制 **[推断]** 是 L2 冲刷（151.6 MiB 对 L2 的 168 MB），
+证据是**分布形状而不是均值**：相邻 KDA qkv matmul 的中位数只降 2.4%（182.1 → 177.8 µs），
+每步总和却降 23%（7823 → 6022 µs）—— 长尾消失了。
 
-**最值钱的性质：它是 O(KV pool)，不是 O(batch) 也不是 O(seq_len)。**
-把 KV pool 从 124 万 token 开到 152 万 token，这一项就从 0.70 → **1.34 ms/step [实测]**。
-bs=1 和 bs=16 几乎一样贵（0.70 → 1.03 ms），**大 batch 摊不掉**。
+**判据（给别的配置复核用）**：profile 里 `BroadcastTo` 的
+`"1,64,1,64" → "<pages>,64,1,64"` 这一组应当完全消失。
 
-**改法**：不 expand，把全零张量按 `(device, dtype, 完整 shape)` 缓存一次，所有 DSA 层共用
-（`_zero_rope()`）。数值恒等 —— 零就是零。代价是一次性 159 MiB HBM（随 pool 大小缩放）。
+### 6.2 让 KDA conv 的 decode 快路径变得可达 [−1.01 ms/step，−2.5%]
 
-**实测收益 −3.08 ms/step，是它自己那 0.80 ms 的 3.9 倍。**
-差额的机制 **[推断]**：那 159 MiB 几乎正好是 L2 的大小（**168 MB**），
-每个 DSA 层把它写一遍就把 L2 冲干净了，殃及相邻的带宽受限 kernel。
-支持这个推断的是**分布形状而不是均值**：KDA qkv matmul 的**中位数只降了 2.4%（182.1→177.8 µs），
-但每步总和降了 23%（7823→6022 µs）** —— 修复前有一条长尾（均值 230 µs 远高于中位 182），
-修复后均值与中位数重合。34 个 KDA 层与 11 个 DSA 层交错，挨着 DSA 的那些 KDA 层在付这个钱。
+`_causal_conv1d_decode` 有一条快路径和一条 dtype 不匹配时的绕行。GLM 的 conv **权重**是 fp32
+（`glm5_next.py` 的 `params_dtype`），而 conv **state** 默认 bf16，**于是快路径永远走不到**，
+每步都走 gather → cast → conv → cast → scatter。`SGLANG_MAMBA_CONV_DTYPE=float32` 让两者一致。
 
-**判据（给 TP16 复核用）**：profile 里 `BroadcastTo` 的
-`"1,64,1,64" → "<pages>,64,1,64"` 这一组**应该完全消失**。
+被删掉的 kernel 在 profile 里一一对得上（这是它不是噪声的证据）：
+`GatherV3 34→0`、`Cast 68→0`、`ScatterUpdate 34→0`、`Range 100→66`、`ClipByValueV2 68→34`，
+**每个 KDA 层 7 个**。代价：conv state 显存 0.08 → 0.16 GB。
 
-### 6.2 把 KDA 投影量化成 INT8 —— 测了 −12.1%，**决定不采纳**
+⚠ **「fp32 state 数值更好」这个直觉是错的，实测证伪。** conv 窗口存的是 bf16 投影输出的
+**拷贝而不是计算结果**，所以 bf16 往返本来就是无损的 —— 实测 `max|t − bf16(t)| == 0.0`。
+**这条改动的理由只能是 kernel 数，不能是精度。**
 
-⚠ **这是性能探针，不是可交付的量化，而且已决定本轮不做**（决定经 glm53_graph_perf
-session 转达，与我在 §3 提的顾虑一致；建议由本报告读者向用户复核一次）。
-没有校准、没有验精度。它回答的只是「把那 8.93 GiB 砍半值多少时间」，得到的是一个**上界**。
+⚠ **走快路径必须补一个 clamp，否则是静默的正确性 bug。** 快路径原样传 `cache_indices`，
+而 padding 行是 `-1`；`causal_conv1d_update_npu` 虽然有 `pad_slot_id` 参数，
+**但在我们走的那条腿上根本不看它**（`cache_seqlens` 与 `num_accepted_tokens` 都是 None 时
+它落到裸的高级索引，而 `torch_causal_conv1d_update_npu` 连这个参数都没有）。
+于是 `-1` 被当作负下标**绕到最后一个 mamba 槽**，而分配器保留的是**槽 0**。
+结果是把一个活着的请求的 conv state 静默写坏 —— continuous batching 下可达，但不可按需复现。
 
-**为什么不采纳 —— 主要不是收益问题，是「测不出它坏」**：
-KDA 是线性注意力的递归路径，权重误差会沿 SSM 状态**随序列累积**，
-而不像标准注意力每步从 KV 重新读。厂商同时排除了 `A_log` / `dt_bias` / `conv1d`
-——正是 HF 用 `_keep_in_fp32_modules_strict` 强制留 fp32 的那批递归参数。
-⚠ **投影本身没有那个约束，所以这是怀疑，不是解释。**
-但正因为是怀疑，代价不对称：**如果它成立，症状是长序列上的缓慢漂移，
-而 GSM8K 那种几百 token 的题目看不见** —— 一条「基准全过」的坏优化比一条明显坏的更危险。
+### 6.3 停止每步重建两个循环不变量 [−1.05 ms/step，−2.7%]
 
-真要做的正确顺序（留给以后）：量化出权重 → GSM8K 每侧 2 轮（BF16 基线已有）
-→ **再加一个长上下文判据**，否则测不到那个失效模式。
+两个 kernel，存在的唯一目的是撤销上一行刚做过的事。
 
-做法：`tools/quantize_kda_int8.py` 对 34 个 KDA 层的 `q/k/v/o_proj` 做
-对称 per-output-channel min-max int8（就是这份 checkpoint 对其他所有 Linear 已经声明的方案），
-并把它们从 `quantization_config.ignore` 里删掉。checkpoint 8.50 → 4.25 GiB，权重 31.50 → 28.03 GB。
+**shared expert 的 clamp 折叠**：非对称 swiglu clamp 原本是「切两半 → 各自 clamp → 拼回去」，
+而 `[rows, 2I]` 的两半是**跨步视图**，等于两趟跨步遍历加一次拷贝。仓库里已经有
+`apply_swiglu_limit_`，它把不对称性折进广播界向量、对连续缓冲区一次 clamp
+（docstring 记着 186 → 589 GB/s、逐位相同），而且它的 `lru_cache` key 和 routed 路径撞得上，
+**零额外显存**。
 
-| kernel | 前 | 后 | roofline |
-|---|---|---|---|
-| KDA qkv `[24576,4096]` | 7823 µs/step（bf16，192 MiB） | **2717 µs/step**（int8，96 MiB） | 76.8 µs，实测中位 79.7 → **1.04×** |
-| KDA o_proj `[4096,8192]` | 2027 µs/step | **1192 µs/step** | 25.6 µs，实测中位 34.3 → 1.34× |
+```
+ConcatD [1,2048]×2   42 → 0    −508.4 µs
+ClipByValueV2 标量界  84 → 0    −275.1 µs
+ClipByValueV2 向量界   0 → 42   +113.3 µs
+                              ───────── −670 µs, −84 kernel
+顺带白捡 dense FFN 3 层（走同一段代码）  −72 µs, −9 kernel
+```
 
-**整步 42.823 → 37.653 ms（−12.1%），墙钟 42.8 → 37.7 独立吻合。**
-叠加 §6.1 之后墙钟 **35.8 ms/token（对 A −16.4%）**。
+⚠ 那个 `ConcatD` **从来不是带宽问题**：实测每次 **13.5 µs 搬 8 KB**，起了 **37 个向量核**
+而 `aiv_vec_time` 只有 **0.02 µs**。纯块启动开销。**在图模式下，「起了几个核」比「搬了多少字节」
+更能解释小算子的耗时** —— 这是本轮反复出现的形状。
 
-**这两个数的用途是给「量化 KDA」这件事标价，不是给它背书。**
+**router gate 权重的 cast 提到 load 期**：非 CUDA 分支刻意用 fp32 算 logits（bf16 路由会
+整个丢掉专家而不只是掉精度），但它把**权重**的 cast 放在了 forward 里，于是一个循环不变量
+每层每步转一次。改成按参数的 storage 指针 + version 缓存，权重更新 / LoRA / EPLB 重排会
+自动失效。`Cast [16,4096] 42 → 0，−249.3 µs`。288 专家下这个 cast 是每层 7 MB 而不是 128 KB，
+**只会更省**（代价是常驻 +99 MB）。
+
+⚠ **一条没解释掉的**：hoist 之后 gate matmul 自己慢了 **+75.7 µs**（同样 42 次、同形状、同 dtype），
+吃掉这条三分之一的收益。可能是局部性，也可能是噪声。**如实记下，没有替它编解释。**
 
 ---
 
-## 7. 试过但没用的，以及踩到的坑
+## 7. 试过、测了、不落地的
 
-**和成功的一样有价值。**
+**和成功的一样写在这里，而且都写在了会被再次尝试的那个源码位置**，因为它们从源码看都"显然对"。
 
-### 7.1 只把 `q/k/v_proj` 从 `ignore` 里删掉 —— 不生效，而且看起来生效了
+### 7.1 量化 KDA 投影 —— 测到 −12.1%，**决定不采纳**
 
-第一次尝试 §6.2 时，**o_proj 量化了，qkv 没有**，整层还是 bf16，墙钟看不出来。
-机制 **[读源码 + 实测复现]**：sglang 把三个 KDA 投影建成一个融合的 `qkv_proj`，
-而 `should_ignore_layer()` 只在 `proj_name in fused_mapping **and layer_name not in ignore**`
-时才把融合名展开回 q/k/v 逐个检查。厂商的 `ignore` 列表里**直接写了融合模块名
-`model.layers.{L}.self_attn.qkv_proj`**，前置条件不成立 → 不展开 → 精确匹配命中 → 整层被忽略。
+⚠ 性能探针，非可交付。**决定经 glm53_graph_perf session 转达**（与我在 §3 的顾虑一致；
+建议读者向用户复核一次）。KDA qkv 融合投影 7823 → **2717 µs/step**
+（96 MiB int8，实测中位 79.7 µs 对地板 76.8，**1.04×**），o_proj 2027 → 1192，
+整步 42.823 → 37.653 ms。
 
-**必须连融合名一起删。** 症状识别：profile 里那一项还是 `MatMulV2` + `DT_BF16;DT_BF16`。
-接手的人一定会再踩一次。
+**不采纳的理由主要不是收益，是「测不出它坏」**：KDA 是线性注意力的递归路径，权重误差会沿
+SSM 状态**随序列累积**；厂商同时排除了 `A_log` / `dt_bias` / `conv1d` —— 正是 HF 强制留 fp32
+的那批递归参数。⚠ **投影本身没有那个约束，所以这是怀疑不是解释。** 但代价不对称：
+**如果成立，症状是长序列上的缓慢漂移，而 GSM8K 那种几百 token 看不见。**
 
-### 7.2 「KDA 量化带来 1.39×」—— 我自己报错过一次，是冷启动伪像
+✅ **后续**：为了 §8 的 conv 池翻面，单独验了 conv **权重** fp32→bf16（不是投影）：
+5 个用例 × 3 层，**30/30 张量在预算内，最差 0.33×（预算 1.00×）**，
+而且 `state.ssm.final` 跨 256 → 4096 → 32768 是 3.722e-3 → 3.546e-3 → **3.516e-3**，
+**平到略降，不累积**。所以「KDA 沾 bf16 就危险」这个笼统说法**不成立**，
+危险的是**投影**（大矩阵、误差进入递归），不是 **conv 权重**（4 抽头、窗口是拷贝）。
 
-一度量到 bs=1 从 42.8 → 30.7 ms/token。**是假的。**
-`bench_graph_decode.py` 用「先跑 `max_new_tokens=1` 拿 prefill 墙钟，再跑 129 相减」的办法
-分离 decode。冷服务的第一发 prefill 花了 **1.88 s** 而不是 0.39 s，
-这 1.5 s **全部落在被减去的那一项里**，把 decode 显得快了 28%。
+### 7.2 `custom::npu_dequant_swiglu_clamp_quant` —— **它根本不 clamp**
 
-**这个相减法对冷启动是单向敏感的 —— 只会让结果偏乐观。**
-修法：先发一次丢弃的 warmup 请求（已加进 `run/ab_tp1.sh`；
-glm53_graph_perf 也已把 warmup 提交进共享的 `bench_graph_decode.py`，commit `44e2c3f4cb`）。
-加 warmup 后真实数是 42.8 → 37.7（1.14×），**与 profiler 的 device 时间逐点吻合**。
+目标是省掉 routed 路径的预 clamp（278.9 µs/step）。仓库 docstring 明确写着
+「mode 1 下精确复现参考实现，所以 int8 路径可以去掉预 clamp 直接调它」。**那句话是错的。**
 
-**教训**：任何「A/B 只测了一次、而且 A 和 B 的服务新旧程度不同」的加速，先怀疑它。
+实测（A3，`[8,4096]` 与 `[128,4096]` bf16，输入放大 48× 让 limit 真正咬到）：
 
-### 7.3 `npu-smi` 的空闲检查写法：一个字符决定它挡不挡得住
+| 和哪种语义比 | max\|Δint8\| | 不同元素 |
+|---|---|---|
+| 参考（gate max=L, up ±L） | 126 | 8772/16384 |
+| 两半都 ±L | 126 | 8772 |
+| 只 clamp gate / 只 clamp up / gate±L,up max=L | 112–119 | 7760–8024 |
+| **完全不 clamp** | **0** | **0/16384** |
 
-`npu-smi info` 把「已用 MiB」字段按固定宽度对齐，所以空闲 die 打印
-`2880 / 65536`，而**忙的 die 打印 `33861/ 65536`，斜杠前没有空格**。
+`swiglu_mode` 取 **0/1/2/3 结果完全一样** —— `clamp_limit` 和 `swiglu_mode` 都被静默忽略。
 
-于是 `grep -oP '\d+(?= / 65536)'` 会**恰好漏掉所有忙的 die**，
-返回 15 个数而不是 16 个，列表整体前移一位，检查读到的是**另一块 die 的空闲数字**并放行 —— 
-直接撞进加载权重时的 OOM。**[实测：一块 die 在 33861 MiB 时，严格写法返回 15 个数，
-带 `\s*` 的写法返回 16 个]**
+**照那句 docstring 做，会静默删掉每个 routed 专家的 swiglu clamp**，而 clamp 是模型定义的
+一部分（`KT_DISABLE_SWIGLU_CLAMP` 存在就是为了让"关掉它"是显式的）。
 
-交接文档里的一行式是对的（用了 `\s*`）；我自己的脚本第一版写错了，已修，
-并在 `run/ab_tp1.sh` 里把原因写在注释里。
+⚠ **它为什么骗得过随手一验**：真实激活 `max|gate_up| ≈ 2.17` 对 limit 10，**clamp 从不触发**，
+不放大输入两者就是逐位相同。**任何以后验这个算子的人必须强制让 clamp 触发**
+（`check_dense_ffn.py --scale-input 48` 就是干这个的）。已改正 docstring。
 
-### 7.4 `TASK_QUEUE_ENABLE=2` —— 在图模式下根本起不来 [实测，P6.9 就此关闭]
+### 7.3 把 `routed_scaling_factor` 折进 topk —— 生效了，但收益低于噪声
 
-PLAN P6.9 记的是 eager 时代实测的 **DSA decode 1.74×，零代码改动**，
-并注明「图模式下可能已被吃掉，要重测」。重测结果比「被吃掉」更干脆：**服务起不来。**
+`npu_moe_gating_top_k` 本来就收这个参数。**我怀疑的失败模式（缩放被 renorm 吃掉）实测不成立** ——
+它在归一化**之后**乘（返回权重比值精确 2.5、专家集合不变，renorm 开关两种都验了）。
+机制也确实生效：**`Muls [1,4096]` 42 → 0，−73.2 µs，−42 kernel**，和预测一致。
+
+**但整步 device 时间只动了 −0.003 ms** —— 那 73 µs 完全在轮间噪声里。
+而输出**不再逐位相同**（3 条提示里 2 条从 token 0–1 分叉，这是次 ulp 的重结合被 MoE 路由
+翻转放大的典型形状）。**证明它落在精度地板内是一项真正的研究，0.19% 付不起这个价。回退。**
+
+⚠ 姊妹项（shared 加法折进 `npu_moe_finalize_routing` 的 `skip1`，96 µs）**没做**：
+要把 `shared_output` 穿过 dispatcher，且 `_shared_expert_tp1` 下加法必须在 all-reduce
+**之后**，`skip1` 在那里是错的。
+
+### 7.4 `TASK_QUEUE_ENABLE=2` —— 图模式下根本起不来 [P6.9 就此关闭]
 
 ```
 RuntimeError: Do not support TASK_QUEUE_ENABLE = 2 during NPU graph capture,
               please export TASK_QUEUE_ENABLE=1/0.
-[ERROR] ERR00007 PTA feature not supported
 ```
+抛在 `torch_npu/npu/graphs.py:625` 的 `capture_begin()`，第一个 bs 桶刚开始捕获时。
+**torch_npu 的硬约束，响亮地失败，不会静默降级。** 与 §1 一致：device 时间已等于墙钟，
+host 侧本来就没有气泡。
 
-抛在 `torch_npu/npu/graphs.py:625` 的 `capture_begin()`，
-即第一个 bs 桶的捕获刚开始时（`decode_cuda_graph_runner.py` → `npu_cudagraph_backend.capture_one`）。
-**这是 torch_npu 的硬约束，不是调参能绕的**，而且它**响亮地失败**，不会静默降级。
+### 7.5 调低 sinkhorn 迭代数 —— 有效，但只值 0.7%
 
-→ **图模式下 TQE 只能是 1 或 0，P6.9 在图模式下不存在。**
-这与 §1 的观察一致：device 时间已经等于墙钟，host 侧本来就没有气泡可挤。
+`hc_sinkhorn_iters` 20 → 1 **确实生效**（`HcPre` 中位 30.34 → 26.42 µs），整步
+39.741 → 39.445 ms。**19 次迭代总共只值 347 µs/step。**
+→ `HcPre` 那 2.4 ms **不是 sinkhorn**，是算子在 M=1 下的固定开销（26 µs 搬 1.5 MiB = 地板的 20 倍）。
+**这个旋钮改数值、不改性能，别动。**
 
-### 7.5 调低 sinkhorn 迭代数 —— 有效，但不值得（0.7%）[实测]
+### 7.6 AOT `torch.ops.npu.causal_conv1d_update` —— 存在、可调、**又错又慢**
 
-`hc_sinkhorn_iters` 20 → 1（改 config，其余不变）。**知识点是它确实生效了**，
-不是「改了没反应」：`HcPre` 中位 30.34 → 26.42 µs、每步 2741 → 2394 µs。
+- **按它自己 assert 字符串写的 layout 算出来是错的，不报错。** 脉冲响应（weight 第 k 抽头设 `10^k`，
+  输出数字直接读回抽头编号）显示它把 4 抽头窗口读成 `[S1, S2, S2, x]` —— **只有两个不同的
+  历史值**。真实约定是 `[cache_len, WIDTH, dim]`（**width 行，不是 width−1**）+ 调用方每次
+  `torch.roll(+1)`，**未文档化**。
+- **比它本该替换的 torch 回退慢 2.5×**（b=1：689 vs 270 µs），约 0.3 GB/s。
 
-但整步只从 39.741 → **39.445 ms（−0.7%）**，墙钟 39.8 → 39.3。
-**19 次迭代总共只值 347 µs/step**，摊到 90 个站点是每站点每次迭代 0.04 µs。
-
-→ **decode 下 sinkhorn 几乎免费**（与 PLAN P6.1 eager 时代的「decode 下占 0%」一致，
-现在在图模式下也成立）。`HcPre` 那 2.4 ms **不是 sinkhorn**，是 mHC pre 本身的固定开销：
-M=1 时 26 µs 搬 1.5 MiB，是带宽地板的 20 倍，纯固定成本主导。
-**这个旋钮改数值、不改性能，不要动它。**
-
-### 7.6 编辑正在运行的 shell 脚本
-
-bash 按字节偏移增量读脚本文件。在 `ab_tp1.sh` 跑着的时候给它打补丁，
-它接着从新文件的旧偏移读下去，把一行注释当命令执行了（`Measured: No such file or directory`），
-一次 A/B 白跑。**别改正在跑的脚本。**
+**该用的是另一个**：见 §8。
 
 ---
 
-## 8. 剩下最值钱的（按实测大小排，都还没做）
+## 7b. 测量与工具的坑 —— 每一条都让一次测量作废过
 
-构型 B 之后，42.8 → 39.8 ms/step。剩下的大头：
+**这些不是花絮。** 本轮七条结论里有三条是先被一个错误测量指到反方向、再被纠回来的。
 
-1. **KDA 的簿记开销 ≈ 4.2 ms/step（10%）[实测，按差额]**。
-   KDA 16.82 ms 里，两个大 matmul 占 9.85、delta-rule kernel 1.13、四个小投影 1.69，
-   **剩下 4.16 ms 是 Slice / ReduceSum / IndexPut / Cast / Index / ConcatD / BroadcastTo /
-   Mul / ScatterUpdate / GatherV3 / Swish 这一堆小向量算子**，
-   **每个 KDA 层 25 个 kernel**。其中 `"1,24576,3"` 那四组 bf16↔fp32 转换共 660 µs/step，
-   来自 KDA 的 fp32 工作集绕行（PLAN 记的 conv 权重 fp32 / cache bf16 那条）。
-2. **DSA 的簿记开销 ≈ 5 ms/step（12%）[实测]**。
-   `SparseFlashAttention` 本身只要 29.8 µs/层、`LightningIndexer` 17.1 µs/层，
-   而整个 DSA 族 6.69 ms、**每层 92 个 kernel**。
-   与 BF16 时代的诊断同源：**「DSA 慢不是因为注意力慢，是因为注意力周围的簿记」**，
-   在 INT8 单卡图模式下**依然成立**。P6.7 / P6.10 / P6.11 那几条仍然值钱。
-3. **`Cast` 合计 1.47 ms/step（3.4%）**，一步 568 次，纯 dtype 转换。
-3b. **MoE 的路由簿记 3.16 ms/step（7.4%）**，每层 14 个 kernel，地板是 0 —— 见 §2 的对账表。
-4. **shared expert 的两个量化 matmul 是 launch 受限的**：
-   `"1,2048;128,128,…"` 搬 8 MiB 却用 16.1 µs，是地板的 2.4×（<16 MB 的 kernel 由固定开销主导）。
-   42 层 × 2 个 = 1.64 ms/step，地板只要 0.85（1.93×）。
-5. **mHC 的 `HcPre` 2.4 ms/step**：M=1 时 26 µs 搬 1.5 MiB，是地板的 20 倍，
-   **且 §7.5 已证明这不是 sinkhorn**，是算子本身的固定开销。
+### 7b.1 检查工具静默地测不了它被叫来测的东西（同一个文件，两处）
 
-**不值得再看的**：MoE 的 `GroupedMatmul`（1.00× 地板）、`lm_head`（0.96×）、
-KDA 的两个大 matmul（1.13× / 1.15×）—— 这四项合计占一步的 39%，**已经贴在带宽线上**。
+`check_kda.py` 在 `cache_params` 里硬编码 `dtype=Mamba2StateDType(conv=torch.bfloat16, ...)`，
+**对 `SGLANG_MAMBA_CONV_DTYPE` 完全免疫** —— 而那正是决定 §6.2 走哪条分支的唯一旋钮。
+它还在 `:127` 硬编码 `f32(...)` 的 conv 权重，**于是也验不了 §8 的 fp32→bf16**。
 
-⚠ 归属表里有 **4.0% 的「未归类」**（511 个每步调用次数不落在任何层族倍数上的小 kernel）。
-上面的排序对这部分是保守的。
+**一个 checking tool 里硬编码一个 dtype 是 bug，两个是 pattern。** 两处都是靠先问
+**「这个 harness 真的在跑我要改的那件事吗」** 发现的，不是靠看绿灯。
+现在两处都走生产的解析方式 / 由 CLI 控制。
+
+**判据**：改一个旋钮之前，先证明 harness 会因为它而走到不同的代码 —— 用调用计数，不用假设。
+（本轮的做法：在 `_causal_conv1d_decode` 上挂计数器，确认 128/128 次调用从绕行分支翻到快路径。）
+
+### 7b.2 我的 commit message 写了一句不实的话
+
+`7688ca5f8d` 的结尾写着「check_kda 现在和生产一样解析 state dtype」。**它没有** ——
+那次提交只动了两个文件，`check_kda.py` 不在其中。成因：两处修改写在同一个 patch 脚本里，
+第一处 assert 失败、脚本中止，第二处没写盘；我重跑了第一处，然后**照着打算做的事写 commit
+message，而不是照着 diff 写**。`git show --stat` 一行就能抓到。已修（`8d054a123e`）并把经过写进提交。
+
+### 7b.3 并发扫描用「桶大小」就测不到 padded replay
+
+图的 decode 桶是 `[1,2,4,8,12,16]`。我最初的扫描用 **1 / 4 / 16 —— 恰好全是桶值，一行 padding 都没有**，
+所以 §6.2 那个 padding 静默写坏 conv state 的 bug **在我所有 bench 里都不会暴露**。
+另一条线用 1/8/16/32/64/128，同样全是桶值，同样测不到。
+**现在规则是扫描必须混非桶值，固定 1 / 3 / 13 / 16。**
+
+### 7b.4 「相减法」量 decode 对冷启动是**单向**敏感的
+
+`bench_graph_decode.py` 用「先跑 `max_new_tokens=1` 拿 prefill 墙钟，再相减」分离 decode。
+冷服务的第一发 prefill 花了 **1.88 s** 而不是 0.39 s，这 1.5 s **全部落在被减去的那一项里**。
+我因此一度报出「KDA 量化 1.39×」，**真实是 1.14×**。**它只会让结果偏乐观。**
+修法：先发一次丢弃的 warmup（已进 `ab_tp1.sh` 与共享的 `bench_graph_decode.py`）。
+
+### 7b.5 `npu-smi` 的空闲检查少写一个 `\s*` 就恰好漏掉忙的卡
+
+`npu-smi` 把已用 MiB 按固定宽度对齐：空闲 die 打印 `2880 / 65536`，
+**忙的打印 `33861/ 65536`，斜杠前没有空格**。于是 `grep -oP '\d+(?= / 65536)'`
+**恰好漏掉所有忙的 die**，列表整体前移一位，检查读到另一块卡的空闲数字并放行 ——
+直接撞进加载权重时的 OOM，**看起来像显存不够，其实是被插队**。
+实测：一块 die 在 33861 MiB 时，严格写法返回 15 个数，带 `\s*` 的返回 16 个。
+
+### 7b.6 别编辑正在运行的 shell 脚本
+
+bash 按字节偏移增量读脚本。在 `ab_tp1.sh` 跑着的时候给它打补丁，它接着从新文件的旧偏移读下去，
+把一行注释当命令执行了，一次 A/B 白跑。
+
+### 7b.7 换配置就不能沿用旧基线
+
+（来自 glm53_graph_perf 的实测教训，同样适用于本线。）TP 宽度变了规约顺序就变，精度也不同，
+硬套旧 golden 会测出一堆差异然后误以为是自己改坏了。做法是**在同一配置上自己造 before/after**
+（`git worktree add --detach <改动前的提交>` 起一份基线）。本报告的每条 A/B 都是这么做的：
+一次只动一个变量，golden 取自紧邻的上一个构型。
+
+### 7b.8 单次 profile 的噪声底是几百微秒
+
+同样 90 次调用、同样形状的 `HcPre` 在两次 profile 之间无缘无故差过 226 µs。
+**所以本报告不靠单个时间数字下结论**，而是靠：① 两个独立仪器（profiler device 时间 / 墙钟）
+是否吻合；② **kernel 计数变化**（`ConcatD 42→0` 这种不是噪声能产生的）。
+§7.3 就是被这条否掉的 —— 机制生效、kernel 少了 42 个，但整步只动 −0.003 ms。
+
+---
+
+## 8. 下一步：KDA 的 conv 池翻面（最大的一块，精度门已过）
+
+### 病灶
+
+**KDA 的 decode conv1d 是被 torch 拆开来做的，每层 16 个 kernel、合计 4.04 ms/step（占一步 9.4%）。**
+根因是布局：
+
+| | conv 池布局 | 能用的入口 |
+|---|---|---|
+| GDN（`is_kda=False`） | **window-major** | `torch.ops.npu.causal_conv1d`（AOT，一个 kernel） |
+| **KDA（`is_kda=True`）** | **channel-major** `[17, 24576, 3]` | `causal_conv1d_update_npu`（**带 torch 回退的那个**） |
+
+分叉点在 `hardware_backend/npu/memory_pool_npu.py:38-48`，注释自己写着两族的约定相反。
+而 `sgl_kernel_npu/mamba/causal_conv1d.py:1379`：`cache_seqlens` 与 `num_accepted_tokens`
+都是 None 时（**正是我们**）落到 `torch_causal_conv1d_update_npu`，Triton kernel 走不到。
+
+⚠ **PLAN §2.5 曾把「K=4 causal conv1d」列在「已排除（不要再做）」下，并写着「decode 已在用」**
+—— 后半句是错的，已更正（`811de9e6a9`）。**挂在"别再看了"下面的错误是最贵的一类。**
+这和 **P6.2**（prefill 侧 `causal_conv1d_fn_npu` 退回 `F.conv1d`）是同一个上游问题的两面。
+
+### 目标算子（实测）
+
+`torch.ops.npu.causal_conv1d(..., run_mode=1)` —— **GDN 路径已经在用**（`ascend_gdn_backend.py:125`）：
+
+| | b=1 | b=16 |
+|---|---|---|
+| AOT `causal_conv1d_update` | 689 µs | 550 µs |
+| 纯 torch 回退（现状，9 个 kernel） | 270 µs | 264 µs |
+| **varlen `causal_conv1d` run_mode=1** | **60 µs** | **61 µs** |
+
+GLM 形状下全部 PASS（双参考地板内）、state 回写逐位精确、`cache_indices` 带 `-1` 时**正确跳过**
+（保留槽未被写 —— 即**它没有 §6.2 修的那个 bug**）。
+
+### 精度门：已通过
+
+conv 权重 fp32 → bf16 是硬要求（算子要求 weight/x/state 三者同 dtype ∈ {bf16, fp16}，
+fp32 是**干净的 host 侧拒绝**，不是静默算错）。
+**5 个用例 × 3 层，30/30 张量在预算内，最差 0.33×，无序列累积**（见 §7.1 末）。
+
+### 要改什么（7 处消费点）
+
+1. `memory_pool_npu.py:_init_npu_conv_state` —— KDA 分支翻成 window-major
+2. `_causal_conv1d_decode` —— 改调 varlen 算子；weight 要 `[width, dim]` 连续（照 `_get_conv_weights_t`）
+3. `_causal_conv1d_extend` —— 同样吃这个布局
+4. `ascend_kda_backend.py:314` 的 mask-track 散写（现在带一个 `.transpose(-1,-2)`）
+5. `glm5_next.py:467` conv 权重 `params_dtype` → bf16
+6. **`SGLANG_MAMBA_CONV_DTYPE` 要从 `float32` 改回 `bfloat16`** —— §6.2 加那个 float32 是为了匹配
+   fp32 权重；权重变 bf16 后它会**重新打开**它本来是来关掉的那个不匹配
+7. speculative 快照路径（`ascend_kda_backend.py:700-780`）
+
+### 三个必须带着走的约束（实测）
+
+- `conv_state_indices` 传 **int64 被接受但静默算错**（相对误差 0.75）。**必须 int32**
+- **padding lane 的输出是垃圾不是零**，调用方必须丢弃
+- `pad_slot_id` 参数**根本不被查**，跳过硬编码在「下标为负」上
+
+### ⚠ 一条验不了的
+
+**第 7 项（speculative / MTP 快照路径）本部署无法验证** —— 不是"没时间"，是**这个部署不跑 MTP**，
+没有能触发那条路径的负载。**能验的条件**：起一个带 MTP / spec decode 的配置，
+或构造一个直接驱动快照路径的单层 harness。**已请 glm53_graph_perf 挂进 PLAN P3.4 的 MTP 一节** ——
+写在 commit 里会被 `git log` 埋掉，而下一个人是从 PLAN/RESUME 进来的。
+
+### 其余（更小，都还没做）
+
+| | µs/step | 说明 |
+|---|---|---|
+| DSA 的簿记 | ≈3.5 ms | 每层 81 个 kernel，而 `SparseFlashAttention` 本身只 29.8 µs/层。**已按目标分工归 glm53_graph_perf**（P6.7/P6.10/P6.11） |
+| MoE 的路由簿记（除去 §6.3 与 §7.2/7.3） | ≈2.4 ms | 每层 14 个 kernel、地板是 0 |
+| `HcPre` | 3.0 ms | 地板的 27×，**已证明不是 sinkhorn**，该去问厂商 |
+| shared expert 两个量化 GEMM | 0.8 ms | 1.93× 地板，搬 8–16 MB 属固定成本主导 |
 
 ---
 
