@@ -1,16 +1,28 @@
 #!/usr/bin/env python
-"""Does speculative decoding change what the model writes? It must not.
+"""Compare what a speculative server writes against a non-speculative one.
 
-Greedy speculative decoding is *exact*: a draft token is accepted only when it
-equals the target model's argmax, and a rejected one is replaced by that argmax.
-So at ``temperature=0`` the output token sequence must be **identical** to the
-same server running without speculation -- not close, identical.
+⛔ **The obvious criterion does not hold on this backend, and this tool exists
+partly to record that.** Greedy speculative decoding is exact in real arithmetic
+-- a draft token is accepted only when it equals the target's argmax -- so the
+output "must" be identical. It is not, and speculation is not the reason:
+decoding the same prompt at batch width 1 and at batch width 8 with no
+speculation at all also diverges, one prompt at token 16 and another at token 0
+(measured 2026-08-30). Greedy output here is not batch-invariant, and turning MTP
+on changes the target's forward from one token per request to N.
 
-That makes this the strongest criterion available for an MTP bring-up, and a
-different kind of criterion from an accuracy score. GSM8K at temperature 1.0
-answers "did quality survive" with about +-1pp of sampling noise and takes half
-an hour; this answers "is the verify arithmetic correct" exactly, in seconds, and
-points at the first token that diverges.
+So a DIFFER result from this tool is not evidence of a verify bug. What it is
+good for:
+
+* **an IDENTICAL result still means something** -- it is a strong pass, just not
+  a criterion you can demand;
+* **locating** the first divergent token when you already have other reason to
+  suspect a bug;
+* comparing two builds at the SAME batch shape, where bit-identity is legal.
+
+For "is the verify arithmetic correct", use GSM8K (statistical, tolerates the
+nondeterminism) and the accept length, which needs no reference at all: a verify
+step computing wrong logits stops agreeing with the draft, so accept length
+collapses toward 1.0 and cannot be faked upward.
 
 What it covers that a short smoke test does not: with a prompt longer than
 ``index_topk`` the kpool sparse path is really exercised, and every rejected
