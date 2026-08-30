@@ -1,50 +1,53 @@
-# bench_dsa_layer.py -- reference output, one IDLE Atlas A3 die (Ascend910_9362)
-# 2026-08-31, torch 2.10.0 / torch_npu 2.10.0.post4, ASCEND_RT_VISIBLE_DEVICES=0
+# bench_dsa_layer.py -- reference output
+# 2026-08-31, torch 2.10.0 / torch_npu 2.10.0.post4, one IDLE Atlas A3 die
+# (Ascend910_9362).  Verified idle: npu-smi 3136 / 2877 MiB, 0%% AI core.
 # Command: python bench_dsa_layer.py --sections layer,sweep,refs,family --reps 30
+#   (defaults: --ref-seq 256, --context-len 32768 -- both matter, see README 5.2/5.4)
 #
-# REGRESSION: `layer` at --ref-seq 512 should land near 5.143 ms x 11.  The three
-# QuantBatchMatmulV3 rows MUST show 4-D NZ weight shapes (128,1024,16,32 etc).
-# If they show 2-D shapes the INT8 weights silently stayed ND -- see README 7.10.
+# REGRESSION: the check is the INVENTORY, not the total -- see the
+# regress_against_network.py output appended at the end.  The three
+# QuantBatchMatmulV3 rows MUST show 4-D NZ weight shapes (128,1024,16,32 etc);
+# 2-D shapes mean the INT8 weights silently stayed ND (README 7.10).
 
 device        : Ascend910_9362
-visible dies  : 0
+visible dies  : 1
 torch 2.10.0+cpu  torch_npu 2.10.0.post4
 target        : 467.6 us/layer x 11 layers = 5.143 ms/step, 81 kernels/layer (config I, bs=1, graph on, one A3 die)
 mode          : NPU graph capture + replay; numbers are profiler device time
 
 === layer: one DSA layer, captured and replayed ===
-  bs=1, T=1, seq_len 512, 64 heads, kv_lora 512, q_lora 1536
+  bs=1, T=1, seq_len 256, 64 heads, kv_lora 512, q_lora 1536
   indexer 32x128, topk 2048, kpool 4, page 64, pool 1246656 tokens
   graph replay, 30 reps after 10 warmups
 
   operator                   shapes                              n/l      p50      p90      max     ref  p50/ref
-  QuantBatchMatmulV3         1,16384;128,1024,16,32;4096;1       1.0    58.48    59.50    60.18    63.1     0.93x
-  SparseFlashAttention       1,64,512;19479,64,1,512;19479,64,1  1.0    45.07    45.98    46.70    32.5     1.39x
-  QuantBatchMatmulV3         1,1536;512,96,16,32;16384;1         1.0    27.86    28.06    28.38    27.6     1.01x
-  MatMulV2                   1,4096;128,4096                     2.0    11.63    11.92    12.20    12.1     0.96x
-  BatchMatMulV2              64,1,256;64,512,256                 1.0    21.40    21.68    21.96    27.3     0.78x
-  QuantBatchMatmulV3         1,4096;64,256,16,32;2048;1          1.0    21.01    21.38    21.60    18.8     1.12x
-  ReduceSum                  1,4,128;1                           2.0     8.20     8.42     8.48     8.5     0.96x
-  LightningIndexer           1,32,128;19480,64,1,128;1,32;1;1;1  1.0    14.98    15.72    16.04    18.6     0.81x
-  MatMulV2                   1,1536;4096,1536                    1.0    12.90    13.02    13.08    20.0     0.65x
-  batch_matmul_transpose_0   N/A                                 1.0    10.74    10.90    11.04    19.8     0.54x
-  Add                        1,512,1;4                           1.0     9.45     9.56     9.62     9.6     0.98x
-  ScatterNdUpdate            76,1,128;1,1;1,1,128                2.0     4.36     4.48     4.56       -         
-  MatMulV2                   32,128;128,128                      1.0     8.33     8.46     8.60       -         
-  Index                      1,16384;2;1;1;1                     1.0     8.07     8.12     8.16       -         
-  IndexPutV2                 1246656,1,512;1,1,512;1;1;1         1.0     8.02     8.18     8.22     8.2     0.98x
-  BroadcastTo                1,512,1;3                           1.0     7.50     7.60     7.64     7.3     1.03x
-  Range                      ;;                                  1.0     7.01     7.08     7.22       -         
-  MatMulV2                   1,4096;32,4096                      1.0     6.19     6.44     6.64     8.0     0.77x
-  ReduceMax                  1,4,128;1                           1.0     6.17     6.42     6.46     5.4     1.14x
-  FloorMod                   1;1                                 4.0     1.46     1.60     1.70       -         
-  GatherV3                   76,128;4;1                          2.0     2.86     3.00     3.20       -         
-  BroadcastTo                ;1                                  4.0     1.28     1.36     1.38       -         
-  ... 48 smaller groups                                                115.25
+  QuantBatchMatmulV3         1,16384;128,1024,16,32;4096;1       1.0    58.01    58.94    60.46    63.1     0.92x
+  SparseFlashAttention       1,64,512;19479,64,1,512;19479,64,1  1.0    31.02    31.84    32.08    32.5     0.95x
+  QuantBatchMatmulV3         1,1536;512,96,16,32;16384;1         1.0    26.67    27.06    27.52    27.6     0.97x
+  MatMulV2                   1,4096;128,4096                     2.0    11.51    11.84    12.08    12.1     0.95x
+  QuantBatchMatmulV3         1,4096;64,256,16,32;2048;1          1.0    20.14    20.44    20.58    18.8     1.07x
+  BatchMatMulV2              64,1,256;64,512,256                 1.0    19.55    19.80    19.98    27.3     0.72x
+  ReduceSum                  1,4,128;1                           2.0     8.62     8.88     8.92     8.5     1.01x
+  LightningIndexer           1,32,128;19480,64,1,128;1,32;1;1;1  1.0    14.11    14.74    15.50    18.6     0.76x
+  batch_matmul_transpose_0   N/A                                 1.0    13.45    13.66    13.96    19.8     0.68x
+  MatMulV2                   1,1536;4096,1536                    1.0    12.52    12.62    12.68    20.0     0.63x
+  ClipByValueV2              1;;                                 3.0     3.82     3.96     4.50       -         
+  Add                        1,512,1;4                           1.0     8.87     9.24     9.50     9.6     0.92x
+  ScatterNdUpdate            76,1,128;1,1;1,1,128                2.0     4.32     4.48     4.60       -         
+  IndexPutV2                 1246656,1,512;1,1,512;1;1;1         1.0     7.32     7.38     7.44     8.2     0.89x
+  Index                      1,512;2;1;1;1                       1.0     7.20     7.28     7.40       -         
+  Range                      ;;                                  1.0     6.93     7.00     7.00       -         
+  BroadcastTo                1,512,1;3                           1.0     6.58     6.64     6.74     7.3     0.90x
+  LogicalAnd                 1;1                                 5.0     1.24     1.34     1.38       -         
+  MatMulV2                   1,4096;32,4096                      1.0     6.17     6.24     6.32     8.0     0.77x
+  MatMulV2                   32,128;128,128                      1.0     6.14     6.38     6.54       -         
+  GatherV3                   76,128;4;1                          2.0     2.92     3.04     3.30       -         
+  Cast                       1,128                               5.0     1.12     1.22     1.28       -         
+  ... 50 smaller groups                                                122.63
   -------------------------- ---------------------------------- ---- --------
-  per layer                                                       93   453.50 us   (config I: 81 kernels, 467.6 us)
-  x 11 layers                                                   1023    4.988 ms   target 5.143 ms (-3.0%)
-  wall clock per replay (host, reference only): 494.6 us
+  per layer                                                       99   445.30 us   (config I: 81 kernels, 467.6 us)
+  x 11 layers                                                   1089    4.898 ms   target 5.143 ms (-4.8%)
+  wall clock per replay (host, reference only): 487.3 us
 
 === sweep: DSA against sequence length -- the whole point ===
   index_topk = 2048 caps the attention itself.  The indexer does not
@@ -53,25 +56,25 @@ mode          : NPU graph capture + replay; numbers are profiler device time
   metadata the captured graph reads changes, which is how the served
   graph handles varying lengths too.
 
-     seq len   us/layer   x11 (ms)    vs 1st  kernels
-         128     436.30      4.799     +0.0%       93
-         512     455.69      5.013     +4.4%       93
-        1024     471.12      5.182     +8.0%       93
-        4096     510.58      5.616    +17.0%       93
-       32768     516.38      5.680    +18.4%       93
-      131072     523.95      5.763    +20.1%       93
-     1048576     590.84      6.499    +35.4%       93
+.     seq len   us/layer   x11 (ms)    vs 1st  kernels
+         128     443.57      4.879     +0.0%       99
+         512     462.07      5.083     +4.2%       99
+        1024     476.90      5.246     +7.5%       99
+        4096     518.54      5.704    +16.9%       99
+       32768     523.39      5.757    +18.0%       99
+      131072     534.46      5.879    +20.5%       99
+     1048576     597.58      6.573    +34.7%       99
 
   per-operator, only the ones that move by more than 2 us:
   operator                   shapes                        128        512       1024       4096      32768     131072    1048576
-  SparseFlashAttention       1,64,512;19479,64,1,51      26.41      45.43      59.84      99.10      99.08      98.96     100.11
-  LightningIndexer           1,32,128;19480,64,1,12      15.39      16.56      17.19      17.89      23.45      31.26      81.12
-  batch_matmul_transpose_0   N/A                         10.75      10.78      10.79      10.77      10.78      10.75      15.75
-  BatchMatMulV2              64,1,256;64,512,256         21.42      21.29      21.44      21.36      21.40      21.43      25.06
-  MatMulV2                   1,1536;4096,1536            12.86      12.82      12.84      12.83      12.89      12.92      15.42
+  SparseFlashAttention       1,64,512;19479,64,1,51      26.53      45.15      59.64      99.74      99.37      99.50     100.26
+  LightningIndexer           1,32,128;19480,64,1,12      16.59      16.92      17.25      18.48      23.88      32.45      80.34
+  batch_matmul_transpose_0   N/A                         13.52      13.50      13.48      13.50      13.48      14.05      18.12
+  MatMulV2                   1,1536;4096,1536            12.40      12.39      12.39      12.41      12.62      12.83      15.25
+  BatchMatMulV2              64,1,256;64,512,256         19.58      19.47      19.53      19.56      19.61      19.61      22.01
 
   least squares over n >= 4096 (attention saturated), 4 points:
-    DSA family = 5.640 + 8.217e-07 x n   ms/step
+    DSA family = 5.733 + 8.056e-07 x n   ms/step
   Two mechanisms, and the sweep separates them:
     * SparseFlashAttention grows only until it hits index_topk=2048,
       then is flat forever.  That is the cap working.
@@ -88,19 +91,19 @@ mode          : NPU graph capture + replay; numbers are profiler device time
   kernel.  Plus the pool reads, because DSA's cost is pool-shaped.
 
   case                                         MiB    floor       p50       p90   /floor
-  o_proj  INT8 16384->4096                   64.00    53.69     55.90     57.56    1.04x
-    same bytes, pure read (int8 w)          320.00   268.44    323.68    592.11    1.21x
-  q_b_proj INT8 1536->16384                  24.00    20.13     27.05     27.76    1.34x
-  w_kc bmm [64,1,256]x[64,512,256]           16.00    13.42     15.09     15.58    1.12x
-    same bytes, pure read w_kc.sum()         16.00    13.42     16.20     16.54    1.21x
-  wq_b   bf16 1536->4096                     12.00    10.07      5.05      9.16    0.50x
-    same bytes, pure read                    12.00    10.07     13.69     14.20    1.36x
-  KV pool  read all 1.19 GiB               1217.44  1021.26   1100.52   1103.98    1.08x
-  KV pool  read 2048 tokens (topk)            2.00     1.68      6.95      7.42    4.14x
-  index pool read all 0.30 GiB              304.38   255.33    269.80    271.83    1.06x
-  index pool read n/4 at 32k                  2.00     1.68      6.99      7.28    4.17x
-  zero k_rope read 0.15 GiB                 152.18   127.66    131.03    132.64    1.03x
-  trivial  torch.add on 1 element             0.00        -      1.40      1.50         
+  o_proj  INT8 16384->4096                   64.00    53.69     55.86     56.60    1.04x
+    same bytes, pure read (int8 w)          320.00   268.44    323.17    600.60    1.20x
+  q_b_proj INT8 1536->16384                  24.00    20.13     26.45     27.24    1.31x
+  w_kc bmm [64,1,256]x[64,512,256]           16.00    13.42     15.07     15.48    1.12x
+    same bytes, pure read w_kc.sum()         16.00    13.42     16.35     16.72    1.22x
+  wq_b   bf16 1536->4096                     12.00    10.07      5.10      9.20    0.51x
+    same bytes, pure read                    12.00    10.07     13.87     14.22    1.38x
+  KV pool  read all 1.19 GiB               1217.44  1021.26   1101.61   1106.00    1.08x
+  KV pool  read 2048 tokens (topk)            2.00     1.68      7.18      7.48    4.28x
+  index pool read all 0.30 GiB              304.38   255.33    267.07    268.73    1.05x
+  index pool read n/4 at 32k                  2.00     1.68      6.96      7.26    4.15x
+  zero k_rope read 0.15 GiB                 152.18   127.66    129.30    130.25    1.01x
+  trivial  torch.add on 1 element             0.00        -      1.42      1.62         
 
   L2 here is ~168 MiB.  Anything smaller than that, measured by
   hammering the same buffer, is L2-warm and will beat its own HBM floor;
@@ -108,6 +111,100 @@ mode          : NPU graph capture + replay; numbers are profiler device time
 
 === family: 11 distinct DSA layers chained in one graph ===
   allocating ~16.3 GB of pools (11 of the 11 layers)
-  11 layers = 5.338 ms, 1023 kernels;  scaled to 11 layers = 5.338 ms   target 5.143 ms (+3.8%)
+  11 layers = 5.320 ms, 1089 kernels;  scaled to 11 layers = 5.320 ms   target 5.143 ms (+3.4%)
+  (no die-sharing check here: see the `layer` section -- pooling distinct layers
+   makes the dispersion test meaningless)
 
-profiler output under /var/tmp/glm53/oplab/dfin (delete when done)
+profiler output under /var/tmp/glm53/oplab/D (delete when done)
+
+
+==============================================================================
+INVENTORY CHECK  (python regress_against_network.py --family DSA --steps 30)
+==============================================================================
+
+=== DSA: standalone (1 layer(s)) vs in-network per-layer ===
+
+op                        shapes                               calls ref/got   us ref   us got      x
+-----------------------------------------------------------------------------------------------------
+QuantBatchMatmulV3        "1,16384;128,1024,16,32;4096;1"        1.0/1.0         63.1     58.2   0.92
+SparseFlashAttention      "1,64,512;19479,64,1,512;19479,64      1.0/1.0         32.5     30.9   0.95
+QuantBatchMatmulV3        "1,1536;512,96,16,32;16384;1"          1.0/1.0         27.6     26.7   0.97
+BatchMatMulV2             "64,1,256;64,512,256"                  1.0/1.0         27.3     19.5   0.72
+MatMulV2                  "1,4096;128,4096"                      2.0/2.0         24.2     22.9   0.95
+MatMulV2                  "1,1536;4096,1536"                     1.0/1.0         20.0     12.5   0.62
+batch_matmul_transpose_0  N/A                                    1.0/1.0         19.8     13.5   0.68
+QuantBatchMatmulV3        "1,4096;64,256,16,32;2048;1"           1.0/1.0         18.8     20.2   1.07
+LightningIndexer          "1,32,128;19480,64,1,128;1,32;1;1      1.0/1.0         18.6     14.2   0.76
+ReduceSum                 "1,4,128;1"                            2.0/2.0         16.9     17.3   1.02
+Add                       "1,512,1;4"                            1.0/1.0          9.6      8.9   0.93
+ScatterNdUpdate           "76,1,128;1,1;1,1,128"                 2.0/2.0          9.4      8.6   0.92
+IndexPutV2                "1246656,1,512;1,1,512;1;1;1"          1.0/1.0          8.2      7.3   0.89
+Index                     "1,512;2;1;1;1"                        1.0/1.0          8.0      7.2   0.89
+MatMulV2                  "1,4096;32,4096"                       1.0/1.0          8.0      6.2   0.77
+BroadcastTo               "1,512,1;3"                            1.0/1.0          7.3      6.6   0.90
+LogicalAnd                "1;1"                                  5.0/5.0          7.1      6.2   0.88
+MatMulV2                  "32,128;128,128"                       1.0/1.0          6.5      6.1   0.94
+Cast                      "1,128"                                5.0/5.0          6.5      5.6   0.87
+GatherV3                  "76,128;4;1"                           2.0/2.0          6.4      5.9   0.91
+ScatterNdUpdate           "1246720,1,128;1,1;1,1,128"            1.0/1.0          6.2      4.4   0.71
+GreaterEqual              "1;"                                   2.0/2.0          6.0      4.7   0.78
+LayerNormV3               "1,128;128;128"                        1.0/1.0          5.9      4.1   0.69
+Mul                       "1;"                                   3.0/3.0          5.7      4.9   0.86
+RmsNorm                   "1,1536;1536"                          1.0/1.0          5.5      4.1   0.74
+MatMulV2                  "1,128;128,128"                        1.0/1.0          5.5      5.1   0.92
+ReduceMax                 "1,4,128;1"                            1.0/1.0          5.4      5.5   1.03
+Add                       "1;1"                                  2.0/2.0          5.1      4.0   0.78
+FloorDiv                  "1;"                                   2.0/2.0          5.0      3.5   0.71
+Add                       "1,1;1,4"                              2.0/2.0          4.9      4.4   0.90
+DynamicQuant              "1,16384"                              1.0/1.0          4.6      3.9   0.86
+RmsNorm                   "1,1,512;512"                          1.0/1.0          4.0      4.0   1.00
+Cast                      "1,32,128"                             2.0/2.0          3.6      3.5   0.98
+Less                      "1;"                                   1.0/1.0          3.1      2.2   0.71
+Cast                      "1,4,128"                              2.0/2.0          2.9      2.6   0.89
+Mul                       "1,32;"                                2.0/2.0          2.9      2.3   0.80
+Less                      "1;1"                                  1.0/1.0          2.6      2.2   0.82
+Sub                       "1,4,128;1,1,128"                      1.0/1.0          2.6      1.9   0.73
+DynamicQuant              "1,1536"                               1.0/1.0          2.6      2.5   0.98
+SelectV2                  "1;1;1"                                1.0/1.0          2.5      1.8   0.69
+SelectV2                  "1,2048;1,2048;1,2048"                 1.0/1.0          2.5      1.9   0.77
+_append_kpool_tail_to_top N/A                                    1.0/1.0          2.5      2.0   0.80
+Mul                       "1,1;"                                 1.0/1.0          2.3      1.7   0.74
+NotEqual                  "1;"                                   1.0/1.0          2.0      1.9   0.96
+Mul                       "1,32,128;"                            1.0/1.0          2.0      1.6   0.80
+SelectV2                  "1;1;"                                 1.0/1.0          2.0      1.8   0.90
+BroadcastTo               ";2"                                   1.0/1.0          1.9      1.5   0.81
+GreaterEqual              "1,512;"                               1.0/1.0          1.8      1.4   0.76
+Add                       "1,4,128;4,128"                        1.0/1.0          1.7      1.3   0.75
+Cast                      "1,512,4"                              1.0/1.0          1.6      1.3   0.79
+Mul                       "1,512,1;"                             1.0/1.0          1.6      1.3   0.79
+FloorMod                  "1,4;1,4"                              1.0/1.0          1.6      1.4   0.90
+Mul                       "1,4,128;1,4,128"                      1.0/1.0          1.5      1.3   0.83
+RealDiv                   "1,128;1,128"                          1.0/1.0          1.5      1.3   0.82
+BroadcastTo               "1,1,512;3"                            1.0/1.0          1.5      1.1   0.73
+Mul                       "1,128;"                               1.0/1.0          1.5      1.2   0.82
+ZerosLike                 N/A                                    1.0/1.0          1.4      1.2   0.81
+Cast                      "1,512,1"                              1.0/1.0          1.4      1.1   0.81
+Exp                       "1,4,128"                              1.0/1.0          1.4      1.1   0.81
+-----------------------------------------------------------------------------------------------------
+TOTAL                                                           467.6    446.0   0.95
+
+⚠ 1 group(s) in the network but NOT in the bench -- the bench is incomplete, and a missing kernel just looks fast:
+    Cast                      "1,1,1"                                      1.0 calls      1.3 us
+
+⚠ 13 group(s) in the bench but NOT in the network -- the bench is doing something the model does not:
+    ClipByValueV2             "1;;"                                        3.0 calls     11.5 us
+    Range                     ";;"                                         1.0 calls      6.9 us
+    FloorMod                  "1;1"                                        2.0 calls      3.1 us
+    DynamicQuant              "1,4096"                                     1.0 calls      2.7 us
+    IndexCheck                "2;1;1"                                      1.0 calls      2.4 us
+    BroadcastTo               ";1"                                         2.0 calls      2.4 us
+    Fill                      "1;"                                         2.0 calls      2.4 us
+    Cast                      "1"                                          2.0 calls      2.2 us
+    IndexCheck                "1;1"                                        1.0 calls      2.2 us
+    Sub                       "1;1"                                        1.0 calls      1.9 us
+    Equal                     "1;"                                         1.0 calls      1.8 us
+    Cast                      "1,4096"                                     1.0 calls      1.5 us
+
+  bench x 11 layers = 4.906 ms   vs in-network 5.143 ms   (-4.6%)
+  ⚠ the totals agreeing is not the check; the inventory agreeing is. A replay with the wrong
+    kernels can hit the right total by accident.

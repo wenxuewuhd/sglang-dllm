@@ -245,7 +245,7 @@ class DSALayer:
     captured graph serves every length, exactly as the served graph does.
     """
 
-    def __init__(self, seq_len=32768, max_seq=131072, share=None, seed=0):
+    def __init__(self, seq_len=512, context_len=32768, share=None, seed=0):
         g = torch.Generator(device="cpu").manual_seed(seed)
 
         def rnd(*shape, dtype=BF, scale=0.05):
@@ -275,7 +275,10 @@ class DSALayer:
         self.kv_a_norm_w = torch.ones(KV_LORA, device=DEV, dtype=BF)
         self.k_norm_w = torch.ones(IDX_DIM, device=DEV, dtype=torch.float32)
         self.k_norm_b = torch.zeros(IDX_DIM, device=DEV, dtype=torch.float32)
-        self.ape = (torch.randn(IDX_KPOOL, IDX_DIM, generator=g) * 0.1).to(BF).to(DEV)
+        # fp32, not bf16.  `compress_pool_bf16` does `ape.float()`, so a bf16 ape
+        # would add a Cast "4,128" per layer -- and the served inventory has the
+        # Add "1,4,128;4,128" but no such Cast, which pins the parameter's dtype.
+        self.ape = (torch.randn(IDX_KPOOL, IDX_DIM, generator=g) * 0.1).float().to(DEV)
         self.scaling = QK_HEAD**-0.5
         self.idx_scale = IDX_HEADS**-0.5 * IDX_DIM**-0.5
 
@@ -299,20 +302,36 @@ class DSALayer:
         self.q_rope, self.k_rope = s["q_rope"], s["k_rope"]
 
         # -- metadata.  These are the only tensors the sweep touches. ---------
-        self.max_pages = max(512, -(-max_seq // PAGE))
+        # The block table is `context_length / page_size` wide, NOT
+        # `current_seq_len / page_size`: the server allocates it once from
+        # --context-length.  Getting this wrong is invisible in the totals and
+        # very visible in the inventory -- it changes the recorded input shape of
+        # SparseFlashAttention, LightningIndexer AND Index at once, which is
+        # three of the four biggest operators in the layer.
+        self.context_len = context_len
+        self.max_pages = -(-context_len // PAGE)
         self.block_tables = torch.zeros(1, self.max_pages, dtype=torch.int32, device=DEV)
         self.pooled_bt = torch.zeros(
             1, self.max_pages // IDX_KPOOL, dtype=torch.int32, device=DEV
         )
+        # dtypes follow ForwardBatch: seq_lens int32, positions/out_cache_loc/
+        # req_pool_indices int64.  `pos < seq_lens` therefore mixes int64 with
+        # int32 and emits a Cast -- that Cast is real, it is in the served run.
         self.seq_lens = torch.zeros(1, dtype=torch.int32, device=DEV)
         self.pool_lens = torch.zeros(1, dtype=torch.int32, device=DEV)
         self.positions = torch.zeros(1, dtype=torch.int64, device=DEV)
         self.out_cache_loc = torch.zeros(1, dtype=torch.int64, device=DEV)
         self.cu_seqlens_q = torch.ones(1, dtype=torch.int32, device=DEV)
         self.req_idx = torch.zeros(1, dtype=torch.int64, device=DEV)
-        self.rows = torch.zeros(1, dtype=torch.int64, device=DEV)
-        self.pool_arange = torch.arange(IDX_KPOOL, dtype=torch.int64, device=DEV)
+        # `_decode_arange`: cached, because rebuilding it per layer would put a
+        # Range kernel in every DSA layer (the served tree hoisted these in
+        # c69883df97).
+        self.rows = torch.arange(1, device=DEV)
+        self.pool_arange = torch.arange(IDX_KPOOL, device=DEV)
         self.scratch_loc = IDX_TOKENS - 1
+        #: a python int, not a tensor -- `torch.where(cond, t, python_int)` is
+        #: SelectV2 "1;1;" while `torch.where(cond, t, tensor)` is "1;1;1", and
+        #: the served run has one of each.
         self.tail_scratch_row = REQ_POOL_ROWS - 1
 
         self.x = rnd(1, HIDDEN)
@@ -327,7 +346,11 @@ class DSALayer:
         """
         pages = -(-n // PAGE)
         if pages > self.max_pages:
-            raise ValueError(f"n={n} needs {pages} pages, block table holds {self.max_pages}")
+            raise ValueError(
+                f"n={n} needs {pages} pages but the block table holds "
+                f"{self.max_pages} (context_len={self.context_len}).  Build the "
+                "layer with a bigger context_len."
+            )
         if pages > KV_PAGES:
             raise ValueError(f"n={n} needs {pages} pages, the KV pool holds {KV_PAGES}")
         bt = torch.zeros(1, self.max_pages, dtype=torch.int32)
@@ -370,23 +393,53 @@ class DSALayer:
         # ---------------- B. indexer -------------------------------------
         query = F.linear(q_lora, self.wq_b).view(-1, IDX_HEADS, IDX_DIM)  # [1,32,128]
         key = F.linear(self.x, self.wk)  # [1,128]
-        key = F.layer_norm(key, (IDX_DIM,), self.k_norm_w, self.k_norm_b, RMS_EPS)
+        # The round trip through fp32 is explicit and it is load bearing: it is
+        # two Cast "1,128" per layer in the served inventory (5 total, and the
+        # bench had 3 until this line matched).  Handing bf16 straight to
+        # F.layer_norm with fp32 weights emits no Cast at all -- measured.
+        key = F.layer_norm(
+            key.float(), (IDX_DIM,), self.k_norm_w, self.k_norm_b, RMS_EPS
+        ).to(BF)
         query = hadamard_transform_npu(query)
         gate_score = F.linear(self.x, self.gate_w)  # [1,128]
 
         # -- kpool_decode_update_index_cache, transcribed --------------------
-        valid = (self.out_cache_loc != 0) & (self.positions < self.seq_lens)
-        closing = (valid & (self.positions % IDX_KPOOL == IDX_KPOOL - 1)).unsqueeze(1)
-        start = self.positions - self.positions % IDX_KPOOL
+        # Expression for expression from
+        # memory_pool_npu.py::kpool_decode_update_index_cache.  The operand
+        # *kinds* matter as much as the arithmetic: a python int and a 1-element
+        # tensor produce different kernels (SelectV2 "1;1;" vs "1;1;1"), and a
+        # scalar comparison and a tensor comparison produce different kernels
+        # (Less "1;" vs "1;1").  The served inventory pins all of them.
+        req, pos = self.req_idx, self.positions
+        valid = (
+            (req >= 0)
+            & (req < REQ_POOL_ROWS)
+            & (self.out_cache_loc != 0)
+            & (pos >= 0)
+            & (pos < self.seq_lens)
+        )
+        safe_req = req.clamp(0, REQ_POOL_ROWS - 1)
+        safe_pos = pos.clamp(min=0)
+
+        # `safe_pos % pool_size` is written three times in the source (closing,
+        # start, and the ring scatter, whose tail_width also equals pool_size).
+        # It is one value; computing it once is what the served graph ends up
+        # doing, and recomputing it would add three FloorMod + three BroadcastTo
+        # per layer that the served inventory does not have.
+        pos_mod = safe_pos % IDX_KPOOL
+        closing = (valid & (pos_mod == IDX_KPOOL - 1)).unsqueeze(1)
+
+        start = safe_pos - pos_mod
         phys = (start.unsqueeze(1) + self.pool_arange.unsqueeze(0)) % IDX_KPOOL
         flat_k = self.tail_k.view(-1, IDX_DIM)
         flat_s = self.tail_s.view(-1, IDX_DIM)
-        gather = (self.req_idx.unsqueeze(1) * IDX_KPOOL + phys).reshape(-1)
+        gather = (safe_req.unsqueeze(1) * IDX_KPOOL + phys).reshape(-1)
         slot_k = flat_k.index_select(0, gather).view(1, IDX_KPOOL, IDX_DIM)
         slot_s = flat_s.index_select(0, gather).view(1, IDX_KPOOL, IDX_DIM)
         slot_k[:, IDX_KPOOL - 1] = key
         slot_s[:, IDX_KPOOL - 1] = gate_score
-        pool_id = self.positions // IDX_KPOOL
+
+        pool_id = safe_pos // IDX_KPOOL
         page_col = ((pool_id // SLOTS_PER_PAGE) * IDX_KPOOL).clamp(
             0, self.block_tables.shape[1] - 1
         )
@@ -394,15 +447,16 @@ class DSALayer:
         loc = torch.where(
             closing.squeeze(1),
             page * PAGE + pool_id % SLOTS_PER_PAGE,
-            torch.full_like(page, self.scratch_loc),
+            torch.full_like(page, self.scratch_loc),   # tensor -> SelectV2 "1;1;1"
         )
         torch_npu.npu_scatter_nd_update_(
             self.index_k.view(-1, 1, IDX_DIM),
-            loc.reshape(-1, 1),
+            loc.reshape(-1, 1).long(),
             compress_pool_bf16(slot_k, slot_s, self.ape).reshape(-1, 1, IDX_DIM),
         )
-        dest = torch.where(valid, self.req_idx, torch.full_like(self.req_idx, self.tail_scratch_row))
-        scatter = (dest * IDX_KPOOL + self.positions % IDX_KPOOL).reshape(-1, 1)
+        # python int, not a tensor -> SelectV2 "1;1;" (+ a Fill for the scalar)
+        dest = torch.where(valid, safe_req, self.tail_scratch_row)
+        scatter = (dest * IDX_KPOOL + pos_mod).reshape(-1, 1)
         torch_npu.npu_scatter_nd_update_(
             flat_k.view(-1, 1, IDX_DIM), scatter, key.reshape(-1, 1, IDX_DIM)
         )
@@ -411,7 +465,13 @@ class DSALayer:
         )
 
         # -- score every closed pool.  THIS is the O(n) term. ----------------
-        weights = (F.linear(self.x.float(), self.wproj) * self.idx_scale).contiguous()
+        # _kpool_head_gate_npu multiplies by two scalars in sequence, not by one
+        # pre-folded constant -- the served inventory has Mul "1,32;" twice.
+        weights = (
+            F.linear(self.x.float(), self.wproj)
+            * IDX_HEADS**-0.5
+            * IDX_DIM**-0.5
+        ).contiguous()
         selected = torch_npu.npu_lightning_indexer(
             query=query.contiguous(),
             key=self.index_k,
@@ -495,6 +555,10 @@ def capture(fn, warmup=10):
 
 MARKER_NUMEL = 1357
 
+#: only kernels at least this long take part in the dispersion test; below it
+#: the p90/p50 ratio measures the timer, not the die.
+DISPERSION_FLOOR_US = 5.0
+
 
 def profile(cases, nrep=30, tag="p"):
     """Profile each (label, callable) in one session, split by a marker kernel.
@@ -507,10 +571,15 @@ def profile(cases, nrep=30, tag="p"):
     for _, fn in cases:
         fn(3)
     torch.npu.synchronize()
+    # With one case there is nothing to split, and the marker would show up in
+    # the raw kernel_details.csv that regress_against_network.py reads -- as an
+    # op group the network does not have.  Single-case profiles stay clean.
+    use_marker = len(cases) > 1
     mk = torch.zeros(MARKER_NUMEL, device=DEV)
 
     def mark():
-        mk.add_(1.0)
+        if use_marker:
+            mk.add_(1.0)
 
     mark()
     torch.npu.synchronize()
@@ -551,13 +620,20 @@ def profile(cases, nrep=30, tag="p"):
     rows = list(csv.DictReader(open(hits[-1], newline="")))
     rows.sort(key=lambda r: float(r["Start Time(us)"].strip()))
     tag_m = str(MARKER_NUMEL)
+    if not use_marker:
+        return [(labels[0], rows)], walls
     cuts = [i for i, r in enumerate(rows) if tag_m in r["Input Shapes"]]
     if len(cuts) != len(cases) + 1:
         raise SystemExit(
             f"marker kernel appeared {len(cuts)} times, expected {len(cases)+1}. "
             "Case attribution would be wrong, so refusing to report numbers."
         )
-    blocks = [rows[cuts[i] + 1 : cuts[i + 1]] for i in range(len(cases))]
+    # Drop the markers themselves: they are measurement scaffolding, not part of
+    # the layer, and leaving them in puts an `Add "1357;"` row in every inventory.
+    blocks = [
+        [r for r in rows[cuts[i] + 1 : cuts[i + 1]] if tag_m not in r["Input Shapes"]]
+        for i in range(len(cases))
+    ]
     return list(zip(labels, blocks)), walls
 
 
@@ -618,49 +694,72 @@ def tabulate(rows, nrep, layers=DSA_LAYERS, top=None):
 
 
 def contention_warning(agg, refs):
-    """Refuse to let a shared die be read as an operator result.
+    """Two different failures, two different messages.  They are not the same thing.
 
-    Two independent tests, because on this machine they fail at different times:
+    * **dispersion** (p90/p50) over the reference shapes -> the die is SHARED.
+      Interference is bursty, so it shows up in the tail first.  This is the
+      test that actually detects a co-tenant.
+    * **median** off against a fixed shape, with the tail clean -> the die is
+      fine and something about the RUN does not match the reference: the
+      sequence length, the context length, the pool size, a dtype.
 
-      * **median** against a fixed, bandwidth-bound shape whose cost is known.
-        Catches a die that is busy for the whole run.
-      * **dispersion** (p90/p50) over every reference shape.  Catches a die that
-        is busy in bursts -- which is the common case, and which the median can
-        miss entirely.  Measured live on 2026-08-31: a DSA layer came out 79.5%
-        over target while its biggest GEMM's median was only 1.12x, because the
-        damage was all in the tail (p50 71 us, p90 223 us).
-
-    The project's own most important piece of evidence was a distribution shape,
-    not a mean.  This is the same lesson, wired into the harness.
+    Getting this backwards costs real time.  An earlier version of this harness
+    led with the median, and on a verifiably idle die (3136 MiB used, no other
+    process) it printed "THIS DIE IS SHARED" because `--ref-seq` was 512 instead
+    of the aligned 256 -- IndexPutV2's median was 1.62x while its dispersion was
+    1.01x, i.e. perfectly clean.  The README's own rule ("interference lives in
+    the tail; a median alone will miss it") applies in both directions.
     """
     hits = []
     for key, v in agg.items():
-        # `refs` keys some operators by (Type, shapes) and some by name alone.
         ref = refs.get(key) or refs.get((key[0], None))
         if not ref or not v:
             continue
         v = sorted(v)
         p50 = statistics.median(v)
         p90 = v[min(len(v) - 1, int(len(v) * 0.9))]
-        hits.append((key, p50 / ref, p90 / p50 if p50 else 1.0))
+        hits.append((key, p50 / ref, p90 / p50 if p50 else 1.0, p50))
     if not hits:
         return
     worst_ratio = max(h[1] for h in hits)
-    worst_spread = max(h[2] for h in hits)
-    if worst_ratio <= 1.25 and worst_spread <= 1.25:
-        return
-    print(
-        f"\n  !! THIS DIE IS SHARED -- do not report these numbers as operator costs.\n"
-        f"     worst median vs config I : {worst_ratio:.2f}x   (clean die: <= 1.15x)\n"
-        f"     worst p90/p50 dispersion : {worst_spread:.2f}x   (clean die: <= 1.10x)"
-    )
-    for key, r, sp in sorted(hits, key=lambda h: -max(h[1], h[2]))[:4]:
-        print(f"       {key[0][:24]:<24} {str(key[1])[:26]:<26} p50/ref {r:5.2f}x  p90/p50 {sp:5.2f}x")
-    print(
-        "     Run `npu-smi info`.  A busy die inflates everything by roughly 1.7x,\n"
-        "     which lands inside the '20% is fine / 2x means wrong shape' gap and is\n"
-        "     exactly the kind of number that gets mistaken for a real regression."
-    )
+    # Dispersion is only meaningful above the timer's own granularity.  A 1.3 us
+    # kernel with 0.4 us of jitter reads as p90/p50 = 1.30 on a verifiably idle
+    # die -- measured, in the `family` section, where it false-fired.  Judge
+    # sharing on kernels big enough for the ratio to mean something.
+    big = [h for h in hits if h[3] >= DISPERSION_FLOOR_US]
+    worst_spread = max((h[2] for h in big), default=1.0)
+
+    def show(n=4):
+        for key, r, sp, _p in sorted(hits, key=lambda h: -max(h[1], h[2]))[:n]:
+            print(f"       {key[0][:24]:<24} {str(key[1])[:26]:<26} "
+                  f"p50/ref {r:5.2f}x  p90/p50 {sp:5.2f}x")
+
+    if worst_spread > 1.25:
+        print(
+            f"\n  !! THIS DIE IS SHARED -- do not report these as operator costs.\n"
+            f"     worst p90/p50 dispersion : {worst_spread:.2f}x   (over kernels >= "
+            f"{DISPERSION_FLOOR_US:.0f} us; clean die: <= 1.10x)\n"
+            f"     worst median vs config I : {worst_ratio:.2f}x"
+        )
+        show()
+        print(
+            "     Run `npu-smi info`.  A busy die inflates everything by roughly 1.7x,\n"
+            "     which lands inside the '20% is fine / 2x means wrong shape' gap."
+        )
+    elif worst_ratio > 1.25:
+        print(
+            f"\n  ?  MEDIAN OFF BUT TAIL CLEAN -- this is most likely a PARAMETER\n"
+            f"     mismatch, not a busy die.\n"
+            f"     worst median vs config I : {worst_ratio:.2f}x\n"
+            f"     worst p90/p50 dispersion : {worst_spread:.2f}x   (clean -- nobody else\n"
+            f"                                 is on this die)"
+        )
+        show()
+        print(
+            "     Check --ref-seq (config I is ~256), --context-len (32768), and that\n"
+            "     the INT8 weights really are NZ.  Only the dispersion test detects a\n"
+            "     co-tenant; a median on its own cannot tell the two apart."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -668,7 +767,7 @@ def contention_warning(agg, refs):
 # ---------------------------------------------------------------------------
 def sec_layer(args):
     print("\n=== layer: one DSA layer, captured and replayed ===")
-    lay = DSALayer(seq_len=args.ref_seq, max_seq=max(args.seq_lens + [args.ref_seq]))
+    lay = DSALayer(seq_len=args.ref_seq, context_len=args.context_len)
     replay, _g = capture(lay.body, warmup=args.warmup)
     blocks, walls = profile([("dsa", replay)], nrep=args.reps, tag="layer")
     rows = blocks[0][1]
@@ -695,7 +794,14 @@ def sec_sweep(args):
     dropped = [n for n in args.seq_lens if n not in ns]
     if dropped:
         print(f"  ! skipping {dropped}: longer than the {KV_TOKENS}-token KV pool\n")
-    lay = DSALayer(seq_len=ns[0], max_seq=max(ns))
+    # The block table has to hold the longest length in the sweep, so it is
+    # wider here than in the `layer` section.  That is faithful -- a server with
+    # a 1M context length allocates a 16384-entry block table whatever the
+    # current sequence length is -- but it does change the recorded input shape
+    # of SparseFlashAttention / LightningIndexer / Index, so the sweep's
+    # inventory is NOT directly comparable to config I.  Use the `layer`
+    # section for the inventory check.
+    lay = DSALayer(seq_len=ns[0], context_len=max(max(ns), args.context_len))
     replay, _g = capture(lay.body, warmup=args.warmup)
 
     # One profiler session per length.  Rewriting the metadata has to happen
@@ -775,7 +881,7 @@ def sec_refs(args):
     print("  Same four controls as the KDA bench: a stock kernel of the same")
     print("  shape, a pure read of the same bytes, a read+write, and a trivial")
     print("  kernel.  Plus the pool reads, because DSA's cost is pool-shaped.\n")
-    lay = DSALayer(seq_len=args.ref_seq, max_seq=max(args.seq_lens + [args.ref_seq]))
+    lay = DSALayer(seq_len=args.ref_seq, context_len=args.context_len)
     tiny = torch.randn(1, device=DEV)
     x16 = torch.zeros(1, QB_OUT, device=DEV, dtype=BF)
     qi, qs = torch.ops.npu.npu_dynamic_quant(x16)
@@ -844,7 +950,7 @@ def sec_family(args):
     share = {}
     try:
         lays = [
-            DSALayer(seq_len=args.ref_seq, max_seq=max(args.seq_lens + [args.ref_seq]),
+            DSALayer(seq_len=args.ref_seq, context_len=args.context_len,
                      share=share, seed=i)
             for i in range(n)
         ]
@@ -872,7 +978,14 @@ def sec_family(args):
         f"{DSA_LAYERS} layers = {scaled/1000:.3f} ms   target {REF_STEP_MS:.3f} ms "
         f"({100*(scaled/1000/REF_STEP_MS-1):+.1f}%)"
     )
-    contention_warning(agg, REF)
+    # No contention check here.  This section pools N *different* layers into one
+    # distribution per operator, so its p90/p50 measures the spread between
+    # layers -- which is real -- and not interference.  Measured on a verifiably
+    # idle die (2877 MiB, 0% AI core): it reported 1.26x and "THIS DIE IS
+    # SHARED".  The test is only valid where every sample is the same work,
+    # which is the `layer` section.
+    print("  (no die-sharing check here: see the `layer` section -- pooling "
+          "distinct layers\n   makes the dispersion test meaningless)")
 
 
 SECTIONS = {
@@ -889,12 +1002,19 @@ def main():
     )
     ap.add_argument("--sections", default="layer,sweep,refs")
     ap.add_argument("--seq-lens", default="128,512,1024,4096,32768,131072,1048576")
-    ap.add_argument("--ref-seq", type=int, default=512,
-                    help="length the `layer` and `refs` sections use.  The default "
-                         "matches the workload config I was profiled on -- a "
-                         "13-token prompt with up to 600 decoded tokens "
-                         "(tools/profile_server_decode.py --prompt-tokens 13). "
-                         "The reference DSA numbers are SHORT CONTEXT numbers.")
+    ap.add_argument("--context-len", type=int, default=32768,
+                    help="served --context-length.  Sets the block table width "
+                         "(context_len/64 entries), which is part of the recorded "
+                         "input shape of SparseFlashAttention, LightningIndexer "
+                         "and Index.  Config I ran 32768 -> a [1,512] table.")
+    ap.add_argument("--ref-seq", type=int, default=256,
+                    help="length the `layer` and `refs` sections use.  Config I "
+                         "was profiled on a 13-token prompt (see "
+                         "tools/profile_server_decode.py --prompt-tokens 13); its "
+                         "SparseFlashAttention median of 32.08 us sits between "
+                         "this bench's n=128 and n=256, so 256 is the aligned "
+                         "point.  The reference DSA numbers are SHORT CONTEXT "
+                         "numbers.")
     ap.add_argument("--reps", type=int, default=30)
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--top", type=int, default=22,

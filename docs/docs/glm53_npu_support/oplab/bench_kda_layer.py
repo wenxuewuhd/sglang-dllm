@@ -313,6 +313,10 @@ def capture(fn, warmup=10):
 #: session.  It must be a shape nothing else in the benchmark uses.
 MARKER_NUMEL = 1357
 
+#: only kernels at least this long take part in the dispersion test; below it
+#: the p90/p50 ratio measures the timer, not the die.
+DISPERSION_FLOOR_US = 5.0
+
 
 def profile(cases, nrep=30, tag="p"):
     """Profile each (label, callable) in one session; return kernel rows per case.
@@ -331,10 +335,15 @@ def profile(cases, nrep=30, tag="p"):
     for _, fn in cases:
         fn(5)
     torch.npu.synchronize()
+    # With one case there is nothing to split, and the marker would show up in
+    # the raw kernel_details.csv that regress_against_network.py reads -- as an
+    # op group the network does not have.  Single-case profiles stay clean.
+    use_marker = len(cases) > 1
     mk = torch.zeros(MARKER_NUMEL, device=DEV)
 
     def mark():
-        mk.add_(1.0)
+        if use_marker:
+            mk.add_(1.0)
 
     mark()
     torch.npu.synchronize()
@@ -376,13 +385,20 @@ def profile(cases, nrep=30, tag="p"):
     rows.sort(key=lambda r: float(r["Start Time(us)"].strip()))
 
     tag_m = str(MARKER_NUMEL)
+    if not use_marker:
+        return [(labels[0], rows)], walls
     cuts = [i for i, r in enumerate(rows) if tag_m in r["Input Shapes"]]
     if len(cuts) != len(cases) + 1:
         raise SystemExit(
             f"marker kernel appeared {len(cuts)} times, expected {len(cases)+1}. "
             "Case attribution would be wrong, so refusing to report numbers."
         )
-    blocks = [rows[cuts[i] + 1 : cuts[i + 1]] for i in range(len(cases))]
+    # Drop the markers themselves: they are measurement scaffolding, not part of
+    # the layer, and leaving them in puts an `Add "1357;"` row in every inventory.
+    blocks = [
+        [r for r in rows[cuts[i] + 1 : cuts[i + 1]] if tag_m not in r["Input Shapes"]]
+        for i in range(len(cases))
+    ]
     return list(zip(labels, blocks)), walls
 
 
@@ -425,49 +441,72 @@ def tabulate(rows, nrep, per_layer_ref=None, layers=KDA_LAYERS):
 
 
 def contention_warning(agg, refs):
-    """Refuse to let a shared die be read as an operator result.
+    """Two different failures, two different messages.  They are not the same thing.
 
-    Two independent tests, because on this machine they fail at different times:
+    * **dispersion** (p90/p50) over the reference shapes -> the die is SHARED.
+      Interference is bursty, so it shows up in the tail first.  This is the
+      test that actually detects a co-tenant.
+    * **median** off against a fixed shape, with the tail clean -> the die is
+      fine and something about the RUN does not match the reference: the
+      sequence length, the context length, the pool size, a dtype.
 
-      * **median** against a fixed, bandwidth-bound shape whose cost is known.
-        Catches a die that is busy for the whole run.
-      * **dispersion** (p90/p50) over every reference shape.  Catches a die that
-        is busy in bursts -- which is the common case, and which the median can
-        miss entirely.  Measured live on 2026-08-31: a DSA layer came out 79.5%
-        over target while its biggest GEMM's median was only 1.12x, because the
-        damage was all in the tail (p50 71 us, p90 223 us).
-
-    The project's own most important piece of evidence was a distribution shape,
-    not a mean.  This is the same lesson, wired into the harness.
+    Getting this backwards costs real time.  An earlier version of this harness
+    led with the median, and on a verifiably idle die (3136 MiB used, no other
+    process) it printed "THIS DIE IS SHARED" because `--ref-seq` was 512 instead
+    of the aligned 256 -- IndexPutV2's median was 1.62x while its dispersion was
+    1.01x, i.e. perfectly clean.  The README's own rule ("interference lives in
+    the tail; a median alone will miss it") applies in both directions.
     """
     hits = []
     for key, v in agg.items():
-        # `refs` keys some operators by (Type, shapes) and some by name alone.
         ref = refs.get(key) or refs.get((key[0], None))
         if not ref or not v:
             continue
         v = sorted(v)
         p50 = statistics.median(v)
         p90 = v[min(len(v) - 1, int(len(v) * 0.9))]
-        hits.append((key, p50 / ref, p90 / p50 if p50 else 1.0))
+        hits.append((key, p50 / ref, p90 / p50 if p50 else 1.0, p50))
     if not hits:
         return
     worst_ratio = max(h[1] for h in hits)
-    worst_spread = max(h[2] for h in hits)
-    if worst_ratio <= 1.25 and worst_spread <= 1.25:
-        return
-    print(
-        f"\n  !! THIS DIE IS SHARED -- do not report these numbers as operator costs.\n"
-        f"     worst median vs config I : {worst_ratio:.2f}x   (clean die: <= 1.15x)\n"
-        f"     worst p90/p50 dispersion : {worst_spread:.2f}x   (clean die: <= 1.10x)"
-    )
-    for key, r, sp in sorted(hits, key=lambda h: -max(h[1], h[2]))[:4]:
-        print(f"       {key[0][:24]:<24} {str(key[1])[:26]:<26} p50/ref {r:5.2f}x  p90/p50 {sp:5.2f}x")
-    print(
-        "     Run `npu-smi info`.  A busy die inflates everything by roughly 1.7x,\n"
-        "     which lands inside the '20% is fine / 2x means wrong shape' gap and is\n"
-        "     exactly the kind of number that gets mistaken for a real regression."
-    )
+    # Dispersion is only meaningful above the timer's own granularity.  A 1.3 us
+    # kernel with 0.4 us of jitter reads as p90/p50 = 1.30 on a verifiably idle
+    # die -- measured, in the `family` section, where it false-fired.  Judge
+    # sharing on kernels big enough for the ratio to mean something.
+    big = [h for h in hits if h[3] >= DISPERSION_FLOOR_US]
+    worst_spread = max((h[2] for h in big), default=1.0)
+
+    def show(n=4):
+        for key, r, sp, _p in sorted(hits, key=lambda h: -max(h[1], h[2]))[:n]:
+            print(f"       {key[0][:24]:<24} {str(key[1])[:26]:<26} "
+                  f"p50/ref {r:5.2f}x  p90/p50 {sp:5.2f}x")
+
+    if worst_spread > 1.25:
+        print(
+            f"\n  !! THIS DIE IS SHARED -- do not report these as operator costs.\n"
+            f"     worst p90/p50 dispersion : {worst_spread:.2f}x   (over kernels >= "
+            f"{DISPERSION_FLOOR_US:.0f} us; clean die: <= 1.10x)\n"
+            f"     worst median vs config I : {worst_ratio:.2f}x"
+        )
+        show()
+        print(
+            "     Run `npu-smi info`.  A busy die inflates everything by roughly 1.7x,\n"
+            "     which lands inside the '20% is fine / 2x means wrong shape' gap."
+        )
+    elif worst_ratio > 1.25:
+        print(
+            f"\n  ?  MEDIAN OFF BUT TAIL CLEAN -- this is most likely a PARAMETER\n"
+            f"     mismatch, not a busy die.\n"
+            f"     worst median vs config I : {worst_ratio:.2f}x\n"
+            f"     worst p90/p50 dispersion : {worst_spread:.2f}x   (clean -- nobody else\n"
+            f"                                 is on this die)"
+        )
+        show()
+        print(
+            "     Check --ref-seq (config I is ~256), --context-len (32768), and that\n"
+            "     the INT8 weights really are NZ.  Only the dispersion test detects a\n"
+            "     co-tenant; a median on its own cannot tell the two apart."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -586,7 +625,9 @@ def sec_family(args):
         "  Compare against the `layer` section's x34.  If this one is closer to\n"
         "  the served number, the difference is cache residency, not the operators."
     )
-    contention_warning(agg, REF)
+    # See bench_dsa_layer.py sec_family: the dispersion test is not valid when
+    # the samples are distinct layers rather than repeats of the same work.
+    print("  (no die-sharing check here: see the `layer` section)")
 
 
 def sec_slots(args):
