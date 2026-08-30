@@ -1640,6 +1640,40 @@ KDA 投影**（§7.1）。量化它就是推翻模型作者的决定，而本部
 
 ---
 
+## 8b. 交给算子团队的两个用例 —— `../oplab/`
+
+⚠ **这个目录的 commit 历史是误导的**：文件被 `git add -A docs/` 扫进了
+`2935e4aee9`（那条 commit 讲的是 `index_kpool`），后续修改在 `6a0dcf7151`。
+`git log -- oplab/` 看不出它是什么。**和 §7b.2 是同一类**（commit message 说的不是它做的事），
+所以在这里交代。
+
+`bench_kda_layer.py` / `bench_dsa_layer.py`：把一个 KDA 层和一个 DSA 层实际发的 kernel
+**捕获成 NPU 图后 replay**，用本部署的真实 shape，并扫序列长度。
+**独立可跑** —— 只要 torch / torch_npu / sgl_kernel_npu 加 PYTHONPATH 上的两个 Triton kernel，
+**不起服务、不加载 checkpoint、不 import 模型代码**。两个合起来覆盖整步 31.274 ms 里
+这两个家族占的 **15.8 ms**。
+
+**回归判据是算子清单，不是总时间** —— `regress_against_network.py` 拿
+`reference_inventory_cfgI.json`（用 `attribute_kernels.py` 自己的 `family_of`/`split_of`
+抽的，**同一套归属、逐字相同的分组键**）逐组比 shape 和每层次数。
+理由：**一个算子搞错的复现可以碰巧落在正确的总时间上，而一个漏掉算子的复现只会显得更快。**
+
+本 session 在空闲 die 上独立复核过：
+
+| | 组数 | 次数 | 单层 | ×层数 | 对整网 |
+|---|---|---|---|---|---|
+| KDA | 8/8，shape 逐字一致 | 全对 | 288.2 µs | 9.797 ms | −5.4% |
+| DSA | 59/60（缺 `Cast "1,1,1"`，1.3 µs） | 全对 | 457.2 µs | 5.029 ms | −2.0% |
+
+⚠ **DSA 还有 6 组「用例发、整网 profile 里没有」的标量下标算子**（clamp / 取模 / 相等 / 相减，
+约 23 µs/层）。**它们在源码里，但整网的计数容不下** ——
+要让它们消失只能把用例写得和源码不一样，**那就是凑数**。已在 `oplab/README.md` §5.2 逐条列出，
+并留了下一个人该查的方向（profile 的代码版本，或 GE 图融合是否折掉了这几类标量算子）。
+
+⚠ **构建过程改了本报告三处**：`index_kpool` 是 4 不是 64（§7b.16）、
+层族归属低了 303 µs（§8.2）、DSA 的绝对值是「约 210 token 上下文」的数字（§8.2）。
+**这三处都是「为了让别人能复现而重建一遍」逼出来的，不是复核报告本身逼出来的。**
+
 ## 9. 复现
 
 ```bash
