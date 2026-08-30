@@ -89,13 +89,24 @@ def apply_swiglu_limit_(hidden_states: torch.Tensor, limit: Optional[float]) -> 
     Doing it here, before the fused swiglu op, keeps the fusion intact: the kernel then
     computes silu(clamped_gate) * clamped_up, which is exactly the reference.
 
-    A fused alternative exists but only for an int8 output.
-    ``custom::npu_dequant_swiglu_clamp_quant`` does honour ``clamp_limit``, but only at
-    ``swiglu_mode=1``; at the default mode 0 it ignores it, which is what an earlier check
-    here measured. At mode 1 with ``glu_alpha=1.0, glu_bias=0.0, activate_left=True`` it
-    reproduces the reference exactly, so the int8 path can drop this pre-clamp and call it
-    directly. Its ``dst_type`` is ignored and the output is always int8, so the bf16 path
-    still needs the clamp here.
+    ⚠ There is no fused alternative on this build, and the operator that looks like one
+    is a trap. ``custom::npu_dequant_swiglu_clamp_quant`` **does not clamp at all**:
+    measured 2026-08-30 on A3 at [8, 4096] and [128, 4096] bf16 with an input scaled 48x
+    so the limit actually bites, its int8 output is *bit-identical to not clamping*
+    (0 of 16384 elements differ) and ``swiglu_mode`` 0, 1, 2 and 3 all produce the same
+    result. ``clamp_limit`` and ``swiglu_mode`` are silently ignored.
+
+    This docstring previously said the opposite -- that mode 1 reproduces the reference
+    exactly, so the int8 path could drop the pre-clamp and call it directly. Following
+    that would have silently removed the swiglu clamp from every routed expert, which is
+    part of the model definition (``KT_DISABLE_SWIGLU_CLAMP`` exists so that removing it
+    is at least explicit). The earlier reading appears to have measured that mode 0
+    ignores ``clamp_limit`` and inferred that mode 1 therefore honours it.
+
+    The reason it passes a casual check: with real activations the clamp never fires
+    (max|gate_up| is about 2.17 against a limit of 10), so the fused op and the reference
+    agree bit for bit until you scale the input up. Any future check of this operator has
+    to force the clamp to trigger, the way ``check_dense_ffn.py --scale-input 48`` does.
 
     ``custom::npu_swiglu_clip_quant`` is not an input clamp at all: it computes plain
     silu*up and then clips the *output* to +/- ``group_alpha`` x rowmax(|y|), i.e. a

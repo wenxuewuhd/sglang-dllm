@@ -1228,7 +1228,9 @@ class DeepseekV2MoE(nn.Module):
             and not _use_aiter
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
         ):
-            # fused in biased_grouped_topk so we can skip here
+            # Platforms whose top-k does not fold routed_scaling_factor in apply it
+            # here. (The comment that used to sit on this line claimed the factor was
+            # already fused in biased_grouped_topk -- on the branch that applies it.)
             final_hidden_states *= self.routed_scaling_factor
 
         if (
