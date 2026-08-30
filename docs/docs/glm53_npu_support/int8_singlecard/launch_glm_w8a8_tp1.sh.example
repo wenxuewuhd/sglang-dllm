@@ -37,6 +37,19 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 export INF_NAN_MODE_FORCE_DISABLE=1
 export TASK_QUEUE_ENABLE=${TQE:-1}
+
+# Keep the KDA conv state in fp32 so it matches the conv *weights*, which GLM
+# pins to fp32 (glm5_next.py: params_dtype=torch.float32).  When the two dtypes
+# differ, _causal_conv1d_decode cannot use its fast path and instead gathers the
+# state into a compact fp32 working set, converts both ways, and scatters it
+# back -- 7 extra kernels per KDA layer per decode step.
+# Measured on one A3 die, bs=1, graph on: 39.741 -> 38.727 ms/step of device
+# time (-2.5%), 3556 -> 3352 kernel launches, wall clock 39.8 -> 38.6 ms/token.
+# Accuracy is *unchanged*, not improved: the conv window holds a copy of the
+# bf16 projection output, so the bf16 round trip was already exact (measured:
+# max|t - bf16(t)| == 0.0, and 18/18 check_kda tensors bit-identical).
+# Costs conv state memory: 0.08 -> 0.16 GB at 16 slots.
+export SGLANG_MAMBA_CONV_DTYPE=${CONV_DTYPE:-float32}
 export SGLANG_SET_CPU_AFFINITY=1
 
 export SGLANG_OPT_DEEPGEMM_HC_PRENORM=False

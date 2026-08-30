@@ -390,21 +390,38 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         # set as _causal_conv1d_extend; the window itself is copied, not
         # computed, so the round trip is exact.
         if state.dtype == layer.conv_weights.dtype:
+            # Clamp here too, for the same reason the branch below does it, and
+            # NOT because `causal_conv1d_update_npu` takes a `pad_slot_id`: on
+            # this path it never looks at one. With neither `cache_seqlens` nor
+            # `num_accepted_tokens` set -- which is our case -- it falls through
+            # to plain advanced indexing, `conv_state[conv_state_indices]`, and
+            # `torch_causal_conv1d_update_npu` has no pad argument at all
+            # (sgl_kernel_npu/mamba/causal_conv1d.py, PAD_SLOT_ID = -1).
+            #
+            # So a padded cuda-graph replay's -1 rows would not be skipped; they
+            # would index *backwards* to the last mamba slot, which the allocator
+            # hands out to real requests (it reserves slot 0, not the last one).
+            # That is a silent write into a live request's conv state, not an
+            # error -- and only when a padded batch happens to coexist with a
+            # request holding the top slot, which continuous batching makes
+            # reachable but not reproducible on demand.
             return causal_conv1d_update_npu(
                 x,
                 state,
                 layer.conv_weights,
                 layer.bias,
                 activation="silu",
-                conv_state_indices=cache_indices,
+                conv_state_indices=torch.clamp(cache_indices, min=0),
             )
         # A padded cuda-graph replay carries PAD_SLOT_ID (-1) in the tail rows of
         # cache_indices (hybrid_linear_attn_backend.py `_replay_metadata`, which
         # the decode runner always reaches because it passes an explicit
-        # num_padding). The branch above is safe -- `causal_conv1d_update_npu`
-        # takes pad_slot_id and skips those rows itself -- but index_select /
-        # index_copy_ do not accept negative indices, and on Ascend they do not
-        # raise: they trap the AI core (507011 aivec error). Send the padded rows
+        # num_padding). Neither branch may see one, for two different reasons: the branch
+        # above would wrap -1 to the last mamba slot and silently corrupt it (its
+        # own comment says why `causal_conv1d_update_npu`'s pad_slot_id does not
+        # save us there), and index_select / index_copy_ here do not accept
+        # negative indices at all -- on Ascend they do not raise, they trap the AI
+        # core (507011 aivec error). Send the padded rows
         # to mamba slot 0, which MambaSlotAllocator reserves for exactly this
         # (mem_cache/allocator/mamba.py: free_slots = arange(1, size + 1), "Slot 0
         # is reserved as a dummy write target for padded tokens"). Several padded
