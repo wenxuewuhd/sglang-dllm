@@ -385,20 +385,29 @@ class RankRunner:
             return qlen
         return max(1, qlen - (slot + 1) * 64 % max(qlen // 2, 1))
 
-    def _pack(self, hidden: torch.Tensor, start: int, qlen: int):
+    def _slot_rows(self, hidden: torch.Tensor, start: int, n: int, slot: int):
+        """The `n` rows slot `slot` sees at `start`, independent of the batch.
+
+        Split out of `_pack` so a solo replay can reproduce exactly one slot's
+        token stream: the batch-independence check needs a request's own rows
+        without its batch-mates.
+        """
+        if slot == self.golden_slot:
+            return hidden[start : start + n]
+        # Different data for every other slot: if the backend mixed two
+        # requests' states, the scored slot's output would move.
+        shift = (slot + 1) * self.DECOY_SHIFT
+        idx = (torch.arange(start, start + n) + shift) % hidden.shape[0]
+        return hidden[idx]
+
+    def _pack(self, hidden: torch.Tensor, start: int, qlen: int, slots=None):
         """Packed rows for the whole batch, plus (offset, len) of the scored one."""
+        slots = range(self.batch) if slots is None else slots
         chunks, lens = [], []
-        for slot in range(self.batch):
+        for slot in slots:
             n = self._decoy_len(slot, qlen)
             lens.append(n)
-            if slot == self.golden_slot:
-                chunks.append(hidden[start : start + n])
-            else:
-                # Different data for every other slot: if the backend mixed two
-                # requests' states, the scored slot's output would move.
-                shift = (slot + 1) * self.DECOY_SHIFT
-                idx = (torch.arange(start, start + n) + shift) % hidden.shape[0]
-                chunks.append(hidden[idx])
+            chunks.append(self._slot_rows(hidden, start, n, slot))
         offset = sum(lens[: self.golden_slot])
         return torch.cat(chunks, dim=0), lens, offset
 
@@ -449,11 +458,172 @@ class RankRunner:
             seen = [s + 1 for s in seen]
         return torch.stack(outs, dim=0)
 
-    def states(self):
+    def states(self, slot: int = None):
+        """Conv/SSM state for one slot, or a list over every slot.
+
+        ⚠ The default is still `golden_slot` alone, which is what the golden
+        `.pt` cases carry -- but scoring one slot is why a real state-writeback
+        bug passed 6/6 green (see `check_state_independence`). Pass `slot=-1`
+        for every slot when you have something to compare them against.
+        """
         cache = self.runner.req_to_token_pool.mamba2_layer_cache(0)
-        conv = cache.conv[0][self.golden_slot].float().cpu()
-        ssm = cache.temporal[self.golden_slot].float().cpu()
-        return conv, ssm
+        pick = range(self.batch) if slot == -1 else [self.golden_slot if slot is None else slot]
+        conv = [cache.conv[0][i].float().cpu() for i in pick]
+        ssm = [cache.temporal[i].float().cpu() for i in pick]
+        return (conv, ssm) if slot == -1 else (conv[0], ssm[0])
+
+    def zero_states(self):
+        """Clear every slot's state, so a solo replay starts where the batch did."""
+        cache = self.runner.req_to_token_pool.mamba2_layer_cache(0)
+        cache.conv[0].zero_()
+        cache.temporal.zero_()
+
+# ------------------------------------------------- batch-independence check
+
+
+def _extend_once(rr, hidden, start, qlen, seen, slots):
+    """One EXTEND over `slots`, each continuing from its own `seen`."""
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    rows, lens, _ = rr._pack(hidden, start, qlen, slots=slots)
+    fb = make_forward_batch(
+        mode=ForwardMode.EXTEND,
+        runner=rr.runner,
+        seq_lens=[seen[i] + n for i, n in zip(slots, lens)],
+        input_lens=lens,
+        max_context_len=rr.max_context_len,
+        page_size=rr.page_size,
+    )
+    rr.backend.init_forward_metadata(fb)
+    rr._core(fb, rows, is_decode=False)
+    return lens
+
+
+def _run_config(rr, hidden, chunk: int, warm: int, solo_cache: dict):
+    """Prefill a batch whose first `warm` slots carry a prefix, then score every
+    slot's cached state against replaying that slot alone.
+
+    `warm == 0` and `warm == batch` are the uniform configurations. They are not
+    trivial: a solo replay is a different batch shape, so bf16 reduction order
+    differs and the difference has a floor above zero. That floor is what the
+    mixed configuration has to be judged against.
+    """
+    batch = rr.batch
+    warm_slots = list(range(warm))
+
+    seen = [0] * batch
+    rr.zero_states()
+    if warm_slots:
+        lens = _extend_once(rr, hidden, 0, chunk, seen, warm_slots)
+        for slot, n in zip(warm_slots, lens):
+            seen[slot] = n
+    _extend_once(rr, hidden, chunk, chunk, seen, list(range(batch)))
+    conv_b, ssm_b = rr.states(slot=-1)
+
+    out = []
+    for slot in range(batch):
+        is_warm = slot < warm
+        key = (slot, is_warm)
+        if key not in solo_cache:
+            # `make_forward_batch` always uses req indices `arange(bs)`, so a
+            # solo run lands in slot 0. It is the same request either way, which
+            # is exactly what is being tested.
+            rr.zero_states()
+            solo_seen = [0] * batch
+            if is_warm:
+                solo_seen[slot] = _extend_once(rr, hidden, 0, chunk, solo_seen, [slot])[0]
+            _extend_once(rr, hidden, chunk, chunk, solo_seen, [slot])
+            solo_cache[key] = rr.states(slot=0)
+        conv_s, ssm_s = solo_cache[key]
+        out.append((
+            (conv_b[slot] - conv_s).abs().max().item(),
+            (ssm_b[slot] - ssm_s).abs().max().item(),
+            conv_b[slot].abs().max().item(),
+        ))
+    return out
+
+
+def check_state_independence(rr, hidden, chunk: int, warm: int, slack: float = 2.0):
+    """A request's state must depend only on its own tokens, not its batch-mates.
+
+    This exists because the layer check scored **one** slot (`golden_slot`), so a
+    state-writeback bug in the *other* slots passed 6/6 green -- outputs stayed
+    correct, only the cached state was wrong. Scoring one slot cannot see that,
+    and neither can a bit-identical logprob comparison: both look at what is
+    *read*, and this class of bug corrupts what is *written*.
+
+    It also builds a shape the harness could not previously reach. `prefill`
+    starts every slot at `seen = 0` and advances them together, so within a chunk
+    `has_initial_state` was uniform -- all False on chunk 0, all True after. The
+    mixed shape is ordinary production traffic (a prefix-cache hit and a cold
+    request in the same batch) and it is where `causal_conv1d_fn_npu` was
+    measured corrupting the writeback, so the harness has to be able to make it.
+
+    ⚠ The criterion is a **measured floor, not zero**. A solo replay is a
+    different batch shape, so bf16 reduction order differs; the SSM state sits
+    around 1e-5 apart even where nothing is wrong. The floor is measured from the
+    two uniform configurations and **pooled across every slot** -- judging a slot
+    against its own single uniform sample flagged a clean slot whose SSM
+    difference was 2.4x its own draw but well under another slot's.
+    """
+    batch = rr.batch
+    if not 0 < warm < batch:
+        raise ValueError(f"need both warm and cold slots (warm={warm}, batch={batch})")
+
+    solo: dict = {}
+    print(f"  batch={batch} warm={list(range(warm))} chunk={chunk} -- floors first")
+    floor_cold = _run_config(rr, hidden, chunk, 0, solo)
+    floor_warm = _run_config(rr, hidden, chunk, batch, solo)
+    mixed = _run_config(rr, hidden, chunk, warm, solo)
+
+    # Keep the mixed batch's own states so a failure can say *whose* state a
+    # contaminated slot got, not just that it is wrong.
+    conv_mixed, _ = rr.states(slot=-1)
+
+    # ⚠ The floor is pooled over every slot in both uniform runs, not taken
+    # per-slot. A single uniform sample is one draw of a noisy quantity -- the
+    # SSM difference ranges over 1.1e-05..5.8e-05 across slots with nothing
+    # wrong -- and two times one draw is not a bound. Pooling cost nothing here:
+    # the conv floor is exactly zero and the violation is order 1.
+    floor = [max(f[i] for f in floor_cold + floor_warm) for i in (0, 1)]
+    lim = [max(floor[i] * slack, 1e-9) for i in (0, 1)]
+    print(f"  pooled floor over {2 * batch} uniform-batch slots: "
+          f"conv {floor[0]:.2e} ssm {floor[1]:.2e}  "
+          f"(limit {slack}x: {lim[0]:.2e} / {lim[1]:.2e})")
+    print("  slot  initial   conv err   ssm err   |conv|")
+    bad = []
+    for slot in range(batch):
+        is_warm = slot < warm
+        mx = mixed[slot]
+        over = [mx[i] > lim[i] for i in (0, 1)]
+        flag = "   <-- CONTAMINATED" if any(over) else ""
+        if any(over):
+            bad.append(slot)
+        print(f"  {slot:>4}  {str(is_warm):>7}  {mx[0]:9.3e} {mx[1]:9.3e}  "
+              f"{mx[2]:6.3f}{flag}")
+
+    gs = rr.golden_slot
+    print(f"\n  the old check scored slot {gs} only "
+          f"({'warm' if gs < warm else 'cold'}): conv err {mixed[gs][0]:.3e}")
+    print(f"  {batch - len(bad)}/{batch} slots within {slack}x the pooled uniform-batch floor")
+    if bad:
+        print(f"  contaminated: {bad}  "
+              f"(all {'cold' if all(b >= warm for b in bad) else 'mixed'})")
+        # Whose state did it get? If a contaminated slot's conv state matches
+        # another slot's solo state, the bug is an indexing one and this names
+        # the offset; if nothing matches, the state is not merely misrouted.
+        print("  what a contaminated slot got instead:")
+        for slot in bad:
+            best, best_err = None, float("inf")
+            for (other, other_warm), (conv_s, _) in solo.items():
+                e = (conv_mixed[slot] - conv_s).abs().max().item()
+                if e < best_err:
+                    best, best_err = (other, other_warm), e
+            near = f"slot {best[0]} ({'warm' if best[1] else 'cold'})"
+            verdict = "MATCHES" if best_err <= 1e-6 else "closest, but no match"
+            print(f"    slot {slot}: {verdict} {near}, err {best_err:.3e}")
+    return 1 if bad else 0
+
 
 # ------------------------------------------------------------------ bench
 
@@ -718,6 +888,16 @@ def main() -> int:
     ap.add_argument("--prefill-chunk", type=int, default=8192)
     ap.add_argument("--page-size", type=int, default=64)
     ap.add_argument(
+        "--check-mixed-state",
+        type=int,
+        default=0,
+        metavar="WARM",
+        help="score every slot's cached state against a solo replay, in a batch "
+        "where the first WARM slots have a prefix and the rest are cold. The "
+        "normal run scores one slot, which cannot see a state-writeback bug in "
+        "the others; and it never builds a mixed has_initial_state batch at all",
+    )
+    ap.add_argument(
         "--bench",
         action="store_true",
         help="time the layer at the deployment shape instead of scoring it",
@@ -778,6 +958,46 @@ def main() -> int:
 
     if args.bench:
         return run_bench(args, weights_full=full, meta=meta)
+
+    if args.check_mixed_state:
+        if args.ranks == "all":
+            # Every rank writes its own state; one is enough to see contamination
+            # and keeps this runnable on a single die.
+            ranks = [0]
+        rc = 0
+        for rank in ranks:
+            w = ShardedKDAWeights(full, rank=rank, tp=args.tp)
+            runner, backend = build_backend(
+                tp=args.tp,
+                batch=args.batch,
+                max_context_len=max_context_len,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                conv_kernel=conv_kernel,
+                page_size=args.page_size,
+            )
+            layer = make_layer(w, lower_bound)
+            o_norm = FusedRMSNormGated(
+                head_dim, eps=float(meta["rms_norm_eps"]), activation="sigmoid"
+            ).to(DEV)
+            o_norm.weight.data.copy_(w.o_norm_weight)
+            rr = RankRunner(
+                weights=w, backend=backend, layer=layer, o_norm=o_norm,
+                tp=args.tp, batch=args.batch, golden_slot=args.golden_slot,
+                page_size=args.page_size, max_context_len=max_context_len,
+                runner=runner,
+            )
+            # Two chunks have to fit: the warm slots' prefix, then the mixed
+            # extend. `_decoy_len` also shortens the other slots inside each.
+            chunk = min(args.prefill_chunk, prefill_len // 2)
+            print(f"rank {rank}: batch-independence of the cached state")
+            rc |= check_state_independence(
+                rr, hidden, chunk, args.check_mixed_state
+            )
+            del runner, backend, rr
+            torch.npu.empty_cache()
+        print("PASS" if rc == 0 else "FAIL: a slot's state depends on its batch-mates")
+        return rc
 
     hidden_size = full["q_proj.weight"].shape[1]
     partial_prefill = torch.zeros(prefill_len, hidden_size, dtype=torch.float64)
