@@ -1,0 +1,145 @@
+=== decode step: 31.274 ms of device time, 2400 kernel launches ===
+
+family            ms/step      %  kernels/step  us/kernel
+---------------------------------------------------------
+KDA                10.357  33.1%           272       38.1
+MoE                 9.628  30.8%           504       19.1
+DSA                 5.143  16.4%           891        5.8
+mHC                 3.341  10.7%           180       18.6
+unclassified        0.968   3.1%           383        2.5
+head                0.924   3.0%             1      923.5
+dense FFN           0.539   1.7%            54        9.9
+head/global         0.225   0.7%            24        9.3
+mHC/per-layer       0.149   0.5%            90        1.7
+---------------------------------------------------------
+TOTAL              31.274 100.0%          2400       13.0
+
+--- KDA ---
+    5877.2 us/step  n=   34    172.9 us  MatMulV2                 AI_CORE    "1,4096;24896,4096"
+    2034.1 us/step  n=   34     59.8 us  MatMulV2                 AI_CORE    "1,8192;4096,8192"
+    1191.3 us/step  n=   34     35.0 us  fused_sigmoid_gating_del AI_VECTOR_ N/A
+     519.8 us/step  n=   34     15.3 us  causal_conv1d_4          MIX_AIV    N/A
+     416.2 us/step  n=   34     12.2 us  BatchMatMulV2            AI_CORE    "2,1,128;2,8192,128"
+     146.1 us/step  n=   34      4.3 us  ClipByValueV2            AI_VECTOR_ "1;;"
+     121.6 us/step  n=   34      3.6 us  layer_norm_gated_fwd_ker AI_VECTOR_ N/A
+      50.7 us/step  n=   34      1.5 us  Cast                     AI_VECTOR_ "2"
+
+--- MoE ---
+    4799.4 us/step  n=   42    114.3 us  GroupedMatmul            MIX_AIC    "9,4096;17,4096,4096;;17,4096;;;;17;9"
+    2611.4 us/step  n=   42     62.2 us  GroupedMatmul            MIX_AIC    "9,2048;17,2048,4096;;17,4096;;;;17;9"
+     572.5 us/step  n=   42     13.6 us  MoeInitRoutingV3         MIX_AIV    "1,4096;1,9"
+     335.9 us/step  n=   42      8.0 us  MatMulV2                 AI_CORE    "1,4096;16,4096"
+     313.4 us/step  n=   42      7.5 us  ClipByValueV2            AI_VECTOR_ "9,4096;4096;4096"
+     263.4 us/step  n=   42      6.3 us  MoeFinalizeRoutingV2     AI_VECTOR_ "9,4096;9;1,9;1,9"
+     262.1 us/step  n=   42      6.2 us  DequantSwigluQuant       AI_VECTOR_ "9,4096;;;;;;"
+     186.6 us/step  n=   42      4.4 us  MoeGatingTopK            AI_VECTOR_ "1,16;16"
+     151.8 us/step  n=   84      1.8 us  ConcatD                  AI_VECTOR_ "1,8;1,1"
+      73.0 us/step  n=   42      1.7 us  Muls                     AI_VECTOR_ "1,4096"
+      58.8 us/step  n=   42      1.4 us  Cast                     AI_VECTOR_ "1,9"
+
+--- DSA ---
+     693.6 us/step  n=   11     63.1 us  QuantBatchMatmulV3       MIX_AIC    "1,16384;128,1024,16,32;4096;1"
+     357.4 us/step  n=   11     32.5 us  SparseFlashAttention     MIX_AIC    "1,64,512;19479,64,1,512;19479,64,1,512;1,1,2051;1,5
+     303.9 us/step  n=   11     27.6 us  QuantBatchMatmulV3       MIX_AIC    "1,1536;512,96,16,32;16384;1"
+     300.0 us/step  n=   11     27.3 us  BatchMatMulV2            AI_CORE    "64,1,256;64,512,256"
+     265.7 us/step  n=   22     12.1 us  MatMulV2                 AI_CORE    "1,4096;128,4096"
+     220.1 us/step  n=   11     20.0 us  MatMulV2                 AI_CORE    "1,1536;4096,1536"
+     218.2 us/step  n=   11     19.8 us  batch_matmul_transpose_0 AI_CORE    N/A
+     206.8 us/step  n=   11     18.8 us  QuantBatchMatmulV3       MIX_AIC    "1,4096;64,256,16,32;2048;1"
+     204.9 us/step  n=   11     18.6 us  LightningIndexer         MIX_AIC    "1,32,128;19480,64,1,128;1,32;1;1;1,128"
+     186.0 us/step  n=   22      8.5 us  ReduceSum                MIX_AIV    "1,4,128;1"
+     105.4 us/step  n=   11      9.6 us  Add                      AI_VECTOR_ "1,512,1;4"
+     103.5 us/step  n=   22      4.7 us  ScatterNdUpdate          MIX_AIV    "76,1,128;1,1;1,1,128"
+      90.7 us/step  n=   11      8.2 us  IndexPutV2               AI_VECTOR_ "1246656,1,512;1,1,512;1;1;1"
+      88.5 us/step  n=   11      8.0 us  Index                    AI_VECTOR_ "1,512;2;1;1;1"
+      87.5 us/step  n=   11      8.0 us  MatMulV2                 AI_CORE    "1,4096;32,4096"
+      80.6 us/step  n=   11      7.3 us  BroadcastTo              AI_VECTOR_ "1,512,1;3"
+      78.3 us/step  n=   55      1.4 us  LogicalAnd               AI_VECTOR_ "1;1"
+      72.0 us/step  n=   11      6.5 us  MatMulV2                 AI_CORE    "32,128;128,128"
+      71.2 us/step  n=   55      1.3 us  Cast                     AI_VECTOR_ "1,128"
+      70.8 us/step  n=   22      3.2 us  GatherV3                 AI_VECTOR_ "76,128;4;1"
+      67.8 us/step  n=   11      6.2 us  ScatterNdUpdate          MIX_AIV    "1246720,1,128;1,1;1,1,128"
+      66.0 us/step  n=   22      3.0 us  GreaterEqual             AI_VECTOR_ "1;"
+      65.4 us/step  n=   11      5.9 us  LayerNormV3              AI_VECTOR_ "1,128;128;128"
+      62.2 us/step  n=   33      1.9 us  Mul                      AI_VECTOR_ "1;"
+      60.4 us/step  n=   11      5.5 us  RmsNorm                  AI_VECTOR_ "1,1536;1536"
+      60.2 us/step  n=   11      5.5 us  MatMulV2                 AI_CORE    "1,128;128,128"
+      59.2 us/step  n=   11      5.4 us  ReduceMax                MIX_AIV    "1,4,128;1"
+      56.1 us/step  n=   22      2.6 us  Add                      AI_VECTOR_ "1;1"
+      54.6 us/step  n=   22      2.5 us  FloorDiv                 AI_VECTOR_ "1;"
+      53.9 us/step  n=   22      2.4 us  Add                      AI_VECTOR_ "1,1;1,4"
+      50.4 us/step  n=   11      4.6 us  DynamicQuant             AI_VECTOR_ "1,16384"
+      43.8 us/step  n=   11      4.0 us  RmsNorm                  AI_VECTOR_ "1,1,512;512"
+      39.2 us/step  n=   22      1.8 us  Cast                     AI_VECTOR_ "1,32,128"
+      34.6 us/step  n=   11      3.1 us  Less                     AI_VECTOR_ "1;"
+      31.9 us/step  n=   22      1.5 us  Cast                     AI_VECTOR_ "1,4,128"
+      31.6 us/step  n=   22      1.4 us  Mul                      AI_VECTOR_ "1,32;"
+      28.8 us/step  n=   11      2.6 us  Less                     AI_VECTOR_ "1;1"
+      28.8 us/step  n=   11      2.6 us  Sub                      AI_VECTOR_ "1,4,128;1,1,128"
+      28.4 us/step  n=   11      2.6 us  DynamicQuant             AI_VECTOR_ "1,1536"
+      28.0 us/step  n=   11      2.5 us  SelectV2                 AI_VECTOR_ "1;1;1"
+
+--- mHC ---
+    2719.3 us/step  n=   90     30.2 us  HcPre                    MIX_AIC    "1,1,4,4096;24,16384;3;24"
+     621.7 us/step  n=   90      6.9 us  HcPost                   AI_VECTOR_ "1,4096;1,4,4096;1,4;1,4,4"
+
+--- unclassified ---
+     347.7 us/step  n=   91      3.8 us  RmsNorm                  AI_VECTOR_ "1,4096;4096"
+     152.3 us/step  n=   96      1.6 us  Fill                     AI_VECTOR_ "2;"
+      99.9 us/step  n=   14      7.1 us  Range                    AI_VECTOR_ ";;"
+      99.7 us/step  n=   53      1.9 us  Cast                     AI_VECTOR_ "1,4096"
+      84.7 us/step  n=   59      1.4 us  Cast                     AI_VECTOR_ "1"
+      46.7 us/step  n=   14      3.3 us  DynamicQuant             AI_VECTOR_ "1,4096"
+      38.6 us/step  n=   13      3.0 us  IndexCheck               AI_VECTOR_ "1;1"
+      36.7 us/step  n=   24      1.5 us  Fill                     AI_VECTOR_ "1;"
+      18.6 us/step  n=    5      3.6 us  Add                      AI_VECTOR_ "1;"
+      15.4 us/step  n=    2      7.7 us  Index                    AI_VECTOR_ "17;1;1;1"
+       9.4 us/step  n=    4      2.4 us  IndexCheck               AI_VECTOR_ "1;1"
+       6.8 us/step  n=    2      3.3 us  Sub                      AI_VECTOR_ "1;"
+       6.4 us/step  n=    2      3.2 us  IndexPutV2               AI_VECTOR_ "17;1;1;1;1"
+       2.9 us/step  n=    2      1.5 us  Cast                     AI_VECTOR_ "1,4"
+       2.7 us/step  n=    2      1.3 us  Cast                     AI_VECTOR_ "1"
+
+--- head ---
+     923.5 us/step  n=    1    923.5 us  MatMulV2                 AI_CORE    "1,4096;154880,4096"
+
+--- dense FFN ---
+     241.5 us/step  n=    3     80.5 us  QuantBatchMatmulV3       MIX_AIC    "1,4096;768,256,16,32;24576;1"
+     144.6 us/step  n=    3     48.2 us  QuantBatchMatmulV3       MIX_AIC    "1,12288;128,768,16,32;4096;1"
+      38.6 us/step  n=   12      3.2 us  IndexCheck               AI_VECTOR_ "2;1;1"
+      33.7 us/step  n=   12      2.8 us  Equal                    AI_VECTOR_ "1;"
+      30.1 us/step  n=   12      2.5 us  Sub                      AI_VECTOR_ "1;1"
+      17.0 us/step  n=    3      5.7 us  ClipByValueV2            AI_VECTOR_ "1,24576;24576;24576"
+      15.2 us/step  n=    3      5.1 us  SwiGlu                   AI_VECTOR_ "1,24576"
+      11.4 us/step  n=    3      3.8 us  DynamicQuant             AI_VECTOR_ "1,12288"
+       6.5 us/step  n=    3      2.1 us  BroadcastTo              AI_VECTOR_ "1;1"
+
+--- head/global ---
+      50.7 us/step  n=    1     48.3 us  Cumsum                   AI_CPU     "1;1"
+      21.5 us/step  n=    1     21.5 us  ArgMaxV2                 AI_VECTOR_ "1,154880;"
+      16.5 us/step  n=    1     16.5 us  ReduceMean               MIX_AIV    "1,4,4096;1"
+      11.4 us/step  n=    1     11.4 us  StridedSlice             AI_VECTOR_ "17,32772;2;2;2"
+      10.3 us/step  n=    1      9.8 us  IndexPutV2               AI_VECTOR_ "17,32772;1;2;2;1;1"
+       9.0 us/step  n=    1      9.0 us  Transpose                AI_VECTOR_ "128,1;2"
+       9.0 us/step  n=    1      9.0 us  Index                    AI_VECTOR_ "17,4;1;2;1"
+       8.9 us/step  n=    1      8.9 us  Transpose                AI_VECTOR_ "1,512;2"
+       8.8 us/step  n=    1      8.8 us  Index                    AI_VECTOR_ "512,1;1;2;128"
+       8.5 us/step  n=    1      8.1 us  Index                    AI_VECTOR_ "17,32772;2;1;1;1"
+       8.4 us/step  n=    1      8.4 us  IndexCheck               AI_VECTOR_ "1;128"
+       8.4 us/step  n=    1      8.4 us  GatherV2                 AI_VECTOR_ "154880,4096;1;1"
+       7.6 us/step  n=    1      7.6 us  Cast                     AI_VECTOR_ "1,154880"
+       7.4 us/step  n=    1      7.4 us  ForeachCopy              AI_VECTOR_ "1;1;1;1"
+       6.7 us/step  n=    1      6.7 us  ForeachCopy              AI_VECTOR_ "1"
+       6.2 us/step  n=    1      6.2 us  Index                    AI_VECTOR_ "1,128;1;2;1"
+       5.3 us/step  n=    1      5.3 us  Tile                     AI_VECTOR_ "1,4096;2"
+       5.0 us/step  n=    1      4.7 us  Cast                     AI_VECTOR_ "1"
+       4.8 us/step  n=    1      4.6 us  IndexCheck               AI_VECTOR_ "2;1;1"
+       2.9 us/step  n=    1      2.8 us  Cast                     AI_VECTOR_ "1"
+       2.4 us/step  n=    1      2.4 us  FloorDiv                 AI_VECTOR_ "1,4;"
+       2.1 us/step  n=    1      2.1 us  FloorDiv                 AI_VECTOR_ "1;"
+       1.8 us/step  n=    1      1.8 us  Cast                     AI_VECTOR_ "1"
+       1.6 us/step  n=    1      1.6 us  ZerosLike                AI_VECTOR_ "90"
+
+--- mHC/per-layer ---
+      79.8 us/step  n=   45      1.8 us  FloorMod                 AI_VECTOR_ "1;1"
+      69.3 us/step  n=   45      1.5 us  BroadcastTo              AI_VECTOR_ ";1"
