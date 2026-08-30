@@ -852,7 +852,7 @@ conv 池翻面的服务级验证第一次跑失败了，**不是改动的问题*
 
 | 路径 | 为什么验不了 | 什么条件下能验 |
 |---|---|---|
-| **MTP / speculative 快照路径**（`ascend_kda_backend.py` 约 700–780） | 这个部署不跑 MTP / spec decode，没有负载能走到它。两处改动在代码里都标了 `UNVERIFIED` | 起一个带 MTP / spec decode 的配置；或构造一个直接驱动快照路径的单层 harness |
+| **MTP / speculative 快照路径**（`ascend_kda_backend.py` 约 700–780） | 这个部署不跑 MTP / spec decode，没有负载能走到它。两处改动在代码里都标了 `UNVERIFIED` | 起一个带 MTP / spec decode 的配置；或构造一个直接驱动快照路径的单层 harness。**已交给接手 MTP 的 session**（`glm53_longctx`），他们的 D② 负载正好能触发 |
 | **mask-track 散写分支**（`has_mamba_track_mask`） | `check_kda` 用 `enable_mamba_extra_buffer=False` 建池，且从不设 `mamba_track_mask`，**这条分支从未执行过** | 让 harness 构造带 track mask 的池 |
 
 ⚠ mask-track 那条**转而验了它依赖的不变量**：算子的 state 回写与 `x[L-3:L]` 在 L=64/256/8192
@@ -862,6 +862,30 @@ conv 池翻面的服务级验证第一次跑失败了，**不是改动的问题*
 ⚠ 另有一条**与本线改动无关、但被这次重构顺带发现的实测缺陷**，见 §7b.8：
 `causal_conv1d_fn_npu`（**正在被删掉的那条路**）在一批内混合 `has_initial_state` 时写坏 conv state。
 PLAN P6.2 已就此记了一条禁令：**修好之前不要打开 radix cache 跑精度评测**。
+
+#### ⚠ 但 conv 池翻面这个方向本身，上游已经有先例 [读源码，本轮独立复核过]
+
+§6.5 把 KDA 的 conv 池从 `(slots, conv_dim, kernel_size)` 翻成
+`(slots, kernel_size, conv_dim)`。这**不是本轮发明的约定** ——
+`mem_cache/memory_pool.py:795-799`，speculative 的 dense conv 中间缓冲
+**早就在按同一个方向翻**：
+
+```python
+(conv_shape[1], conv_shape[0]) if _is_npu and cache_params.is_kda else conv_shape
+```
+
+而同文件 `:127` 的 `conv_window_dedup_enabled` 判据是
+`not is_npu and not is_cpu and not is_kda and topk <= 1` ——
+**GLM 在 NPU 上被 `is_npu` 和 `is_kda` 两条各自否掉**，所以 dedup 那条路走不到，只走 dense。
+它的 docstring 把理由写明了：「KDA transposes the window before conv so the overlapping
+`as_strided` layout would corrupt stores」。
+
+**这条降低但没有消除 §8.1 那个风险**：两边方向一致，意味着快照路径如果对不上会**响亮地错**
+（形状不匹配）而不是静默错位。但**方向一致 ≠ 已经验过**，那两处 `UNVERIFIED` 仍然是 UNVERIFIED。
+
+⚠ 另有三处 `device="cuda"` 写死（`memory_pool.py:473 / 745 / 813`）。
+`:473` 只在 dedup 路径、NPU 不可达；**`:745` 和 `:813` 在 NPU 上可达**，
+一开 MTP 就会撞。本线不动它们（没有负载能验），已交给 `glm53_longctx`。
 
 ### 8.2 剩下的目标（构型 G = 33.348 ms 上重算，并做了加总校验）
 
