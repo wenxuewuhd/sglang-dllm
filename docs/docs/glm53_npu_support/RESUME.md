@@ -1,65 +1,57 @@
-# 接手指南（2026-08-29 中午，图模式已跑通并逐位对齐）
+# 接手指南（2026-08-30，P4 与 P5 都已闭环）
 
 新 session 从这里开始，然后读 `PLAN.md`。**上一份交接的内容已经全部消化，本文件是新的。**
+第一次接触这个项目、想从零把环境和精度跑通的，看 [`REPRODUCE.md`](./REPRODUCE.md)。
 
 ---
 
 ## 一句话现状
 
-**GLM-5.3-Flash 在 A3 上整网跑通、精度判定通过、NPU Graph 也开起来了。**
-eager 对 fp32 CPU 参考 8/8 在实测地板内（最差 0.91×）；
-**graph 在同一 batch 宽度下与 eager 逐位相同**；decode **约 7.7×**（33–35 vs 4.2–4.6 token/s）。
-**算子开发需求 0 项。**
-下一步是 **GSM8K**（eager 下不可行，现在才够快）。
+**BF16 和 INT8 两条线都闭环了，NPU Graph 也开着。算子开发需求 0 项。**
 
-## 服务现在开着的是 graph 模式
+| | |
+|---|---|
+| 整网 | TP16 / 45 层 / 真实 HCCL / graph |
+| 精度（BF16） | GSM8K 两轮 97.04 / 97.35%，判据 97.50%，在噪声内 |
+| **精度（INT8 W8A8）** | 两轮 97.80 / 97.19%，**对 BF16 +0.30pp**，判据「1% 以内」**通过** |
+| graph vs eager | 同 batch 宽度下**逐位相同**；decode 约 **8×** |
+| overlap scheduler | 开着，实测 **1.23×**，数值不变 |
+| chunked prefill | 单请求 / 并发 / 2 chunk / 3 chunk 全绿，**逐位相同** |
 
-端口 **30003**，日志 `$ROOT/run/glm_bf16_graph_1104.log`，
-启动脚本 `$ROOT/run/launch_glm_bf16_graph.sh`（仓库里的 `launch_glm_bf16.sh.example`
-已同步成这份配方）。要回 eager 就把那两行图参数换成 `--disable-cuda-graph`。
-要停就 `pkill -f "[s]glang.launch_server"`（**注意方括号**，否则会把自己的 shell 一起打掉）。
+**下一步是 P6 性能**：图下的排序要重做，主线是让 prefill 也进图。
 
-⚠ **停服务后显存不是立刻回收的**，而且 `bootstrap.py:339` 的「每卡空闲 ≥ 90%」检查
-**挡不住这件事**（2026-08-29 实测）：kill 后 3 秒就重起，那个检查放行了，
-进程一路跑到加载权重才炸 —— `NPU out of memory ... 22.15 GiB already allocated;
-525.39 MiB free`，看起来像显存不够，其实是上一个进程还没退干净。
+## 机器现在的分工（2026-08-30 起）
 
-**正确做法是等到 `npu-smi` 自己说话**，别看秒表：
-```bash
-until [ "$(npu-smi info | grep -oP '\d+(?=\s*/ 65536)' | awk '$1>6553{c++}END{print c+0}')" = 0 ]; do sleep 15; done
-```
-16 个 die 全部回到约 3 GB（95% 空闲）实测要 **2–3 分钟**。
+另一个 session **`glm53_int8_1card`** 在同一台机器上做 INT8 单卡性能分析
+（TP1，固定用 **die 0**，worktree `../wt-int8-singlecard`，分支 `int8_singlecard`）。
 
-## 卡是共用的
+- **我们这条线的单卡活用 die 14/15**（`layer_check/`、`probe/` 一直是
+  `ASCEND_RT_VISIBLE_DEVICES=14`），和它不冲突
+- **但 TP16 要全部 16 个 die**，所以起整网前必须先跟它说，它停服 + 等释放约 3–5 分钟
+- 用 `SendMessage` 直接发给 `glm53_int8_1card`
 
-另一个用户（`l00960396`）会不定时起 16-die 的 DSv4 训练。
-**GLM BF16 只能 TP16**（TP8 每卡要 74.9 GB，放不下），所以**整网必须独占整机**。
-单卡的验证任务可以并行，但要先 `npu-smi info` 看一眼，并且**跑完让进程干净退出**。
+⚠ **消息不是可靠的互斥，`npu-smi` 才是真相** —— 这台机器上还有别的用户。
+今天出过两次：放卡后不到一小时被第三方占走；以及在 `npu-smi` 看着空的情况下起服务，
+**别人在加载权重那一两分钟里插进来**，于是在 MoE 的 `create_weights` 处 OOM
+（看起来像显存不够，其实是被插队）。**起服务前和开始加载前各看一眼。**
 
----
+## 精度是怎么判的（方法比数字重要）
 
-## 第 1 级回归：地板测出来了，eager 通过
+**判据是测出来的地板，不是拍的阈值。** 这个模型的地板是**离散的 MoE 路由差异**，
+随深度从 1.2e-2 涨到 1.8e-1；工具里曾经写死过 `<1e-2`，比实际低一个数量级还多。
+现在 `logit_check.py` **不给默认阈值**，判定必须显式 `--floor` 传进来。
 
-细节全在 `REGRESSION.md` 的新章节，这里只留结论：
+三个量级不同的地板，别混（全部实测，方法见 `REGRESSION.md`）：
 
-- **地板 = fp32 与 bf16 跑同一件事**，逐提示 mean|dlp| **9.6e-3 ~ 2.85e-1**
-- **eager 服务对 fp32 参考：8/8 在地板 × 2.0 之内，最差 0.91×** → **通过**
-- 原先那些「说不清」的数字（0.013–0.25）**从来就不可疑**，缺的只是地板
-- fp32 参考是用 `logit_check.py --streaming` 出的（逐层物化 + `lm_head`），
-  **8 条提示一次前向**：一条一条跑要 8 遍 599 GB checkpoint，fp32 那边约 17 小时；
-  批一次 470 秒。右填充在这个因果 + 逐 token 的模型上是精确的
-- 顺带测到**第三个地板**：同为 bf16、只是 GEMM 形状不同（批 vs 不批），
-  mean|dlp| 也能到 2.6e-2，8 条里 3 条逐位相同。比精度地板小一个量级
+| 地板 | 是什么 | mean\|dlp\| |
+|---|---|---|
+| 精度地板 | fp32 与 bf16 跑同一件事 | 9.6e-3 ~ 2.85e-1 |
+| 形状地板 | 同为 bf16、同样的数学，只是 GEMM 形状不同 | 0 ~ 2.6e-2 |
+| 判据 | 候选 ≤ 精度地板 × SLACK(2.0)，逐提示 | — |
 
-## eager 基线已经全部录下来了（开 graph 前的唯一对照）
-
-在 `$ROOT/goldens/logits/`，清单见 `REGRESSION.md`。覆盖回归阶梯 **1、2、4 三级**：
-短提示 prefill、每条 100 token 的贪心 decode、以及 **3256 token 的长提示**
-（> `index_topk=2048`，**稀疏选择真的走了**，段落里六个事实全答对）。
-
-**这一步是刻意提前做的**：graph 一起来 eager 服务就没了，而重启一次很贵。
-
----
+**所有基线都在 `$ROOT/goldens/`**：`logits/` 是 CPU 双参考 + 两个地板 + eager 服务基线
+（覆盖回归阶梯 1、2、4 级），`gsm8k/` 是 BF16 和 INT8 各两轮的全量结果（含响应原文）。
+**开 graph 前专门录 eager 基线是刻意的** —— graph 一起来 eager 服务就没了。
 
 ## graph 这一轮验了什么（细节在 `PLAN.md` P6.6b / P6.6c）
 
@@ -84,7 +76,7 @@ kpool 开销该去的地方，而它们**全是 device 时间类的，图吃不�
 否则 3256 token × 16 并发的 5.2 万 prefill token 会把 decode 完全盖掉。
 脚本在 `tools/bench_graph_decode.py`（padding 那条是 `tools/check_graph_padding.py`）。
 
-## GSM8K：已过（P4 闭环）
+## GSM8K：P4 与 P5 都已闭环
 
 **97.35%**（1284/1319）、stop rate **100.00%**、抽取失败 0 —— 判据 97.50%，差 0.32 个 SE。
 run 1 是 97.04%，但那轮有 9 例是**抽取器**把 `\boxed{70\%}` 判成无答案，不是模型错，已修。
@@ -92,10 +84,18 @@ run 1 是 97.04%，但那轮有 9 例是**抽取器**把 `\boxed{70\%}` 判成�
 结果连同响应原文存在 `$ROOT/goldens/gsm8k/`。
 
 **不用再跑第三轮**：GSM8K 是固定的全部 1319 题、与 cookbook 同一套，题目抽样方差抵消，
-只剩解码随机性（上界 0.47pp），两轮差 0.30pp 已经一致。
+只剩解码随机性（上界 0.47pp）。
 DSv4 那个跑三轮是因为 GPQA 只有 **198 题**（单轮 ±6pp），量级完全不同。
-**真正需要多轮的是 P5**（判据「回归到 BF16 1% 以内」）：每侧 1 轮时 1pp 只有 1.5σ，
-2 轮时 2.1σ —— **上面这两轮就是 P5 的 BF16 基线，别丢**。
+
+**P5（INT8）也已经用这两轮做基线判完了**：
+
+| | run 1 | run 2 | 均值 |
+|---|---|---|---|
+| BF16 | 97.04% | 97.35% | 97.19% |
+| **INT8 W8A8** | 97.80% | 97.19% | **97.50%** |
+
+差 **+0.30pp**，判据「1% 以内」**通过**（每侧 2 轮，差值 SE 0.46pp）。
+INT8 错的 29 题里 **23 题 BF16 也错** —— 错的是同一批难题。
 
 ## 这一轮性能上已经落地的（细节见 PLAN P6.13 / P6.14）
 
@@ -108,6 +108,12 @@ DSv4 那个跑三轮是因为 GPQA 只有 **198 题**（单轮 ±6pp），量级
   （否则捕获期间必抛 107027）。收益上界大，但代价是真代码
 - ⚠ **服务级 profiling 会把服务打挂**（16 rank 全段错误），采到的数据也是废的。
   要 profile 走 `layer_check/kernel_profile.py` 那条单模块路线
+- **INT8 与 BF16 吞吐基本持平**，满批下 INT8 反而快约 6%。
+  ⚠ 此前「INT8 慢 1.47×」的说法**已证伪** —— 那是拿 GSM8K 的 aggregate tok/s 当吞吐，
+  而它把 128 路满批（约 2000 tok/s）和单请求长尾（约 30 tok/s）平均在一起。
+  **别再用那个指标**，用 `#running-req` 对齐后的 `gen throughput` 或 `bench_graph_decode.py`。
+  bs=1 时 INT8 慢 14%（量化线性每次 `npu_quant_matmul` 前要单发一次 `npu_dynamic_quant`，
+  每 forward 多 140 个 kernel），bs=128 时摊薄后反超 8%。见 PLAN P6.15
 
 ## chunked prefill：已完整验完（2026-08-30）
 
@@ -115,29 +121,35 @@ DSv4 那个跑三轮是因为 GPQA 只有 **198 题**（单轮 ±6pp），量级
 8192+8192+3520，同时 8 路后台请求全程 decode，结果对无并发那次逐位相同**
 （`max|dlp| = 0.000e+00`），后台请求 0 降级。细节见 PLAN P3.4。
 
-## 欠一次整机窗口
-
-- 我改的 `_extend_rows`（设备侧行分段）**没在设备上跑过一次** —— CPU 上 3006 个用例等价已验
-- A1：`visible_pool_runs` 的 `nonzero()` 是动态形状，prefill 进图的最后一道门槛，
-  需要先问清楚 `npu_fused_infer_attention_score` 能否接受填充的 run
-
 ## 下一步（已定顺序）
 
-1. **在 graph 下重做 P6 的性能排序** —— 现在所有条目都是 eager 时代量的，**排序会变**：
-   host 开销类的（`TASK_QUEUE_ENABLE=2`、减少 aten dispatch）已经被图吃掉，
-   device 时间类的（AI_CPU 回退、int64 算术、标量瓶颈 kernel）才继续值钱。
-   **已有的两个指向**：① 长上下文 64 并发就拐（见性能基线）；
-   ② GSM8K 这种短输出高翻台的负载实测只跑到 206–234 token/s，
-   而同并发的纯 decode benchmark 是 1680 —— 差在**每答完一题就要插一次 prefill，
-   而 prefill 没有捕获图**（`--disable-prefill-cuda-graph`），overlap 也还关着
-2. **P5 W8A8 量化**（磁盘只剩 23 GB，必须先删 FP8 源）
+**主线：让 prefill 也进图。** 这是目前收益上界最大的一项 —— GSM8K 那种短输出高翻台的负载
+实测 **875 个 prefill 批、每批仅 163 token**，而 prefill 全程在 eager 跑。三步里已完成一步：
+
+1. [x] `_extend_rows` 与 `visible_pool_runs` 都已改成设备侧 + 静态形状（CPU 等价 + 上机复核都过）
+2. [ ] `_kpool_compress_write_extend_npu` 仍是 host 侧循环（每请求形状不同的散写）——
+       **比前两个难一档**：写的是 KV 索引缓存，改错是静默数据损坏而不是报错，
+       核心部分离线验不了
+3. [ ] 在声明式 registry（`arg_groups/overrides.py` 的 `_inkling_overrides` 那套）
+       里给 GLM 注册 full prefill capture
+
+**并行可做**：图下重做 P6 排序。已有的两个指向 ——
+① **长上下文 64 并发就拐**（1044 → 1130 只涨 8%，而 KV 用量才 0.04、mamba 满 1.00），
+指向 kpool 的 device 时间（P6.7 / P6.10 / P6.11），**图吃不掉**；
+② P6.9 `TASK_QUEUE_ENABLE=2` 在 eager 下测得 1.74×，**图下可能已被吃掉，要重测**。
+其中 **P6.11 有实测线索别浪费**：那 4.73 ms 全来自被 clamp 的 gather load，
+去掉是 5.557 → 0.282 ms；而原设计的「三处 store」重写方案作者已判定是错的（地址区间重叠），
+**那条路不要再走**。
 
 ## 还没碰的（别当成已验）
 
-① prefill 图没开（`--disable-prefill-cuda-graph`）—— extend 侧的 host 同步还在
-② overlap scheduler 仍然关着
-③ `enable_torch_compile` + `npugraph_ex`（`patch_model_npu`）那条路
-④ MTP / spec decode 下的捕获
+① **prefill 图没开** —— 见上面主线的第 2、3 步。⚠ 注意「extend 侧还有 host 同步」
+   这个说法**是错的、已作废**：逐行审计过，`kpool_indexer_npu.py` 里
+   `.item()`/`.cpu()`/`.tolist()` 一个都没有。挡住捕获的是**被烘进图的 host 侧构造**
+   和**动态输出形状**，两件不同的事
+② `enable_torch_compile` + `npugraph_ex`（`patch_model_npu`）那条路
+③ MTP / spec decode 下的捕获
+④ DeepEP-normal 的 MoE（出厂配方走 `--moe-a2a-backend none`，是已验的 TP dispatcher）
 
 ## 对外页面（别新建，要更新那一个）
 
@@ -146,19 +158,24 @@ DSv4 那个跑三轮是因为 GPQA 只有 **198 题**（单轮 ±6pp），量级
 ⚠ **更新时必须把这个 URL 传给 Artifact 工具**，否则会新建一页而不是更新它。
 内容来自 `operator_handoff/`，**以仓库为准**。
 
-**现在有一句已经过期**：页脚和 banner 写着「端到端精度尚未跑通」——
-整网 2026-08-29 已跑通，**eager 基线的 logits 判定也已通过**，只剩 GSM8K 未跑。
+**现在页脚和 banner 写着「端到端精度尚未跑通」，已经严重过期**：
+整网跑通、eager 与 graph 的 logits 判定通过、**GSM8K 97.35%（BF16）与 97.50%（INT8）都过了**。
+P4 和 P5 都闭环了。**这一页需要重写一次。**
 
 ## 欠账
 
 `SHARED_CHANGES.md` 有 5 条已改 + 3 条待决。其中：
-- **DSv4 的 GPQA 回归没跑**（swiglu_limit 那条改动欠的，基线 73.23–73.74%）
+- **DSv4 的 GPQA 回归没跑**（swiglu_limit 那条改动欠的，公开对标值 73.23%，198 题）。
+  ⚠ **本项目决定不跑**（用户 2026-08-29 拍板）。但那条改动**确实会改变 DSv4 的数值**
+  （给它的 routed 专家加上本就该有的 clamp，实测修前 2.85× budget 判失败、修后 0.35×），
+  所以这是一条**已知且被接受的风险，合入前需要下游确认**，不是一条会有人认领的待办。
+  DSv4 权重在 P1.2 后已删（只留元数据），真要跑得重新下载约 275 GB
 - **待决 ②** `seq_lens_cpu_list` 在捕获时被烘死 —— GLM 逃过，
   但**对任何走 FIA 的非 DSA 昇腾模型是活的静默 bug**
 - `git stash` 里有 kpool 共享路径的半成品（tail kernel，作者已判定原方案是错的；
   但**实测那 4.73 ms 全部来自被 clamp 的 gather load，去掉就是 5.557 → 0.282 ms**）
 
-## 四条最贵的教训
+## 六条最贵的教训
 
 1. **短 prompt 测不到 kpool** —— `seq_len < index_topk=2048` 时 indexer 直接全选。
    「Paris 答对了」只证明 45 层能串起来。现在有 3256 token 的长提示基线了
@@ -167,3 +184,11 @@ DSv4 那个跑三轮是因为 GPQA 只有 **198 题**（单轮 ±6pp），量级
 3. **工具里拍脑袋的阈值比没有阈值更危险** —— 它让人对着错的基准下判断。
    现在阈值是**测出来的**，而且要显式 `--floor` 传进去才会给判定
 4. **这台机器的 `HTTP_PROXY` 会劫持 127.0.0.1**，代理回 503。连本机服务前先 unset
+
+5. **指标选错比没有指标更糟。** 我拿 GSM8K 的 aggregate tok/s 报过「INT8 慢 1.47×」，
+   实际满批下 INT8 快 6% —— 那个数把 128 路满批和单请求长尾平均在了一起，
+   谁碰上一条不收敛的生成谁就难看。**先问这个指标在测什么，再看它的值**
+6. **「单请求全绿」和「单层全绿」是同一类错觉。** chunked prefill 的并发场景、
+   graph 的 padding batch，都是**批里有别人时才会发生的事**，单请求/单层测试
+   结构上碰不到。要问的是「这个失败模式需要什么条件才会出现」，
+   而不是「我的测试通过了吗」

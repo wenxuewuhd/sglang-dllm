@@ -274,7 +274,16 @@ host list 物化成设备张量喂 `npu_grouped_matmul`。
 `is_deepep() = False`，quant method 是 `UnquantizedFusedMoEMethod`，
 **这条分支根本不进**。`--deepep-mode normal` 就活了。**共享代码，仍未改。**
 
-## 关于 DSv4 回归
+## 关于 DSv4 回归 —— **本项目决定不跑（2026-08-29 用户拍板）**
+
+⚠ **这是一条被接受的风险，不是一条待办。** swiglu_limit 那条改动**确实会改变 DSv4 的数值**
+（给它的 routed 专家加上本就该有的 clamp；在真实 gmm1 输出上实测：修前 2.85× budget 判失败、
+修后 0.35×，与出厂 `NPUSwiglu` 同数）。本项目不验证它，**合入前需要下游自己确认**。
+另外 DSv4 权重在 P1.2 后已删（只留元数据），真要跑得重新下载约 275 GB。
+
+下面是原本的回归口径，留给要跑的人：
+
+
 
 多条改动都指向「需要跑一次 DSv4 GPQA」。基线在 PLAN §3：**73.74%**（P0，三轮 74.24/75.25/71.72），
 P1 rebase 后 **73.23%**。起服务脚本见 `launch_dsv4_a3.sh.example`。
