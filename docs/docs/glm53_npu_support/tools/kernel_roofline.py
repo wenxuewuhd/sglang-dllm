@@ -7,7 +7,8 @@ The profiler's `Input Shapes` / `Output Shapes` columns are filled in even with
     traffic = sum(input tensor bytes) + sum(output tensor bytes)
     floor   = traffic / 1.25 TB/s        (measured A3 read+write)
 
-A kernel moving less than ~16 MB is dominated by the ~13.5 us fixed launch cost
+A kernel moving less than ~16 MB is not explained by its bytes -- its cost is
+fixed overhead of some kind, not bandwidth
 and its ratio to that floor says nothing about efficiency -- those rows are
 labelled `launch` rather than given a meaningless multiple.
 
@@ -36,7 +37,23 @@ import re
 import statistics
 
 BW = 1.25e12  # bytes/s, measured read+write on this A3 die
-LAUNCH_US = 13.5
+#: Split inside the <16 MB group, between "small op" and "this one is actually
+#: doing work".  27 us is an empirical elbow on this machine, NOT twice a
+#: per-kernel launch floor -- there is no such floor at 13.5 us.  The smallest
+#: kernels in a real decode step run at 1.3-1.5 us (Cast/Mul/BroadcastTo on
+#: scalars, measured), and a 1.5 MiB read costs ~8.4 us achievable.  A kernel
+#: landing in "launch 主导" means "its time is not explained by its bytes", it
+#: does NOT mean "13.5 us of this was launch overhead".
+#: The old name asserted the latter and made the report self-contradictory:
+#: 2177 launch-bound kernels x 13.5 us = 29.4 ms, against a 33.3 ms step whose
+#: launch-bound total is 10.2 ms (4.7 us each).
+SMALL_OP_US = 13.5
+#: Below this many bytes, the byte count cannot explain the kernel's time.
+#: It is BW * the per-kernel fixed-cost floor, so it moves with that floor --
+#: it is not a property of the hardware on its own.  16 MiB (the old value)
+#: was BW * 13.5 us, and 13.5 us was one ConcatD call mistaken for a machine
+#: constant (see REPORT 7b.14).  Overridable with --floor-us so the sensitivity
+#: can be shown rather than asserted.
 LAUNCH_BOUND_BYTES = 16 * 1024**2
 
 DTYPE_BYTES = {
@@ -93,7 +110,14 @@ def main() -> None:
     ap.add_argument("--profile", required=True)
     ap.add_argument("--steps", type=int, required=True)
     ap.add_argument("--top", type=int, default=30)
+    ap.add_argument("--floor-us", type=float, default=None,
+                    help="per-kernel fixed-cost floor; sets the <N MB threshold as BW*floor")
     args = ap.parse_args()
+    # Two independent knobs, deliberately not tied: --floor-us moves the
+    # "bytes cannot explain this" threshold, SMALL_OP_US only splits inside it.
+    global LAUNCH_BOUND_BYTES
+    if args.floor_us is not None:
+        LAUNCH_BOUND_BYTES = args.floor_us * 1e-6 * BW
 
     path = sorted(
         glob.glob(os.path.join(args.profile, "**", "kernel_details.csv"), recursive=True)
@@ -142,7 +166,7 @@ def main() -> None:
                 note = " [decl?]"
         floor_us = byts / BW * 1e6
         if byts < LAUNCH_BOUND_BYTES:
-            bound = "launch" if med < 2 * LAUNCH_US else "compute"
+            bound = "launch" if med < 2 * SMALL_OP_US else "compute"
             ratio = "—"
         else:
             bound = "bandwidth" if med < 1.5 * floor_us else "above floor"
@@ -165,7 +189,7 @@ def main() -> None:
         floor_us = byts / BW * 1e6
         if byts >= LAUNCH_BOUND_BYTES:
             key = "带宽受限（>=16 MB）" if med < 1.5 * floor_us else "高于地板（>=16 MB）"
-        elif med >= 2 * LAUNCH_US:
+        elif med >= 2 * SMALL_OP_US:
             key = "compute/固定成本主导（<16 MB，>27 us/call）"
         else:
             key = "launch 主导（<16 MB）"

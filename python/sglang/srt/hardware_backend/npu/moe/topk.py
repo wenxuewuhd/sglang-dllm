@@ -30,6 +30,73 @@ def _apply_routed_scaling_after_renorm(
     return topk_weights
 
 
+def _append_fused_shared_slot(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_routed_experts: int,
+    topk_config: "TopKConfig",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Append the fused shared expert's slot to a routed-only top-k result.
+
+    The vendor top-k ops (``npu_moe_gating_top_k`` and friends) select from the
+    router's ``num_routed_experts`` logits and know nothing about the extra
+    expert slot that shared-experts fusion appends to the MoE weight tensors.
+    So we ask them for the routed ``top_k`` only and append the shared slot
+    here, rather than the CUDA reference's trick of asking for one extra column
+    and overwriting it (``biased_topk_impl``): overwriting would need the
+    vendor op's renormalisation to run over the wrong column count.
+
+    The weight is chosen so that the fused shared expert ends up contributing
+    with weight exactly 1.0 after ``DeepseekV2MoE.forward_normal`` finishes,
+    matching what the unfused ``shared_experts`` MLP would have added:
+
+      * ``apply_routed_scaling_factor_on_output`` -> the routed weights already
+        carry ``routed_scaling_factor`` and nothing scales the output later, so
+        the shared slot's weight is 1.0.
+      * otherwise (the Ascend default, see FusedMoE.
+        ``should_fuse_routed_scaling_factor_in_topk``) ``forward_normal`` does
+        ``final_hidden_states *= routed_scaling_factor`` on the *combined*
+        output, so the shared slot goes in pre-divided by that factor.
+
+    Same arithmetic as the CUDA path, which writes ``topk_weights[:, -1] =
+    topk_weights[:, :-1].sum(-1) / routed_scaling_factor`` before a
+    renormalisation that divides by exactly that sum.
+    """
+    n_fused = topk_config.num_fused_shared_experts
+    n_tokens = topk_ids.shape[0]
+
+    if n_fused == 1:
+        shared_ids = topk_ids.new_full((n_tokens, 1), num_routed_experts)
+    else:
+        shared_ids = torch.arange(
+            num_routed_experts,
+            num_routed_experts + n_fused,
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        ).expand(n_tokens, n_fused)
+
+    if topk_config.apply_routed_scaling_factor_on_output:
+        shared_weight = 1.0
+    else:
+        shared_weight = 1.0 / float(topk_config.routed_scaling_factor or 1.0)
+
+    # `new_full` + `cat` rather than `torch.nn.functional.pad`, which reads like
+    # the cheaper way to say this.  It is not, and it is not even fewer kernels:
+    # measured on one A3 die, TP1, bs=1, graph on, 42 MoE layers, pad lowers to
+    # 84 MemSet (623.5 us/step) + 84 PadV3 (290.8 us/step) against this pair's
+    # 84 Fill (~129) + 84 ConcatD (148.4) -- same 168 launches, 3.3x the device
+    # time, and 32.357 vs 31.541 ms/step end to end (32.6 vs 31.5 ms/token wall,
+    # at every one of concurrency 1/3/13/16).  Both spellings are bit-identical
+    # in output (teacher-forced max|dlp| = 0.0).
+
+    topk_ids = torch.cat([topk_ids, shared_ids], dim=1)
+    topk_weights = torch.cat(
+        [topk_weights, topk_weights.new_full((n_tokens, n_fused), shared_weight)],
+        dim=1,
+    )
+    return topk_weights, topk_ids
+
+
 def fused_topk_npu(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -43,6 +110,12 @@ def fused_topk_npu(
     renormalize = topk_config.renormalize
     correction_bias = topk_config.correction_bias
 
+    # The vendor top-k ops select among the router's logits only; the fused
+    # shared expert's slot is appended afterwards by
+    # _append_fused_shared_slot.  ``topk_config.top_k`` already includes it.
+    num_fused_shared_experts = topk_config.num_fused_shared_experts
+    routed_top_k = topk_config.top_k - num_fused_shared_experts
+
     # sqrtsoftplus (DSV4 noaux_tc): top-k over (scores + bias); weights from
     # un-biased scores. The custom op fuses softplus/sqrt/topk/gather/norm/cast.
     if topk_config.scoring_func == "sqrtsoftplus":
@@ -53,7 +126,7 @@ def fused_topk_npu(
         )
         topk_weights, topk_ids, _ = torch.ops.custom.npu_moe_gating_top_k(
             x=router_logits.to(torch.float32),
-            k=topk_config.top_k,
+            k=routed_top_k,
             bias=(
                 correction_bias.to(torch.float32)
                 if correction_bias is not None
@@ -70,15 +143,11 @@ def fused_topk_npu(
     elif not use_grouped_topk and correction_bias is None:
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
             router_logits,
-            k=topk_config.top_k,
+            k=routed_top_k,
         )
 
         if renormalize:
-            topk_weights = l1_norm(
-                topk_weights
-                if topk_config.num_fused_shared_experts == 0
-                else topk_weights[:, :-1]
-            )
+            topk_weights = l1_norm(topk_weights)
         topk_weights = topk_weights.to(torch.float32)
 
     # Support grouped top-k or correction bias or sigmoid or routed_scaling_factor
@@ -89,7 +158,7 @@ def fused_topk_npu(
     ):
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
             router_logits.to(torch.float32),
-            k=topk_config.top_k,
+            k=routed_top_k,
             bias=(
                 correction_bias.to(torch.float32)
                 if correction_bias is not None
@@ -122,6 +191,11 @@ def fused_topk_npu(
             topk_config=topk_config,
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
+        )
+
+    if num_fused_shared_experts:
+        topk_weights, topk_ids = _append_fused_shared_slot(
+            topk_weights, topk_ids, router_logits.shape[-1], topk_config
         )
 
     if expert_location_dispatch_info is not None:

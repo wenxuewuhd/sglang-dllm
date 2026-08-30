@@ -99,6 +99,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
     _is_cuda,
+    _is_npu,
     _use_aiter_gfx95,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -1398,9 +1399,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
         text_config = getattr(hf_config, "text_config", hf_config)
         if not getattr(text_config, "n_shared_experts", None):
             return "No shared experts are defined in the config."
-        if not _is_cuda:
-            return "Shared experts fusion currently requires CUDA devices."
-        if _device_sm is not None and _device_sm < 80:
+        if not _is_cuda and not _is_npu:
+            return "Shared experts fusion currently requires CUDA or NPU devices."
+        # get_device_sm() returns 0 off CUDA, so this check has to stay CUDA-only
+        # or it disables the NPU path it is not talking about.
+        if _is_cuda and _device_sm is not None and _device_sm < 80:
             return "Shared experts fusion requires SM80 or newer GPUs."
         if get_parallel().moe_ep_size > 1:
             return (
