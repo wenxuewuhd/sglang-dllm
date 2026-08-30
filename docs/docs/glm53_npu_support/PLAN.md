@@ -716,8 +716,17 @@ PLAN 里「overlap 下 `seq_lens_cpu` 领先设备张量一步」那个担忧**�
         每请求最多 `ceil(q_len/kpool)+1` 个 run，合计 `ceil(n_rows/kpool)+batch`。
         回归 `layer_check/check_pool_runs.py`：**2006 个配置**，补齐版在真实 run 上与
         精确版逐元素相同、填充部分确实是空 run、上界从不被突破（余量 1..13）。
-        ⚠ **只验了分段本身（CPU）与算子对空 run 的容忍（单卡）**，
-        整条 prefill 捕获还没试过 —— 它还缺下面两项。
+        **2026-08-30 上机验完**：调用点改成**总是走补齐路径**（而不是把它做成可选、
+        默认走老路），因为那样捕获路径和 eager 路径才是同一条路 —— 两条不同的代码路径
+        碰巧给出相同结果，和同一条路径给出相同结果，是不同强度的证据。
+        TP16 实测对改动前的 eager 基线**逐位相同**（`0.000e+00`），
+        而且**没有代价**：prefill 3256×16 是 11.77 s 对 11.72 s（0.4%，噪声内），
+        decode bs=1 不变（25.4 ms/token）。空 run 是彻底的 no-op。
+
+        ⚠ **差点漏掉的一步**：`max_runs` 一开始是可选参数、调用点没传，
+        所以第一轮上机跑的还是老的 `nonzero` 路径 —— **全绿证明的是「没改坏老路」，
+        不是「新路对」**。和「短 prompt 测不到 kpool」「单请求测不到并发」
+        「单层测不到整网」是同一类：**测试通过了，但它测的不是你以为的那件事。**
   - [x] **`_kpool_compress_write_extend_npu` 也改成批量静态形状了**（2026-08-30，
         **⚠ 仅离线验证，未上机**）。原来每请求一趟 Python 循环，切片、`pool_ids`、
         `write_locs`、散写目标**全是数据相关的尺寸**。现在一次散写：
@@ -733,9 +742,11 @@ PLAN 里「overlap 下 `seq_lens_cpu` 领先设备张量一步」那个担忧**�
         测试里显式断言了**不同请求的物理页互不相交**（分配器的不变量），
         否则两个 pool 撞同一行、散写顺序未定义，那个比较就是空的。
 
-        ⚠ **离线验不到的**：`npu_scatter_nd_update_` 与 `compress_pool_bf16`
-        在这些形状上的实际行为；以及扁平 `index_select` 是否真的把页表 gather
-        挡在 AI CPU 之外。**上机前不能算完成。**
+        **2026-08-30 上机验完**：TP16 对改动前的 eager 基线**逐位相同**
+        —— 3256 token 长提示（extend + 稀疏）、短提示 + 100 decode、
+        以及 19858 token 切三刀 + 8 路并发的 chunked prefill（针召回、后台 0 降级）。
+        ⚠ **仍未测**：扁平 `index_select` 是否真的把页表 gather 挡在 AI CPU 之外
+        —— 那要 kernel profile 才看得到，数值正确不构成证据。
         ⚠ 写的时候差点自己引进两个坑，都靠读 decode 路径的既有注释躲开：
         ① `block_tables[req, col]` 这种两张量高级索引**没有 AI Core 实现**，
         会回落到 AI CPU 的 `aclnnIndex`（decode 那边实测占该层 device 时间的 37.5%），
@@ -793,6 +804,11 @@ prefill 与 decode 分开量：先跑 `max_new_tokens=1` 拿 prefill 墙钟，�
       单站点 p50：decode(M=16) **0.211 ms**、prefill(M=8192) **2.784 ms**。
       **sinkhorn 是个只在 prefill 有意义的旋钮**：44.8 µs/轮，占 prefill pre 的 **46%**，
       decode 下占 **0%**（那里是 launch-bound，20 轮白送）。
+      ⚠ **图模式下复核过，结论不变**（`glm53_int8_1card` 实测）：`hc_sinkhorn_iters`
+      20 → 1 只值整步的 **0.7%**，而且**确实生效了**（`HcPre` 中位 30.34 → 26.42 µs，
+      不是「改了没反应」）—— 19 次迭代共 347 µs/step，摊到 90 个站点是每站点每次 0.04 µs。
+      **所以 `HcPre` 那 2.4 ms 不是 sinkhorn**，是算子在 M=1 下的固定开销
+      （26 µs 搬 1.5 MiB = 带宽地板的 20 倍）。**这个旋钮改数值不改性能，别动。**
       roofline：post 高于带宽下界 2.6×、pre 9.5×（去掉 sinkhorn 是 5×）——
       **prefill 下不是 host 开销主导**，和 DSA 的 100× 不是一回事
 - [ ] P6.2 **KDA prefill conv1d** —— **已量化**：Ascend 的 extend 把深度卷积拆成 **3 次调用**，
@@ -907,7 +923,13 @@ DSA 每步 170 次 aten dispatch，MoE 只要 25 次。
 
 按实测收益排序：
 - [x] **P6.8 消掉 decode 的 AI_CPU gather** —— 已修（§2.4）。占 DSA decode device 时间 37.5%，27× 提升
-- [ ] **P6.9 `TASK_QUEUE_ENABLE=2`** —— DSA decode 立得 **1.74×，零代码改动**。先验正确性
+- [x] ~~**P6.9 `TASK_QUEUE_ENABLE=2`**~~ —— **图模式下用不了，这条关闭**
+      （`glm53_int8_1card` 实测）。不是「被图吃掉」，是 torch_npu 的硬约束，
+      第一个 bs 桶刚开始捕获就抛：
+      `RuntimeError: Do not support TASK_QUEUE_ENABLE = 2 during NPU graph capture,
+      please export TASK_QUEUE_ENABLE=1/0`（`torch_npu/npu/graphs.py:625` 的
+      `capture_begin()`）。**响亮地失败，不会静默降级** —— 这是好事。
+      那 1.74× 是 eager 时代的数，图模式下 host 侧本来就没有气泡了。
 - [ ] **P6.10 `expand_pooled_groups_to_topk` 改 int32** —— prefill 的 `aclnnAdd` 花 **5.73 ms**
       产出 `[8192,512,4]` 的 int64（134 MB），高于下界 **43×**。token id 最大约 32768，
       **int32 完全够**，既减半流量又避开 Ascend 上被模拟的 int64 向量运算。**在共享代码里**

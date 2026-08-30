@@ -569,8 +569,17 @@ class KPoolNPUIndexerMixin:
             )
             run_pool_lens, run_req = pool_lens_row, req_index_row.long()
         else:
+            # Always the padded form, so the captured path and the eager path are
+            # the same path. The operator treats the empty runs as a no-op --
+            # measured bit-identical at 1, 8 and 128 of them (probe/p6_a1_padded_runs).
             cu_seqlens_q, run_pool_lens, run_req = visible_pool_runs(
-                pool_lens_row, req_index_row
+                pool_lens_row,
+                req_index_row,
+                max_runs=max_visible_pool_runs(
+                    int(pool_lens_row.shape[0]),
+                    int(forward_batch.batch_size),
+                    self.index_kpool,
+                ),
             )
         pooled_page_table = build_pooled_page_table_64(
             block_tables, self.index_kpool
