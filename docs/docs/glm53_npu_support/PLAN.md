@@ -1370,7 +1370,7 @@ TP1 是全部 32）。**主导项恰好不是被 TP 切得最干净的那部分�
 
 ### P8 · MTP / 投机解码 ☐（bring-up 通了，**并发 >= 32 有未解决的越界**）
 
-**跑起来了，但只在并发 <= 16。** 完整判据见下；这一节最重要的是那个未解决的 bug。
+**跑起来了，但只在单请求或长度一致的批上。** 这一节最重要的是那个未解决的 bug。
 
 #### 已经通的
 
@@ -1385,14 +1385,21 @@ TP1 是全部 32）。**主导项恰好不是被 TP 切得最干净的那部分�
 W8A8 checkpoint 的 layer 45 **是量化的**（871 个 scale），`quantization_config.ignore`
 只列了本就不量化的 norm/gate、没有通配符，所以 `_resolve_nextn_quant_config` 走量化路径是对的。
 
-#### ⛔ 未解决：并发 >= 32 时 AI Core 越界
+#### ⛔ 未解决：**批内长度不一致（ragged）时** AI Core 越界
 
 ```
 errorStr: MTE accesses an invalid GM address or the cross-device memory access times out
 ```
 
-- 并发 1/2/4/8/16 全过，**32 崩**。异步错误，宿主端在
-  `prepare_for_draft_extend -> ForwardBatch.init_new` 处撞到它撞上的下一个 copy
+⚠ **触发条件是 ragged，不是并发数** —— 这一条我先判错过一次，记下来免得重蹈：
+- 长度**几乎相同**的短提示：并发 1/2/4/8/16 全过，32 崩
+- **GSM8K（提示长度差异大）**：`#running-req: 16` 就崩
+=> 先看到的「32 崩」让我写成了「并发 >= 32」，实际是**批越大越容易 ragged**。
+   **「阈值」形式的结论要先问一句「我扫的那个维度是真正的自变量吗」。**
+- 单请求（bs=1）六次跑全绿 —— 这个失败模式**结构上需要批里有别人**，
+  与 RESUME 教训 7 同形
+- 异步错误，宿主端在 `prepare_for_draft_extend -> ForwardBatch.init_new`
+  或 `overlap_utils.resolve_forward_inputs` 处撞到它撞上的下一个 copy
 - **已排除三个嫌疑**：① draft-extend 的行布局（`prepare_for_draft_extend` 的
   `extend_num_tokens = bs * (num_draft_tokens + num_front_tokens)` 可能不等于
   `bs * num_draft_tokens`）—— 加了响亮断言，**没触发**；
