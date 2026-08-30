@@ -435,6 +435,13 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
         **这条从待办里划掉。**
   - [ ] **仍未验证**：
         TP>1（单层 harness 意义上）；多 DSA 层共享 pool；只测了 layer 3、一条 prompt
+  - [ ] ⚠ **KDA conv 池若改成 window-major，`ascend_kda_backend.py:700-780` 的
+        speculative 快照路径同样吃这个布局，但未验证**（`glm53_int8_1card` 正在做这个改动，
+        由该线声明、请本线代记 —— commit message 会被 `git log` 埋掉，
+        而下一个碰这块的人是从这里进来的）。
+        **不是「没时间」，是这个部署不跑 MTP**，没有能触发那条路径的负载。
+        **能验的条件**：起一个带 MTP / spec decode 的配置，
+        或者构造一个直接驱动快照路径的单层 harness。
   - [ ] **接 spec decode 前必须先解决**：`kpool_decode_update_index_cache` 假设每请求一行，
         MTP 一次多 draft token 会让同一 `req_pool_index` 的多行抢同一个 ring 槽。
         共享 CUDA kernel 有 `kpool_max_closed_pools` 那套多 token 逻辑，NPU 这条没有
