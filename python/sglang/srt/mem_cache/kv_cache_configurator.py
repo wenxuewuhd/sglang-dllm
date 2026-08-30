@@ -1015,6 +1015,19 @@ class KVCacheConfigurator:
                 token_to_kv_pool = self._build_ascend_minimax_sparse_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
                 )
+            elif is_dsa_model and get_dsa_index_kpool_compress(
+                self.model_config.hf_config
+            ):
+                # `NPUMLATokenToKVPool` carries a plain per-token index cache but
+                # none of the kpool machinery (compress-tail ring, scratch slot,
+                # bf16 index writers). A hybrid model reaches the kpool pool
+                # through `HybridLinearKVPool`; a NextN draft is a single
+                # non-hybrid layer, so before this it landed on the plain pool
+                # and the indexer had nothing to write to.
+                token_to_kv_pool = self._build_dsa_kv_pool(
+                    max_total_num_tokens=sizes.max_total_num_tokens,
+                    max_running_requests=sizes.max_running_requests,
+                )
             elif self.use_mla_backend:
                 token_to_kv_pool = self._build_ascend_mla_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
@@ -1350,6 +1363,15 @@ class KVCacheConfigurator:
             PoolCls = LayerSplitDSATokenToKVPool
             pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
+        elif _is_npu:
+            # Same reason as the hybrid path in memory_pool.py: the shared index
+            # cache packs an fp8 key with an fp32 scale and Ascend cannot hold an
+            # fp8 tensor, so the NPU pool stores the key as bf16.
+            from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                NPUDSATokenToKVPool,
+            )
+
+            PoolCls = NPUDSATokenToKVPool
         else:
             PoolCls = DSATokenToKVPool
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
