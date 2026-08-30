@@ -124,14 +124,21 @@ INT8 错的 29 题里 **23 题 BF16 也错** —— 错的是同一批难题。
 ## 下一步（已定顺序）
 
 **主线：让 prefill 也进图。** 这是目前收益上界最大的一项 —— GSM8K 那种短输出高翻台的负载
-实测 **875 个 prefill 批、每批仅 163 token**，而 prefill 全程在 eager 跑。三步里已完成一步：
+实测 **875 个 prefill 批、每批仅 163 token**，而 prefill 全程在 eager 跑。
+
+⚠ **2026-08-30 上机试过了，阻塞点和原先以为的不一样。** 原先记的是「差 registry 注册」，
+**那是错的**：`--cuda-graph-backend-prefill full` 现成参数就能开，也确实开成了。
+真正炸的是 `KeyError: 'block_tables'` —— **Ascend 后端只实现了 decode 的图 metadata 契约**，
+prefill 运行器走的是另一条路（只调 `init_forward_metadata_out_graph`，
+从不调 `init_cuda_graph_state`）。这是后端工作，在共享的 `ascend_backend.py` 里。详见 PLAN P3.4。
+
+三处准备工作已完成并各自上机验过（**都不是这次失败的原因**，捕获在碰到它们之前就炸了）：
 
 1. [x] `_extend_rows` 与 `visible_pool_runs` 都已改成设备侧 + 静态形状（CPU 等价 + 上机复核都过）
 2. [ ] `_kpool_compress_write_extend_npu` 仍是 host 侧循环（每请求形状不同的散写）——
        **比前两个难一档**：写的是 KV 索引缓存，改错是静默数据损坏而不是报错，
        核心部分离线验不了
-3. [ ] 在声明式 registry（`arg_groups/overrides.py` 的 `_inkling_overrides` 那套）
-       里给 GLM 注册 full prefill capture
+3. [ ] **给 `AscendAttnBackend` 加 prefill 侧的图 metadata 契约** —— 这才是真正的阻塞
 
 **并行可做**：图下重做 P6 排序。已有的两个指向 ——
 ① **长上下文 64 并发就拐**（1044 → 1130 只涨 8%，而 KV 用量才 0.04、mamba 满 1.00），

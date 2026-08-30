@@ -778,9 +778,39 @@ PLAN 里「overlap 下 `seq_lens_cpu` 领先设备张量一步」那个担忧**�
         会回落到 AI CPU 的 `aclnnIndex`（decode 那边实测占该层 device 时间的 37.5%），
         必须用扁平 `index_select`；② 对齐检查一开始写成对设备张量取 `bool(...any())`，
         那是 D2H 等待，捕获下还会抛 107027 —— 改成读 host 侧的 `*_cpu` 字段。
-  - [ ] **prefill 进图还差最后一步**：在声明式 registry
-        （`arg_groups/overrides.py` 的 `_inkling_overrides` 那套）里给 GLM 注册
-        full prefill capture，然后**整条链要上机验一次**。
+  - [ ] **prefill 进图的真正阻塞：Ascend 后端没实现 prefill 侧的图 metadata 契约**
+        （2026-08-30 上机定位，**推翻了本条原先的说法**）。
+
+        ⚠ **原先写的「差最后一步：在 registry 里注册」是错的。** 注册根本不是阻塞 ——
+        `--cuda-graph-backend-prefill full` 这个现成的 CLI 参数就能开，实测
+        `prefill.backend` 成功解析成 `full`（`_disable_full_prefill_cudagraph_if_incompatible`
+        的规则表是**空的**，FULL prefill 没有任何兼容性门槛）。
+        ⚠ 顺带：`cuda_graph_config.py:114` 那条注释说 full prefill 是
+        「opt-in via the declarative registry（见 `_inkling_overrides`）」**也不准** ——
+        `_inkling_overrides` 自己的 docstring 写着 full-graph prefill **不在 registry 里设**，
+        因为 cuda-graph 配置在 `__post_init__` 里先于声明被解析。真正的机制是 inline 的
+        `_apply_inkling_prefill_cuda_graph_default()`。
+
+        **真正炸在哪**：捕获跑到 `capture_one_shape` 抛
+        `KeyError: 'block_tables'`（`ascend_backend.py:638`）。原因是
+        `graph_metadata` 只在 `init_cuda_graph_state()` 里分配（`:585`），
+        而**那个函数只被 `decode_cuda_graph_runner.py` 调用**（`:369`、`:539`）；
+        prefill 运行器走的是另一条契约 —— 它只调
+        `init_forward_metadata_out_graph(forward_batch, in_capture=True)`
+        （`prefill_cuda_graph_runner.py:1407`），**从不调 `init_cuda_graph_state`**。
+        Ascend 的 `init_forward_metadata_out_graph` 却假设静态 buffer 已经按 decode 的
+        bs 预分配好了，于是读一个空 dict。
+
+        **所以这是后端工作，不是配置工作**：要给 `AscendAttnBackend` 加一条 prefill 分支，
+        直接从 `forward_batch` 建 metadata（而不是从 decode 的预分配 buffer 取），
+        或者把 buffer 也按 prefill 形状分配。⚠ **在共享文件 `ascend_backend.py` 里**，
+        DSv4 那类非 hybrid 的昇腾模型也走它。
+        ⚠ 设计上还有个未解问题：捕获的 prefill 图里 `block_tables` 也必须是静态的，
+        而它的宽度取决于序列占多少页 —— 这个上界怎么定，需要先想清楚。
+
+        **好消息**：我这三处改写（`_extend_rows` / `visible_pool_runs` 补齐 /
+        compress-write 批量化）**都不是这次失败的原因** —— 捕获在碰到它们之前就炸了。
+        它们已各自上机验过逐位相同。
   - [ ] `_kpool_compress_write_extend_npu` 仍是 host 侧循环（每请求形状不同的散写），难度更高
 
 捕获期间 `.item()`/`.cpu()` 会抛 **107027**（已实测）。
