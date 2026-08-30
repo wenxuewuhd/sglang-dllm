@@ -1,0 +1,63 @@
+#!/bin/bash
+# One A/B point for the INT8 single-card study: restart the TP1 server with the
+# given MODEL/env, wait until it is really up, and time decode at bs=1 and bs=16.
+#
+# The wait after the kill is not optional and not a timer.  Killing the server
+# does not return HBM immediately, and bootstrap.py's "each die >=90% free"
+# check will happily let the next process start and then blow up in the middle
+# of loading weights -- which looks like "not enough memory" and is actually
+# "the last process had not exited".  So we wait for npu-smi to say so.
+#
+#   NAME=kdaint8 MODEL=/var/tmp/glm53/...-kdaint8 ./ab_tp1.sh
+#   NAME=tqe2 TQE=2 ./ab_tp1.sh
+set -u
+NAME=${NAME:?set NAME}
+DIE=${DIE:-0}
+PORT=${PORT:-30013}
+RUN=/mnt/workspace/y00359136/work/glm53_dev/env/run
+LOG=$RUN/glm_w8a8_tp1_${NAME}_$(date +%H%M).log
+
+pkill -f "[s]glang.launch_server" 2>/dev/null
+echo "waiting for die $DIE to come back to idle..."
+# Physical die $DIE is the (DIE+1)-th HBM figure npu-smi prints (the phy-id
+# column runs 0..15 in order).
+#
+# The \s* in the pattern is load-bearing.  npu-smi pads the used-MiB field to a
+# fixed width, so an idle die prints "2880 / 65536" but a busy one prints
+# "33861/ 65536" with no space.  A pattern written '(?= / 65536)' therefore drops
+# exactly the dies that are busy, the list shifts up by one, and the check reads
+# some *other* die's idle number and lets you through -- straight into an OOM
+# during weight loading.  Measured 2026-08-30 with a die at 33861 MiB: strict
+# pattern returned 15 numbers, loose returned 16.
+die_used() { npu-smi info | grep -oP '\d+(?=\s*/ 65536)' | sed -n "$((DIE + 1))p"; }
+until [ "$(die_used)" -lt 6553 ]; do
+    sleep 10
+done
+echo "die $DIE free: $(die_used) MiB used"
+
+nohup bash $RUN/launch_glm_w8a8_tp1.sh > $LOG 2>&1 &
+echo "log $LOG"
+for i in $(seq 1 240); do
+    grep -q "server is fired up" $LOG && break
+    grep -qE "Traceback|out of memory" $LOG && { echo "FAILED:"; tail -25 $LOG; exit 1; }
+    sleep 5
+done
+grep -q "server is fired up" $LOG || { echo "TIMEOUT"; tail -25 $LOG; exit 1; }
+grep -E "Load weight end|Mamba Cache|KV Cache|Capture target decode NPU graph end" $LOG
+
+set +u  # env.sh sources CANN set_env scripts that read unset variables
+source /mnt/workspace/y00359136/work/glm53_dev/env/env.sh
+cd /mnt/workspace/y00359136/work/glm53_dev/wt-int8-singlecard/docs/docs/glm53_npu_support/tools
+
+# Warm up before timing anything.  bench_graph_decode subtracts a max_new_tokens=1
+# run from a max_new_tokens=DEC+1 run, so a cold first request does not just add
+# noise -- it lands entirely in the term being SUBTRACTED and makes decode look
+# faster than it is.  Measured 2026-08-30: a cold server reported 30.7 ms/token
+# where the true figure was 42.4, purely because the prefill leg took 1.88 s
+# instead of 0.39 s.
+curl -s -m 300 -X POST http://127.0.0.1:$PORT/generate \
+    -H 'Content-Type: application/json' \
+    -d '{"text":"warmup","sampling_params":{"max_new_tokens":32,"temperature":0,"ignore_eos":true}}' \
+    > /dev/null
+$VENV/bin/python bench_graph_decode.py --port $PORT \
+    --concurrency ${CONC:-1,4,16} --decode-tokens ${DECTOK:-128} --pools ${POOLS:-short} 2>&1 | tee /var/tmp/glm53/bench_${NAME}.log

@@ -1,0 +1,120 @@
+### bs1
+=== bs=1 decode step: 42.823 ms device time, 3578 kernel launches, floor 1.25 TB/s ===
+kernel                     n  us/step     %  cum%  us/call       MiB  floor us  x floor  bound
+----------------------------------------------------------------------------------------------
+MatMulV2                  34   7823.3 18.3% 18.3%    182.1     192.1     161.1    1.13x  bandwidth
+GroupedMatmul             42   4516.5 10.5% 28.8%    107.3     128.0     107.4    1.00x  bandwidth [8 of 16 experts, gate_up]
+HcPre                     90   2995.1  7.0% 35.8%     32.9       1.5       1.3        —  compute
+GroupedMatmul             42   2469.6  5.8% 41.6%     58.4      64.0      53.7    1.09x  bandwidth [8 of 16 experts, down]
+MatMulV2                  34   2026.9  4.7% 46.3%     59.0      64.0      53.7    1.10x  bandwidth
+fused_sigmoid_gating_del  34   1128.8  2.6% 48.9%     33.1       0.0       0.0        —  compute
+MatMulV2                  90   1036.3  2.4% 51.4%     11.5       1.0       0.8        —  launch
+QuantBatchMatmulV3        42    954.5  2.2% 53.6%     22.7      16.0      13.4    1.69x  above floor
+MatMulV2                   1    930.1  2.2% 55.8%    930.4    1210.3    1015.3    0.92x  bandwidth
+QuantBatchMatmulV3        11    717.2  1.7% 57.4%     65.6      64.0      53.7    1.22x  bandwidth
+BroadcastTo               11    701.0  1.6% 59.1%     63.7     151.6     127.2    0.50x  bandwidth
+QuantBatchMatmulV3        42    680.8  1.6% 60.7%     16.1       8.0       6.7        —  launch
+HcPost                    90    631.9  1.5% 62.1%      7.0       0.1       0.1        —  launch
+Range                    100    600.7  1.4% 63.5%      6.4       0.0       0.0        —  launch
+MoeInitRoutingV3          42    585.3  1.4% 64.9%     13.8       0.0       0.0        —  launch
+ConcatD                   42    567.9  1.3% 66.2%     13.4       0.0       0.0        —  launch
+Slice                     34    522.3  1.2% 67.5%     15.4       0.7       0.6        —  launch
+ReduceSum                 34    507.4  1.2% 68.6%     14.8       0.5       0.4        —  launch
+MatMulV2                  68    477.4  1.1% 69.8%      6.9       2.0       1.7        —  launch
+IndexPutV2                34    428.9  1.0% 70.8%     12.6       0.8       0.7        —  launch
+MatMulV2                  34    424.9  1.0% 71.8%     12.5       0.5       0.4        —  launch
+Cast                      68    413.9  1.0% 72.7%      6.2       0.4       0.4        —  launch
+batch_matmul_transpose_0  11    388.3  0.9% 73.6%     35.3       0.0       0.0        —  compute
+RmsNorm                   91    363.4  0.8% 74.5%      4.3       0.0       0.0        —  launch
+Index                     34    334.3  0.8% 75.3%      9.4       0.6       0.5        —  launch
+SparseFlashAttention      11    328.0  0.8% 76.0%     29.8       4.0       3.4        —  compute [<=2048 selected tokens, k+v]
+ClipByValueV2             68    319.7  0.7% 76.8%      5.0       0.0       0.0        —  launch
+ConcatD                   34    297.3  0.7% 77.5%      8.7       0.8       0.6        —  launch
+... 其余 120 组: 9651.4 us/step (22.5%)
+
+按限制因素汇总                                 ms/step      %  kernel/step
+  带宽受限（>=16 MB）                          20.022  46.8%          215
+  launch 主导（<16 MB）                      16.662  38.9%         3163
+  compute/固定成本主导（<16 MB，>27 us/call）      4.899  11.4%          147
+  高于地板（>=16 MB）                           1.241   2.9%           53
+
+### bs16
+=== bs=1 decode step: 72.507 ms device time, 3688 kernel launches, floor 1.25 TB/s ===
+kernel                     n  us/step     %  cum%  us/call       MiB  floor us  x floor  bound
+----------------------------------------------------------------------------------------------
+fused_sigmoid_gating_del  34  11326.3 15.6% 15.6%    332.2       0.0       0.0        —  compute
+MatMulV2                  34  10107.9 13.9% 29.6%    284.5     192.9     161.8    1.76x  above floor
+GroupedMatmul             42   5587.2  7.7% 37.3%    124.8     257.8     216.2    0.58x  bandwidth
+MatMulV2                  34   4058.0  5.6% 42.9%    119.3      64.4      54.0    2.21x  above floor
+HcPre                     90   3211.6  4.4% 47.3%     35.3       2.1       1.8        —  compute
+GroupedMatmul             42   2951.9  4.1% 51.4%     65.6     129.5     108.6    0.60x  bandwidth
+Index                     34   2280.2  3.1% 54.5%     66.9       9.0       7.5        —  compute
+ReduceSum                 34   2109.4  2.9% 57.4%     62.0       7.5       6.3        —  compute
+IndexPutV2                34   2000.3  2.8% 60.2%     58.9      13.5      11.3        —  compute
+MatMulV2                   1   1138.3  1.6% 61.7%   1137.8    1214.9    1019.1    1.12x  bandwidth
+ScatterUpdate             34   1134.3  1.6% 63.3%     33.3       7.0       5.9        —  compute
+BroadcastTo               11   1032.8  1.4% 64.7%     93.9     151.6     127.2    0.74x  bandwidth
+QuantBatchMatmulV3        42    978.8  1.3% 66.1%     23.3      16.2      13.6    1.71x  above floor
+MatMulV2                  90    900.4  1.2% 67.3%     10.0       1.1       0.9        —  launch
+HcPost                    90    884.5  1.2% 68.5%      9.7       1.1       0.9        —  launch
+Slice                     34    764.2  1.1% 69.6%     22.5      10.5       8.8        —  launch
+MoeInitRoutingV3          42    735.3  1.0% 70.6%     17.1       0.6       0.5        —  launch
+QuantBatchMatmulV3        11    722.7  1.0% 71.6%     66.2      64.4      54.0    1.23x  bandwidth
+ClipByValueV2             42    678.5  0.9% 72.5%     16.2       2.0       1.7        —  launch
+QuantBatchMatmulV3        42    676.7  0.9% 73.5%     16.2       8.2       6.9        —  launch
+ClipByValueV2             84    673.0  0.9% 74.4%      8.2       0.1       0.1        —  launch
+ConcatD                   34    663.6  0.9% 75.3%     19.5      12.0      10.1        —  launch
+Range                    100    626.3  0.9% 76.2%      6.8       0.0       0.0        —  launch
+MatMulV2                  68    605.8  0.8% 77.0%      8.9       2.3       1.9        —  launch
+RmsNorm                   91    597.4  0.8% 77.8%      6.8       0.3       0.2        —  launch
+DequantSwigluQuant        42    561.4  0.8% 78.6%     13.3       1.3       1.0        —  launch
+IndexCheck                95    500.0  0.7% 79.3%      5.4       0.0       0.0        —  launch
+Cast                      68    496.2  0.7% 80.0%      7.4       2.2       1.9        —  launch
+... 其余 125 组: 14503.7 us/step (20.0%)
+
+按限制因素汇总                                 ms/step      %  kernel/step
+  compute/固定成本主导（<16 MB，>27 us/call）     22.916  31.6%          283
+  launch 主导（<16 MB）                      21.701  29.9%         3137
+  高于地板（>=16 MB）                          15.542  21.4%          121
+  带宽受限（>=16 MB）                          12.348  17.0%          147
+
+### bs1_zerorope
+=== bs=1 decode step: 39.741 ms device time, 3556 kernel launches, floor 1.25 TB/s ===
+kernel                     n  us/step     %  cum%  us/call       MiB  floor us  x floor  bound
+----------------------------------------------------------------------------------------------
+MatMulV2                  34   6022.2 15.2% 15.2%    177.8     192.1     161.1    1.10x  bandwidth
+GroupedMatmul             42   4493.5 11.3% 26.5%    106.8     128.0     107.4    0.99x  bandwidth [8 of 16 experts, gate_up]
+HcPre                     90   2741.3  6.9% 33.4%     30.3       1.5       1.3        —  compute
+GroupedMatmul             42   2440.9  6.1% 39.5%     57.9      64.0      53.7    1.08x  bandwidth [8 of 16 experts, down]
+MatMulV2                  34   2017.8  5.1% 44.6%     58.2      64.0      53.7    1.08x  bandwidth
+fused_sigmoid_gating_del  34   1098.4  2.8% 47.3%     32.1       0.0       0.0        —  compute
+MatMulV2                  90   1011.0  2.5% 49.9%     11.2       1.0       0.8        —  launch
+QuantBatchMatmulV3        42    971.8  2.4% 52.3%     23.1      16.0      13.4    1.72x  above floor
+MatMulV2                   1    937.1  2.4% 54.7%    936.9    1210.3    1015.3    0.92x  bandwidth
+QuantBatchMatmulV3        11    722.2  1.8% 56.5%     66.3      64.0      53.7    1.23x  bandwidth
+QuantBatchMatmulV3        42    677.0  1.7% 58.2%     15.9       8.0       6.7        —  launch
+HcPost                    90    623.8  1.6% 59.8%      6.5       0.1       0.1        —  launch
+Range                    100    613.9  1.5% 61.3%      6.4       0.0       0.0        —  launch
+Slice                     34    586.8  1.5% 62.8%     17.3       0.7       0.6        —  launch
+MoeInitRoutingV3          42    583.8  1.5% 64.3%     14.0       0.0       0.0        —  launch
+ConcatD                   42    576.3  1.5% 65.7%     13.6       0.0       0.0        —  launch
+ReduceSum                 34    503.6  1.3% 67.0%     14.8       0.5       0.4        —  launch
+MatMulV2                  68    496.7  1.2% 68.2%      7.1       2.0       1.7        —  launch
+Cast                      68    421.0  1.1% 69.3%      6.2       0.4       0.4        —  launch
+IndexPutV2                34    419.4  1.1% 70.4%     11.8       0.8       0.7        —  launch
+MatMulV2                  34    415.7  1.0% 71.4%     12.2       0.5       0.4        —  launch
+RmsNorm                   91    349.0  0.9% 72.3%      3.4       0.0       0.0        —  launch
+Index                     34    338.9  0.9% 73.1%      9.9       0.6       0.5        —  launch
+SparseFlashAttention      11    334.4  0.8% 74.0%     30.3       4.0       3.4        —  compute [<=2048 selected tokens, k+v]
+ClipByValueV2             68    310.6  0.8% 74.8%      4.6       0.0       0.0        —  launch
+QuantBatchMatmulV3        11    303.7  0.8% 75.5%     27.1      24.1      20.2    1.34x  bandwidth
+ConcatD                   34    299.3  0.8% 76.3%      8.8       0.8       0.6        —  launch
+BatchMatMulV2             11    280.2  0.7% 77.0%     25.4      16.1      13.5    1.88x  above floor
+... 其余 118 组: 9150.6 us/step (23.0%)
+
+按限制因素汇总                                 ms/step      %  kernel/step
+  带宽受限（>=16 MB）                          17.476  44.0%          204
+  launch 主导（<16 MB）                      16.784  42.2%         3163
+  compute/固定成本主导（<16 MB，>27 us/call）      4.229  10.6%          136
+  高于地板（>=16 MB）                           1.252   3.2%           53
+

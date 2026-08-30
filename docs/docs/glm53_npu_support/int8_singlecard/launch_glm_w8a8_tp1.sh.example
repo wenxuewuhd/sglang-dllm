@@ -1,0 +1,73 @@
+#!/bin/bash
+# GLM-5.3-Flash INT8 (compressed-tensors W8A8) on a SINGLE A3 die.
+#
+# Differences from launch_glm_w8a8.sh (TP16):
+#   --tp-size 1                     the point of this configuration
+#   ASCEND_RT_VISIBLE_DEVICES       pin to one physical die.  The other session
+#                                   on this box uses dies 14/15 for its
+#                                   single-card work, so we take die 0.
+#   --model-path ...-e${EXPERTS}    a checkpoint pruned to the first N routed
+#                                   experts (tools/prune_experts_int8.py).
+#                                   All 288 experts are 306 GiB and do not fit;
+#                                   N=16 is 31.6 GiB.  *** Routing is top-8 of N,
+#                                   which is NOT the model's routing -- this
+#                                   configuration is for performance work only.
+#   --max-running-requests 16       at TP1 the KDA mamba state pool costs 16x
+#                                   what it does per die at TP16 (64 heads, not
+#                                   4) -- about 140 MB per slot.  128 slots
+#                                   would be ~18 GB.
+#   graph on, prefill graph off     same as the TP16 recipe; prefill capture on
+#                                   NPU is blocked in server_args.py, see
+#                                   PLAN P6.14.
+#
+# Env knobs kept identical to the TP16 recipe so that any INT8 TP1 vs TP16
+# comparison has one variable.  TASK_QUEUE_ENABLE is deliberately left at 1
+# (the TP16 value) -- 2 is a measured 1.74x on eager DSA decode and is one of
+# the things to A/B here, so it must not be silently different in the baseline.
+set -x
+source /mnt/workspace/y00359136/work/glm53_dev/env/env.sh
+export PYTHONNOUSERSITE=1
+# The worktree, not the main repo: another session is working in $REPO.
+export WT=${WT:-/mnt/workspace/y00359136/work/glm53_dev/wt-int8-singlecard}
+export PYTHONPATH=$WT/python:$PYTHONPATH
+
+export ASCEND_RT_VISIBLE_DEVICES=${DIE:-0}
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+export INF_NAN_MODE_FORCE_DISABLE=1
+export TASK_QUEUE_ENABLE=${TQE:-1}
+export SGLANG_SET_CPU_AFFINITY=1
+
+export SGLANG_OPT_DEEPGEMM_HC_PRENORM=False
+export SGLANG_OPT_FP8_WO_A_GEMM=0
+export SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
+export SGLANG_OPT_USE_FUSED_HASH_TOPK=False
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+ulimit -n 65536
+
+EXPERTS=${EXPERTS:-16}
+MODEL=${MODEL:-/var/tmp/glm53/GLM-5.3-Flash-W8A8-e${EXPERTS}}
+PORT=${PORT:-30013}
+MAXREQ=${MAXREQ:-16}
+
+GRAPH_ARGS="--cuda-graph-max-bs-decode ${MAXREQ} --disable-prefill-cuda-graph"
+if [ "${EAGER:-0}" = "1" ]; then GRAPH_ARGS="--disable-cuda-graph"; fi
+
+exec $VENV/bin/python -m sglang.launch_server \
+    --model-path ${MODEL} \
+    --trust-remote-code \
+    --device npu \
+    --tp-size 1 \
+    --moe-a2a-backend none \
+    --dtype bfloat16 --kv-cache-dtype auto \
+    --page-size 64 \
+    --chunked-prefill-size ${CHUNK:-8192} \
+    --max-running-requests ${MAXREQ} \
+    --context-length ${CTX:-32768} \
+    --mem-fraction-static ${MEMFRAC:-0.80} \
+    --disable-radix-cache \
+    ${GRAPH_ARGS} \
+    --skip-server-warmup \
+    --watchdog-timeout 9000 \
+    --host 127.0.0.1 --port ${PORT}
