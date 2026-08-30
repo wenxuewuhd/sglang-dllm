@@ -4311,6 +4311,17 @@ class HybridLinearKVPool(KVCache):
             round_scale=round_scale,
         )
 
+    @property
+    def scratch_loc(self) -> int:
+        """Forwarded: the wrapped pool owns the index cache and so the spare slot."""
+        return self.full_kv_pool.scratch_loc
+
+    def set_compress_tail_batched(self, layer_id: int, **kwargs) -> None:
+        assert self.use_dsa, "set_compress_tail_batched called when use_dsa is False"
+        self.full_kv_pool.set_compress_tail_batched(
+            layer_id=self._transfer_full_attention_id(layer_id), **kwargs
+        )
+
     def set_compress_tail_for_request(
         self,
         layer_id: int,

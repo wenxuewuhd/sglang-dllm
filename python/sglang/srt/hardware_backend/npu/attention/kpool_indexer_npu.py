@@ -281,58 +281,156 @@ class KPoolNPUIndexerMixin:
         weights, _ = self.weights_proj(x.float())
         return (weights * self.n_heads**-0.5 * self.softmax_scale).contiguous()
 
+    @staticmethod
+    def _compress_write_plan(extend_seq_lens, seq_lens, n_rows: int, kpool: int):
+        """Where every pooled write and every tail row goes, in fixed-size tensors.
+
+        The loop this replaces walked the batch in Python and sliced the query rows
+        per request, so every tensor it built had a data-dependent size and a graph
+        capture would have baked one forward's values in. Here the pool count is
+        bounded by ``n_rows // kpool + batch`` and the tail by ``kpool - 1`` per
+        request, both fixed once the capture shape is.
+
+        Returns ``(rows, valid, pool_ids, req_of_pool, tail_rows, tail_valid,
+        tail_slots_logical)``:
+
+        * ``rows`` ``[P_max, kpool]`` -- the query rows each pool reduces
+        * ``valid`` ``[P_max]`` -- which pools are real; the rest must be steered to
+          scratch by the caller, not skipped, because skipping is what needs a
+          dynamic shape in the first place
+        * ``pool_ids`` ``[P_max]`` -- the logical pooled-K id, for the page lookup
+        * ``req_of_pool`` ``[P_max]`` -- which request, for the page table row
+        * ``tail_rows`` / ``tail_valid`` / ``tail_slots_logical`` ``[B, kpool-1]``
+
+        Requests contributing no rows fall out on their own: the pool ownership is
+        resolved against cumulative *ends*, so an empty request leaves the running
+        total unchanged and is stepped over, and its tail is entirely invalid.
+        """
+        batch = int(extend_seq_lens.shape[0])
+        device = extend_seq_lens.device
+        n_pools_per = torch.div(extend_seq_lens, kpool, rounding_mode="floor")
+        pool_ends = n_pools_per.cumsum(0)
+        p_max = n_rows // kpool + batch
+
+        p = torch.arange(p_max, device=device, dtype=torch.int64)
+        req_of_pool = (
+            (p.unsqueeze(1) >= pool_ends.unsqueeze(0)).sum(1).clamp(max=batch - 1)
+        )
+        valid = p < pool_ends[-1]
+        p_in_req = p - (pool_ends[req_of_pool] - n_pools_per[req_of_pool])
+
+        row_starts = extend_seq_lens.cumsum(0) - extend_seq_lens
+        first_pos = seq_lens - extend_seq_lens
+        base = row_starts[req_of_pool] + p_in_req * kpool
+        last_row = max(n_rows - 1, 0)
+        rows = (
+            base.unsqueeze(1) + torch.arange(kpool, device=device, dtype=torch.int64)
+        ).clamp(max=last_row)
+        pool_ids = (
+            torch.div(first_pos[req_of_pool], kpool, rounding_mode="floor") + p_in_req
+        )
+
+        n_remain = extend_seq_lens - n_pools_per * kpool
+        t = torch.arange(kpool - 1, device=device, dtype=torch.int64)
+        tail_valid = t.unsqueeze(0) < n_remain.unsqueeze(1)
+        tail_rows = (
+            (row_starts + n_pools_per * kpool).unsqueeze(1) + t
+        ).clamp(max=last_row)
+        tail_slots_logical = (first_pos + n_pools_per * kpool).unsqueeze(1) + t
+        return (
+            rows,
+            valid,
+            pool_ids,
+            req_of_pool,
+            tail_rows,
+            tail_valid,
+            tail_slots_logical,
+        )
+
     def _kpool_compress_write_extend_npu(
         self, key, gate_score, forward_batch, layer_id, block_tables, pool
     ) -> None:
-        """Drain whole pools into the cache, and park the remainder in the tail."""
-        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
-            compute_pooled_write_locs,
+        """Drain whole pools into the cache, and park the remainder in the tail.
+
+        One batched scatter rather than a Python loop over requests. Invalid slots
+        are steered to reserved rows instead of being dropped, because dropping them
+        is exactly the dynamic shape a graph capture cannot take.
+
+        Safe as a scatter only because **physical pages are disjoint across live
+        requests** -- the allocator's invariant. Were two requests to share a page,
+        two pools could target one cache row and the scatter order would be
+        undefined, where the loop's later request simply won.
+        """
+        kpool, page_size = self.index_kpool, pool.page_size
+        n_rows = int(key.shape[0])
+        if n_rows == 0:
+            return
+        extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int64)
+        seq_lens = forward_batch.seq_lens.to(torch.int64)
+
+        # The alignment this needs is guaranteed upstream: chunked_prefill_size is
+        # asserted to be a multiple of page_size (64), radix prefix matches are
+        # floored to page multiples, and 64 is a multiple of index_kpool. Kept as a
+        # check because an unaligned start would corrupt the cache silently.
+        #
+        # Read from the host-side lengths, not the device ones. `bool(t.any())` on a
+        # device tensor is a device-to-host wait -- the very thing this rewrite is
+        # removing -- and it would throw 107027 under capture besides.
+        if any(
+            (int(seq) - int(q)) % kpool
+            for seq, q in zip(
+                forward_batch.seq_lens_cpu, forward_batch.extend_seq_lens_cpu
+            )
+        ):
+            raise NotImplementedError(
+                "index_kpool_compress extend requires kpool-aligned chunk "
+                "starts. Set chunked_prefill_size % index_kpool == 0 and "
+                "avoid non-aligned prefix reuse."
+            )
+
+        (
+            rows,
+            valid,
+            pool_ids,
+            req_of_pool,
+            tail_rows,
+            tail_valid,
+            tail_slots,
+        ) = self._compress_write_plan(extend_seq_lens, seq_lens, n_rows, kpool)
+
+        pooled = compress_pool_bf16(
+            key[rows], gate_score[rows], self.index_kpool_compress_ape
+        )
+        # The same addressing `compute_pooled_write_locs` does, but per pool against a
+        # 2-D page table instead of one request's 1-D slice, and written the way the
+        # decode path had to be: a flat index_select rather than block_tables[a, b].
+        # Two-tensor advanced indexing has no AI Core implementation and falls back to
+        # aclnnIndex on the AI CPU, which cost that path 37.5% of its device time.
+        slots_per_page, block_k = pool.slots_per_page, block_tables.shape[1]
+        page_col = (
+            torch.div(pool_ids, slots_per_page, rounding_mode="floor") * kpool
+        ).clamp(0, block_k - 1)
+        page = block_tables.reshape(-1).index_select(
+            0, req_of_pool * block_k + page_col
+        )
+        locs = page.to(torch.int64) * pool.page_size + torch.remainder(
+            pool_ids, slots_per_page
+        )
+        pool.set_index_k_bf16(
+            layer_id,
+            torch.where(valid, locs, torch.full_like(locs, pool.scratch_loc)),
+            pooled,
         )
 
-        kpool, page_size = self.index_kpool, pool.page_size
-        offset = 0
-        for i in range(forward_batch.batch_size):
-            q_len = int(forward_batch.extend_seq_lens_cpu[i])
-            if q_len == 0:
-                continue
-            seq_len = int(forward_batch.seq_lens_cpu[i])
-            first_pos = seq_len - q_len
-            if first_pos % kpool != 0:
-                raise NotImplementedError(
-                    "index_kpool_compress extend requires kpool-aligned chunk "
-                    "starts. Set chunked_prefill_size % index_kpool == 0 and "
-                    "avoid non-aligned prefix reuse."
-                )
-            key_chunk = key[offset : offset + q_len]
-            score_chunk = gate_score[offset : offset + q_len]
-            n_pools = q_len // kpool
-            n_drain = n_pools * kpool
-            if n_pools > 0:
-                num_token_pages = (seq_len + page_size - 1) // page_size
-                pool_ids = first_pos // kpool + torch.arange(
-                    n_pools, dtype=torch.int64, device=key.device
-                )
-                write_locs = compute_pooled_write_locs(
-                    block_tables[i, :num_token_pages].contiguous(), pool_ids, kpool
-                )
-                pool.set_index_k_bf16(
-                    layer_id,
-                    write_locs,
-                    compress_pool_bf16(
-                        key_chunk[:n_drain].view(n_pools, kpool, self.head_dim),
-                        score_chunk[:n_drain].view(n_pools, kpool, self.head_dim),
-                        self.index_kpool_compress_ape,
-                    ),
-                )
-            pool.set_compress_tail_for_request(
-                layer_id=layer_id,
-                req_pool_idx=forward_batch.req_pool_indices[i].to(torch.long),
-                key_tail=key_chunk[n_drain:],
-                score_tail=score_chunk[n_drain:],
-                n_remain=q_len - n_drain,
-                dst_logical_start=first_pos + n_drain,
-            )
-            offset += q_len
+        req_idx = forward_batch.req_pool_indices.to(torch.long)
+        pool.set_compress_tail_batched(
+            layer_id=layer_id,
+            req_pool_idx=req_idx.unsqueeze(1).expand_as(tail_rows).reshape(-1),
+            key_tail=key[tail_rows.reshape(-1)],
+            score_tail=gate_score[tail_rows.reshape(-1)],
+            slots_logical=tail_slots.reshape(-1),
+            valid=tail_valid.reshape(-1),
+        )
 
     @staticmethod
     def _extend_rows(extend_seq_lens, seq_lens, n_rows: int):

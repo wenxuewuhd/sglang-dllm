@@ -977,6 +977,46 @@ class NPUDSATokenToKVPool(DSATokenToKVPool):
             flat_s.view(-1, 1, width), scatter, slot_score.reshape(-1, 1, width)
         )
 
+    def set_compress_tail_batched(
+        self,
+        layer_id: int,
+        req_pool_idx: torch.Tensor,
+        key_tail: torch.Tensor,
+        score_tail: torch.Tensor,
+        slots_logical: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> None:
+        """Write every request's tail rows in one scatter, for extend.
+
+        ``set_compress_tail_for_request`` takes one request at a time with a host-side
+        ``n_remain``, so an extend batch needed a Python loop and every tensor in it
+        had a data-dependent length -- which a graph capture would bake in. Here the
+        caller passes a fixed ``[batch, kpool-1]`` worth of rows flattened, and says
+        with ``valid`` which of them are real.
+
+        Rows that are not real are sent to the spare tail row rather than filtered
+        out, for the same reason the decode path does it: filtering needs the count
+        on the host.
+        """
+        assert (
+            self.kpool_use_compress
+        ), "set_compress_tail_batched called when kpool compress is disabled"
+        idx = layer_id - self.start_layer
+        tail_k, tail_s = self._compress_tail_k[idx], self._compress_tail_score[idx]
+        tail_width, width = tail_k.shape[1], tail_k.shape[-1]
+
+        dest = torch.where(valid, req_pool_idx, self._tail_scratch_row)
+        # One flat index, not [req, slot]: two-tensor advanced indexing has no AI Core
+        # implementation and falls back to aclnnIndex on the AI CPU, which is what the
+        # decode path had to be rewritten to avoid.
+        scatter = (dest * tail_width + slots_logical % tail_width).reshape(-1, 1)
+        torch_npu.npu_scatter_nd_update_(
+            tail_k.view(-1, 1, width), scatter, key_tail.reshape(-1, 1, width)
+        )
+        torch_npu.npu_scatter_nd_update_(
+            tail_s.view(-1, 1, width), scatter, score_tail.reshape(-1, 1, width)
+        )
+
     def set_index_k_scale_buffer(self, *args, **kwargs):
         raise NotImplementedError(
             "This pool stores index keys as bf16; there is no fp8 key + fp32 scale "

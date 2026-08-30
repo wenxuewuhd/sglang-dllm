@@ -274,6 +274,23 @@ host list 物化成设备张量喂 `npu_grouped_matmul`。
 `is_deepep() = False`，quant method 是 `UnquantizedFusedMoEMethod`，
 **这条分支根本不进**。`--deepep-mode normal` 就活了。**共享代码，仍未改。**
 
+## 新增：`HybridLinearKVPool` 加了 `scratch_loc` 与 `set_compress_tail_batched`（2026-08-30）
+
+**改到共享文件** `mem_cache/memory_pool.py`：给 `HybridLinearKVPool` 加了一个
+`scratch_loc` property 和一个 `set_compress_tail_batched` 转发，两者都只是把调用
+交给 `full_kv_pool`。
+
+**谁受影响**：没有别人 —— 两个新成员都只在 `use_dsa` 为真时可达，而且只有
+NPU 的 kpool extend 路径会调；非 DSA 模型碰不到，CUDA 路径也不经过这里。
+`set_compress_tail_batched` 的实现在 NPU 专属的 `memory_pool_npu.py` 里。
+
+**为什么要加转发**：GLM 的顶层池对象是包装类，方法加在被包的那个上就会
+`AttributeError` —— 这个项目在整网拉通时被同一类问题咬过两次
+（`forward_metadata`、`set_index_k_bf16`）。
+
+**回归**：`layer_check/check_compress_write_plan.py`（离线，1418 组，比缓冲区内容）。
+⚠ **未上机**，见 PLAN P3.4 里的告警。
+
 ## 关于 DSv4 回归 —— **本项目决定不跑（2026-08-29 用户拍板）**
 
 ⚠ **这是一条被接受的风险，不是一条待办。** swiglu_limit 那条改动**确实会改变 DSv4 的数值**

@@ -663,10 +663,32 @@ PLAN 里「overlap 下 `seq_lens_cpu` 领先设备张量一步」那个担忧**�
         精确版逐元素相同、填充部分确实是空 run、上界从不被突破（余量 1..13）。
         ⚠ **只验了分段本身（CPU）与算子对空 run 的容忍（单卡）**，
         整条 prefill 捕获还没试过 —— 它还缺下面两项。
-  - [ ] **prefill 进图还差两步**：① `_kpool_compress_write_extend_npu` 仍是 host 侧循环
-        （每请求形状不同的散写），同样会被烘进图；
-        ② 要在声明式 registry（`arg_groups/overrides.py` 的 `_inkling_overrides` 那套）
-        里给 GLM 注册 full prefill capture。**A1 做完不等于 prefill 能进图。**
+  - [x] **`_kpool_compress_write_extend_npu` 也改成批量静态形状了**（2026-08-30，
+        **⚠ 仅离线验证，未上机**）。原来每请求一趟 Python 循环，切片、`pool_ids`、
+        `write_locs`、散写目标**全是数据相关的尺寸**。现在一次散写：
+        pool 数上界 `n_rows//kpool + batch`，tail 上界每请求 `kpool-1`，
+        无效项**送 scratch 而不是过滤掉** —— 过滤正是那个要不到静态形状的动作。
+        新增 `NPUDSATokenToKVPool.set_compress_tail_batched`，并给包装类
+        `HybridLinearKVPool` 补上 `scratch_loc` 与它的转发
+        （**包装类没转发**是这个项目栽过的同一类坑）。
+
+        **回归 `layer_check/check_compress_write_plan.py`：1418 组，
+        比的是最终缓冲区内容而不是索引** —— 把索引缓存和 tail ring 用普通张量建模，
+        新旧两版写完之后逐元素相同，所以写错位置会以「某行不同」暴露，而不是溜过去。
+        测试里显式断言了**不同请求的物理页互不相交**（分配器的不变量），
+        否则两个 pool 撞同一行、散写顺序未定义，那个比较就是空的。
+
+        ⚠ **离线验不到的**：`npu_scatter_nd_update_` 与 `compress_pool_bf16`
+        在这些形状上的实际行为；以及扁平 `index_select` 是否真的把页表 gather
+        挡在 AI CPU 之外。**上机前不能算完成。**
+        ⚠ 写的时候差点自己引进两个坑，都靠读 decode 路径的既有注释躲开：
+        ① `block_tables[req, col]` 这种两张量高级索引**没有 AI Core 实现**，
+        会回落到 AI CPU 的 `aclnnIndex`（decode 那边实测占该层 device 时间的 37.5%），
+        必须用扁平 `index_select`；② 对齐检查一开始写成对设备张量取 `bool(...any())`，
+        那是 D2H 等待，捕获下还会抛 107027 —— 改成读 host 侧的 `*_cpu` 字段。
+  - [ ] **prefill 进图还差最后一步**：在声明式 registry
+        （`arg_groups/overrides.py` 的 `_inkling_overrides` 那套）里给 GLM 注册
+        full prefill capture，然后**整条链要上机验一次**。
   - [ ] `_kpool_compress_write_extend_npu` 仍是 host 侧循环（每请求形状不同的散写），难度更高
 
 捕获期间 `.item()`/`.cpu()` 会抛 **107027**（已实测）。
