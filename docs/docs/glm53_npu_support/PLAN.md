@@ -600,6 +600,25 @@ bs=128 时这笔固定开销摊薄，int8 GEMM 的收益反超 —— 这就是�
 用 `#running-req` 对齐后的满批 `gen throughput`，或者直接用 `bench_graph_decode.py`。
 要让墙钟可复现，把 `--max-tokens` 压到 4096（实测 p99 是 891、最大 11891），不损精度。
 
+**P6.16 `_nope_zero_rope` 的 stride-0 expand 每步都被物化**（`glm53_int8_1card` 单卡实测，
+本线已核对源码，**TP16 上未测**）。`ascend_backend.py:1089` 用一个全零页 `expand` 出
+`query_rope`/`key_rope`，函数自己就写着 ⚠「算子文档说不支持非连续输入，所以这个 aliasing
+是观察到的行为，不是承诺的行为」。**⚠ 兑现了，但不是以算错的方式，而是以静默变慢的方式**：
+torch_npu 在调 aclnn 前把输入变连续，于是那个 expand 每层每步真的写一遍。
+
+单卡 kernel profile：`BroadcastTo`，`[1,64,1,64]` → `[19403,64,1,64]` bf16，
+`aiv_mte3_ratio=0.945`（纯 store），**63.8 µs × 11 层 = 0.70 ms/step**，每步写 1.75 GiB 的零。
+
+**最坏的性质：它是 O(KV pool) 而不是 O(batch) 或 O(seq_len)** —— pool 从 124 万涨到
+152 万 token，这一项就 0.70 → 1.34 ms/step；而 bs=1 与 bs=16 几乎一样贵（0.70 → 1.03），
+**大 batch 摊不掉**。TP16 每 die `max_total_num_tokens=1195072`，页数同量级，
+估计每步约 0.6–0.7 ms，在 28.9 ms 的 step 里约 **2.4%** —— 比在单卡上占比还高，
+而**墙钟一直看不见它**。
+
+改法（对方正在测）：不 expand，按 (device, dtype, 完整 shape) 缓存一次全零张量，
+所有 DSA 层共用。数值上恒等（零就是零），代价是一次性约 159 MiB HBM。
+**等对方的实测收益出来再决定是否 cherry-pick 到本线。**
+
 **P6.13 overlap scheduler：开，实测 1.23× 且数值不变**（2026-08-29，A/B，200 题 GSM8K、128 并发）：
 
 | | 墙钟 | q/s | token/s | 准确率 |

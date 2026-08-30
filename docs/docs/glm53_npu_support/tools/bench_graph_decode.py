@@ -42,6 +42,19 @@ def run(ids, n_new):
         timeout=1800, proxies=NP)
     r.raise_for_status()
 
+def warmup(pool):
+    """Burn the first call before anything is timed.
+
+    The prefill column is measured by timing max_new_tokens=1 and the decode column
+    by differencing it out, so a cold first call inflates the subtrahend and makes
+    decode look *faster*. The bias is one-directional, which is the dangerous kind:
+    measured on this stack a cold first prefill took 1.88 s against a warm 0.39 s,
+    and 1.5 s of that landed entirely in the term being subtracted. A single
+    discarded call removes it.
+    """
+    run(pool[0], 1)
+
+
 def wall(pool, n, n_new):
     reqs = [pool[i % len(pool)] for i in range(n)]
     t0 = time.time()
@@ -53,6 +66,7 @@ for name, pool in pools.items():
     print(f"\n--- {name}, {DEC} decode tokens", flush=True)
     print(f"{'conc':>6}{'prefill s':>11}{'decode s':>10}{'ms/token':>10}{'decode tok/s total':>20}",
           flush=True)
+    warmup(pool)
     for n in CONCURRENCY:
         t_pre = wall(pool, n, 1)
         t_all = wall(pool, n, DEC + 1)
