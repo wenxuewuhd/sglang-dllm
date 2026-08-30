@@ -946,10 +946,25 @@ prefill 与 decode 分开量：先跑 `max_new_tokens=1` 拿 prefill 墙钟，�
       **对 GLM 是死代码**。与 §4 早先记的「DeepEP 那条 GLM 走不到」一致。
       只有 DSv4 的 `--moe-a2a-backend deepep` 才命中
 - [ ] P6.5 NoPE 未融合的 split+RMSNorm（与 P3.3 同源，一起做）；顺带删掉那个看起来是死代码的 `q.clone()`
-- [ ] **P6.7 kpool indexer 的 expand+tail**（实测，单层单 4096-chunk 的最大单项）——
-      `expand_pooled_groups_to_topk` 中间物化了 `[4096, 512, 4]` 的 int64（67 MB）再 reshape，
-      占 6.3 ms / 单层。11 个 DSA 层 → 每个 4096-token chunk 约 69 ms。**在共享代码里**
-      （`kpool_fp8_index.py:379`），改动会影响 CUDA 路径，先 profiling 再决定
+- [x] **P6.7 kpool indexer 的 expand+tail —— 已修，15.9×**（2026-08-30）。
+      ⚠ **它不是第三条待办，它就是 P6.10 和 P6.11 加在一起的那个观测。**
+      原记录「`expand_pooled_groups_to_topk` 物化 `[4096,512,4]` 的 int64 再 reshape，
+      占 **6.3 ms/单层**」—— 那 6.3 ms 里，expand 的 int64 中间物化是 P6.10，
+      tail 的寻址退化是 P6.11。修完这两条，这一条自动没了。
+
+      实测（把改动前后的两份 `kpool_fp8_index.py` 各自 import 进来，跑完整的 expand+tail）：
+
+      | rows | 改前 | 改后 | |
+      |---|---|---|---|
+      | **4096** | **6.257 ms** | 0.393 ms | **15.9×** |
+      | 8192 | 12.482 ms | 0.845 ms | 14.8× |
+
+      **6.257 与原记录的 6.3 ms 对得上**，说明这两个观测确实是同一件事。
+      按 11 个 DSA 层折算，每个 4096-token chunk 从约 **69 ms → 4.3 ms**。输出逐位相同。
+
+      **教训**：同一段代码被从两个角度量过两次（一次按函数、一次按「阶段」），
+      就会在待办清单上变成两条，让人以为还有活没干。
+      **合并的判据是数字对得上，不是名字像。**
 - [x] **P6.6 NPU Graph —— 四类层单层捕获全部跑通并验过数值**（实测，die 14/15）。
       回归脚本 `layer_check/graph_capture/`，判据是三问：能不能捕获 / replay 还跟不跟设备输入走 /
       从图里读出来的数还对不对（双参考法）。**逐位**是这里的常态，不是巧合 ——
