@@ -872,6 +872,21 @@ class NPUDSATokenToKVPool(DSATokenToKVPool):
             index_k.reshape(-1, 1, self.index_head_dim).to(torch.bfloat16),
         )
 
+    #: [0..n) tensors reused across the DSA layers of one decode step. Keyed by
+    #: (n, device) alone: the contents are a pure function of n, so unlike a cache
+    #: over live batch tensors there is nothing that can go stale. Bounded by the
+    #: number of distinct n ever asked for -- max_running_requests plus one for
+    #: index_kpool -- so it does not grow.
+    _decode_arange_cache: dict = {}
+
+    def _decode_arange(self, n: int, device) -> torch.Tensor:
+        key = (int(n), device)
+        t = self._decode_arange_cache.get(key)
+        if t is None:
+            t = torch.arange(int(n), device=device)
+            self._decode_arange_cache[key] = t
+        return t
+
     def kpool_decode_update_index_cache(
         self,
         layer_id: int,
@@ -931,11 +946,18 @@ class NPUDSATokenToKVPool(DSATokenToKVPool):
         # the path impossible to capture into a graph. The batch is at most
         # max_running_requests, so compressing all of it is cheaper than the sync.
         closing = (valid & (safe_pos % pool_size == pool_size - 1)).unsqueeze(1)
-        rows = torch.arange(batch, device=key.device)
+        # Both aranges are loop invariants: every DSA layer in one forward
+        # rebuilt the same [0..batch) and [0..pool_size). `pool_size` is a model
+        # constant and `batch` is fixed for the step, so neither depends on the
+        # layer or on anything the step writes -- unlike the metadata cache in
+        # kpool_indexer_npu, which needs a fingerprint because its inputs are
+        # written in place. Keyed by value, so a changed batch simply misses.
+        rows = self._decode_arange(batch, key.device)
 
         start = safe_pos - safe_pos % pool_size
         phys = (
-            start.unsqueeze(1) + torch.arange(pool_size, device=key.device).unsqueeze(0)
+            start.unsqueeze(1)
+            + self._decode_arange(pool_size, key.device).unsqueeze(0)
         ) % tail_width
         # Flatten to one index tensor rather than indexing [req, slot] with two.
         # Multi-tensor advanced indexing has no AI Core implementation, so it
