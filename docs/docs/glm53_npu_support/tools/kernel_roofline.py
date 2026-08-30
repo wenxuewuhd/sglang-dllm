@@ -48,6 +48,12 @@ BW = 1.25e12  # bytes/s, measured read+write on this A3 die
 #: 2177 launch-bound kernels x 13.5 us = 29.4 ms, against a 33.3 ms step whose
 #: launch-bound total is 10.2 ms (4.7 us each).
 SMALL_OP_US = 13.5
+#: Below this many bytes, the byte count cannot explain the kernel's time.
+#: It is BW * the per-kernel fixed-cost floor, so it moves with that floor --
+#: it is not a property of the hardware on its own.  16 MiB (the old value)
+#: was BW * 13.5 us, and 13.5 us was one ConcatD call mistaken for a machine
+#: constant (see REPORT 7b.14).  Overridable with --floor-us so the sensitivity
+#: can be shown rather than asserted.
 LAUNCH_BOUND_BYTES = 16 * 1024**2
 
 DTYPE_BYTES = {
@@ -104,7 +110,14 @@ def main() -> None:
     ap.add_argument("--profile", required=True)
     ap.add_argument("--steps", type=int, required=True)
     ap.add_argument("--top", type=int, default=30)
+    ap.add_argument("--floor-us", type=float, default=None,
+                    help="per-kernel fixed-cost floor; sets the <N MB threshold as BW*floor")
     args = ap.parse_args()
+    # Two independent knobs, deliberately not tied: --floor-us moves the
+    # "bytes cannot explain this" threshold, SMALL_OP_US only splits inside it.
+    global LAUNCH_BOUND_BYTES
+    if args.floor_us is not None:
+        LAUNCH_BOUND_BYTES = args.floor_us * 1e-6 * BW
 
     path = sorted(
         glob.glob(os.path.join(args.profile, "**", "kernel_details.csv"), recursive=True)
