@@ -118,6 +118,39 @@ prefill-vs-decode 的 KL 一致性；INT8 对 **int8 CPU 参考**的 logprob 地
 （现在只能借 BF16 时代的地板，超出属预期内）；
 spec decode 前置（`kpool_decode_update_index_cache` 假设每请求一行）。
 
+### D. 从来没打开过的开关 —— ⚠ 这一节最容易被漏掉
+
+上面 A/B/C 列的都是**已知问题**。这一节是**从来没试过的东西**，
+清单上没有，所以没人会去找。全部按 2026-08-30 的启动脚本与 checkpoint 核实：
+
+| 开关 | 我们的现状 | 模型/权重其实支持 |
+|---|---|---|
+| **上下文长度** | `--context-length 32768` | **1048576（1M）** |
+| **MTP / 投机解码** | 那一层不建 | `num_nextn_predict_layers = 1`，**权重里带着** |
+| **prefix cache** | `--disable-radix-cache`（8 个脚本全带）| 标准生产特性 |
+| **DeepEP** | `--moe-a2a-backend none`（TP dispatcher）| 上规模/开 DP 才有意义 |
+
+**① 长上下文是这个模型的卖点，而我们从来没测过。**
+DSA 稀疏注意力、kpool、`index_topk=2048` 这一整套**就是为长上下文做的**，
+而我们最长跑到 32k，验精度的长提示是 3256 token。**这套架构最贵的部分基本没让它干活。**
+
+⚠ **不是改个数字就完事**：TP8 那次服务 `max_total_num_tokens=939712`，
+**一条 1M token 的请求根本放不下**。得先做容量测算（KV 池 / page 数 / TP 宽度怎么配），
+再谈精度与性能。**这是一个完整的题目，够一个 session。**
+
+**② MTP：权重里就带着那一层，我们没建。**
+前置阻塞已记在案：**`kpool_decode_update_index_cache` 假设每请求一行**，
+而投机解码一步要验证多个 token，这条得先改。
+另外单卡那条线有两处 `UNVERIFIED` 的 MTP 快照路径 ——
+**没有 MTP 配置就验不了，正好一起解决。**
+
+**③ prefix cache** 相对小，但**卡在 `causal_conv1d_fn_npu` 那个 conv state bug 上**（见 A 类）。
+单卡线翻 conv 池时应已顺手修掉，确认后打开、跑一轮 GSM8K 即可。
+
+**⚠ 别把这四条和「记账不做的」混为一谈**：
+记账那两条是**已知收益、暂时不做**；这四条是**从来没试过、连收益都不知道**。
+后者才是真正的未知，也是下一个 session 最值得接的。
+
 ### 记账不做的
 
 - **prefill 进图** —— 真正的阻塞是 `KeyError: 'block_tables'`：
