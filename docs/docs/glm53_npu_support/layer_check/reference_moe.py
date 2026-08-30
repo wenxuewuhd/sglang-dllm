@@ -4,7 +4,7 @@
 Runs GLM-5.3-Flash on CPU with real weights up to the MoE layer under test, captures
 the tensor that layer's ``mlp`` actually receives, and evaluates the *reference* MoE
 twice on it -- once fp32, once bf16 -- so ``harness.check`` has a measured noise floor
-(``operator_handoff/ACCEPTANCE.md`` §A).  Saves a ``harness.Case``.
+(``ACCEPTANCE.md`` §A).  Saves a ``harness.Case``.
 
 The model does not fit in memory 45 layers at a time (one MoE layer alone is 29 GB in
 fp32), so layers are **streamed**: build layer i on meta, fill it from the checkpoint,
@@ -42,9 +42,8 @@ import torch.nn.functional as F
 from safetensors import safe_open
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "operator_handoff"))
 from harness import Case  # noqa: E402
-from reference.tolerance import ABS_MIN, SLACK, noise_floor, rel_err  # noqa: E402
+from tolerance import ABS_MIN, SLACK, noise_floor, rel_err  # noqa: E402
 
 MODEL = os.environ.get("GLM53_MODEL", "/mnt/workspace/models/GLM-5.3-Flash-BF16")
 CKPT_PREFIX = "model.language_model."

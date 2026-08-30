@@ -19,7 +19,7 @@ G = str(_Path(__file__).resolve().parent)                  # .../layer_check/gra
 # Point SCRATCH at wherever dump_reference.py / reference_dsa.py wrote them.
 SP = _os.environ.get("SCRATCH", "/tmp/glm53_scratch")
 
-sys.path.insert(0, LC); sys.path.insert(0, G); sys.path.insert(0, LC + "/../operator_handoff")
+sys.path.insert(0, LC); sys.path.insert(0, G)
 import gcap
 ap = argparse.ArgumentParser()
 ap.add_argument("--layer", type=int, default=3)

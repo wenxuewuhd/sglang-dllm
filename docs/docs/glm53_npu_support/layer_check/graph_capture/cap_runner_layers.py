@@ -638,8 +638,7 @@ print(f"\n  -> {len(results)-len(bad)}/{len(results)} pass")
 # ---------------------------------------------------------------- gold
 if a.golden:
     hr("Q3 gold -- the tensor the GRAPH returns, scored against the CPU trace")
-    sys.path.insert(0, str(Path(LC).parent / "operator_handoff"))
-    from reference.tolerance import ABS_MIN, SLACK, noise_floor, rel_err  # noqa
+    from tolerance import ABS_MIN, SLACK, noise_floor, rel_err  # noqa
 
     if a.tp != 1:
         print(f"  !! --tp {a.tp}: the modules compute rank 0's PARTIAL "

@@ -17,30 +17,29 @@
 
 【第一件事：读文档，不要重新调研】
 docs/docs/glm53_npu_support/ 下，按顺序：
-  1. PLAN.md   —— 环境事实、算子结论、阶段计划。**每条结论都标了证据等级**
-                  （实测 / 源码 / 推断），照着用，不要重新推导。
-  2. SETUP.md  —— 环境搭建。换机才需要；坑都在里面，照做别自己摸索。
-  3. REGRESSION.md / SHARED_CHANGES.md —— 改完跑什么；动了共享代码记哪里。
-  4. probe/、tools/ —— 现成脚本，别重写。
-GLM53_flash_ascend_support_assessment.html 是最初的评估报告，**多处已被实测推翻**，
-以 PLAN.md 为准。
+  1. RESUME.md —— **最新的接手指南**，先读它（现状、机器归谁、下一步）
+  2. PLAN.md   —— 环境事实、算子结论、阶段计划。**每条结论都标了证据等级**
+                  （实测 / 源码 / 推断），照着用，不要重新推导
+  3. REGRESSION.md / SHARED_CHANGES.md —— 改完跑什么；动了共享代码记哪里
+  4. layer_check/、tools/、probe/ —— 现成脚本，别重写
+第一次接触这个项目、要从零把环境和精度跑通的，看 REPRODUCE.md。
 
 【环境】
 source /mnt/workspace/y00359136/work/glm53_dev/env/env.sh   # 然后用 npy 代替 python
 参考环境（HF golden，CPU）：$ROOT/.venv-ref/bin/python —— 绝不能装进 .venv-glm53
 
 【当前进度】
-**整网已跑通**（2026-08-29，TP16 / 45 层 / 真实 HCCL / prefill + decode / 并发 ragged 批）。
-**算子开发需求 0 项** —— 五条推断出来的缺口逐条上机核实，五条全部证伪，工单包已清空。
-五类层（DSA / KDA / MoE / mHC / dense FFN）逐层对拍全部通过，回归脚本在 layer_check/。
-NPU Graph 捕获：五类层各自 + 两个完整 decoder 层捕进同一个图 + 多 bs 共池 + 2 卡 HCCL，
-全部验通 —— 但**还没在整网上开过**。
+**BF16 与 INT8 两条线都已闭环，NPU Graph 开着。算子开发需求 0 项。**
+- 整网 TP16 / 45 层 / 真实 HCCL / graph；graph 与 eager 在同 batch 宽度下**逐位相同**
+- GSM8K：BF16 两轮 97.04 / 97.35%（判据 97.50%）；INT8 W8A8 两轮 97.80 / 97.19%，
+  对 BF16 +0.30pp，判据「1% 以内」通过
+- decode 约 8×（对 eager）；overlap scheduler 已开，另有 1.23×
+- chunked prefill：单请求 / 并发 / 2 chunk / 3 chunk 全绿
 
 【下一步】
-先读 RESUME.md，它是最新的接手指南（当前卡在哪、服务开没开、卡是不是共用的）。
-顺序：拿到 logits 对拍的地板 → 判定 eager 基线 → 开 graph（判据是**逐位相同**）
-→ 补 decode 与长上下文 → graph 下重做性能 → GSM8K。
-⚠ GSM8K 在 eager 下不可行（480 ms/token），必须等 graph。
+主线是**让 prefill 也进图**（收益上界最大：GSM8K 那种负载有 875 个 prefill 批、
+每批仅 163 token，而 prefill 全程 eager）。三步已完成一步，见 RESUME「下一步」。
+并行可做：图下重做 P6 的性能排序 —— 现有条目全是 eager 时代量的，排序会变。
 ⚠ 改完跑什么，看 REGRESSION.md 的六级阶梯；动了共享代码，记 SHARED_CHANGES.md。
 
 【工作方式（用户明确要求）】
@@ -84,8 +83,7 @@ NPU Graph 捕获：五类层各自 + 两个完整 decoder 层捕进同一个图 
 | **[SHARED_CHANGES.md](./SHARED_CHANGES.md)** | 共享路径改动台账：动了谁、影响谁、还欠什么回归 | 改到非 NPU 专属文件时 |
 | `probe/` | 探测脚本 | `p0_5_ops.py` 验环境；`p0_6_*.py` 验算子 shape；`p3_4_lightning_indexer.py` 验 kpool 打分算子 |
 | `launch_dsv4_a3.sh.example` | DSv4-Flash 起服务脚本（A3 TP16/DP16+DeepEP） | 冒烟 / 精度回归 |
-| [`operator_handoff/`](./operator_handoff/) | **已归档**：四条需求全部撤销，不需要任何算子开发。留作「五条推断缺口为何逐条证伪」的记录 | 想知道某条为什么被撤销时 |
-| [`layer_check/`](./layer_check/) | 逐层与整层对拍、图捕获验证、统一计时口径。**双参考法在 `tolerance.py`** | 改完要验数值时 |
+| [`layer_check/`](./layer_check/) | 逐层与整层对拍、图捕获验证、统一计时口径。**双参考法的说明在 `ACCEPTANCE.md`，实现在 `tolerance.py`** | 改完要验数值时 |
 | 算子清单的对外呈现页 | https://claude.ai/code/artifact/54dbfb20-667f-465d-84c1-ea7d0cc1a827 | 发给下游同事时。**内容来自本目录，仓库为准**；要更新必须带上这个 URL，否则会新建一个而不是更新它 |
 | `tools/fp8_to_bf16.py` | FP8 blockwise → BF16 逐 shard 反量化 | 换权重版本要重转时 |
 | `tools/bf16_to_int8_ct.py` | BF16 → compressed-tensors W8A8-INT8。**不需要机器**（激活动态，无需校准）| P5 量化。产物已在 `/mnt/workspace/models/GLM-5.3-Flash-W8A8` |
@@ -100,7 +98,6 @@ NPU Graph 捕获：五类层各自 + 两个完整 decoder 层捕进同一个图 
 | `layer_check/check_extend_rows.py` | `_extend_rows` 的设备侧形式与它取代的 host 循环是否逐元素相等（CPU 上跑，不需要机器）| 改了 kpool 的行分段之后 |
 | `tools/check_chunked_prefill.py` | 单条序列跨 forward 被切开之后还对不对（针探 + logprob 双探针）| 动了 KDA 状态传递或 kpool 增量写入之后 |
 | `env.sh.example` | 环境变量模板 | 复制到 `$ROOT/env.sh` |
-| `GLM53_flash_ascend_support_assessment.html` | 最初的评估报告 | 参考。**若干判断已被推翻，见 PLAN.md §2.5** |
 
 ## 30 秒背景
 
@@ -125,7 +122,7 @@ GPU 参考实现在 `upstream/xinyuan/glm-5.3-flash-support @ 0b9c38484e`（本�
 | P6 性能优化 | ☐ 进行中：图下的排序要重做 |
 
 **算子开发需求 0 项** —— 五条推断出来的缺口逐条上机核实，五条全部证伪，
-`operator_handoff/` 已清空。
+逐条的证伪理由见 `PLAN.md` §2.5。
 
 **INT8 与 BF16 吞吐基本持平**（满批下 INT8 反而快约 6%）—— 此前「INT8 慢 1.47×」的说法
 **已证伪**，那是 GSM8K aggregate tok/s 被单请求长尾污染，见 PLAN P6.15。

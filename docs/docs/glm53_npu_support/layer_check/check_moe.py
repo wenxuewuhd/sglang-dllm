@@ -42,7 +42,6 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "operator_handoff"))
 
 MODEL = os.environ.get("GLM53_MODEL", "/mnt/workspace/models/GLM-5.3-Flash-BF16")
 CKPT_PREFIX = "model.language_model."
@@ -397,7 +396,7 @@ def verify_deepep_clamp(cfg, gate, topk, layer, dispatcher, w13, w2, x_all, dev)
         NPUSwiglu,
         NPUSwigluDeepEPKernel,
     )
-    from reference.tolerance import ABS_MIN, SLACK, noise_floor, rel_err
+    from tolerance import ABS_MIN, SLACK, noise_floor, rel_err
 
     n_tok = min(8192, x_all.shape[0])
     x = x_all[x_all.shape[0] - n_tok:].to(torch.bfloat16).to(dev)
@@ -451,7 +450,7 @@ def verify_router_dtype(cfg, gate, topk, meta, x_all, dev, iters, warmup):
     top-k then upcasts them again, which cannot undo it). This scores both dtypes
     against the fp32 reference's expert set and prices the difference.
     """
-    from reference.tolerance import rel_err
+    from tolerance import rel_err
 
     ref_all = meta["topk_ids_fp32"].to(torch.int64)
     floor_all = meta["topk_ids_bf16"].to(torch.int64)

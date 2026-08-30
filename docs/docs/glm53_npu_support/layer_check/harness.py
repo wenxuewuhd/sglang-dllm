@@ -12,7 +12,7 @@ is wrong".
     stage B  (NPU, $ROOT/.venv-glm53) check_<module>.py
              Feeds the same inputs to the real sglang module on device and compares.
 
-The verdict is the two-reference method from ``operator_handoff/ACCEPTANCE.md``: the
+The verdict is the two-reference method from ``ACCEPTANCE.md``: the
 distance between the fp32 and bf16 references *is* the budget. A fixed threshold is
 wrong for this model -- the KDA layer-0 golden at seq=64 has an fp32-vs-bf16 relative
 error of 1.06e-2, so a 1e-3 gate would reject a bit-perfect implementation.

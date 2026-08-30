@@ -9,7 +9,8 @@
 ## 现状（2026-08-29）
 
 **算子开发需求：0 项。** 五条推断出来的缺口逐条上机核实，**五条全部证伪**，
-`operator_handoff/` 已清空。详见 §2.5。
+逐条的证伪理由见 §2.5。（原先那个给算子团队的工单包 `operator_handoff/` 已随之删除，
+它的验收方法学保留为 `layer_check/ACCEPTANCE.md`。）
 
 | | 状态 |
 |---|---|
@@ -257,8 +258,7 @@ device 时间类的（AI_CPU 回退、int64 算术、标量瓶颈 kernel）才�
 
 **int8 降级为 P5 显存预案**：bf16 每槽 256 B，int8 128 B（约 704 vs 352 B/token，
 按 11 个 DSA 层折算，**推断**，未在活服务上量过）。真要启用，
-`operator_handoff/specs/op1_kpool_topk_transform.md` §3 那三个条件依然成立，
-但**先要解决消费者**。
+**先要解决消费者**（`npu_quant_lightning_indexer` 只接受 `num_heads_q=64`，GLM 是 32，见 §2.5）。
 
 ---
 
@@ -503,8 +503,20 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
       量化式：`scale = absmax(W,dim=1)/127`，`q = round(W/scale).clamp(-127,127)` ——
       用 127 而不是 128 保持对称，`q*scale` 复原时没有偏移项；scale 在 fp32 里算，
       先在 bf16 里取 max 等于把 scale 自己也量化了。
-- [x] **P5.2 ignore list** —— 直接抄 checkpoint 的 `modules_to_not_convert` 原文（1509 条）：
-      KDA 34 层全部、indexer 全套、`hc_*` 全部、所有 norm/embed/router/lm_head
+- [x] **P5.2 ignore list** —— 直接抄 checkpoint 的 `modules_to_not_convert` 原文（1509 条）。
+      **注意由此产生的一个后果**（2026-08-30 从 checkpoint header 逐张量核实，
+      由 `glm53_int8_1card` 那条线量出流量占比）：**KDA 34 层的 q/k/v/o_proj 全是 BF16**
+      （每种 2.12 GiB，合计约 8.7 GiB），DSA 的 `kv_b_proj` 也是 BF16。
+      厂商的 FP8 checkpoint 就没量化它们，我们照搬了。
+
+      ⚠ **两个百分比别混**：未量化权重只占**常驻**的 4.2%（12.9 / 305.7 GiB），
+      但 **bs=1 每 token 的流量**里 MoE 只读 top-8/288，于是 KDA 反而是最大单项 ——
+      单卡 TP1 实测每 token 必读 20.7 GiB 里 KDA 占 **8.9 GiB（42%）**，比 routed 专家还多。
+      **所以「INT8 在小 batch 只小赢」有一半是因为流量的 42% 根本没被量化。**
+      TP16 下 KDA 被 16 分（每 die 约 558 MiB/token ≈ 0.45 ms），所以在我们这条线不显眼。
+      **量化 KDA 是这份 checkpoint 剩下最大的一个杠杆**，但厂商没做，做之前要先问为什么。
+
+
 - [x] ~~P5.3 288 专家校准~~ —— **不需要**。激活是动态的，没有静态激活 scale 要标定
 - [x] **P5.4 加载 —— 通过**（2026-08-29 21:56）：`quant=compressed-tensors`，
       权重 **19.57 GB/die**（BF16 是 37.25，约一半，这是格式正确的独立证据），无报错。

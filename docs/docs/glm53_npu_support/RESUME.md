@@ -156,7 +156,7 @@ INT8 错的 29 题里 **23 题 BF16 也错** —— 错的是同一批难题。
 算子清单的对外呈现页：https://claude.ai/code/artifact/54dbfb20-667f-465d-84c1-ea7d0cc1a827
 
 ⚠ **更新时必须把这个 URL 传给 Artifact 工具**，否则会新建一页而不是更新它。
-内容来自 `operator_handoff/`，**以仓库为准**。
+**以仓库为准**（算子结论在 `PLAN.md` §2）。
 
 **现在页脚和 banner 写着「端到端精度尚未跑通」，已经严重过期**：
 整网跑通、eager 与 graph 的 logits 判定通过、**GSM8K 97.35%（BF16）与 97.50%（INT8）都过了**。

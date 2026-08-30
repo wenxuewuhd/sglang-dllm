@@ -15,7 +15,7 @@
 
 ## 判据
 
-用 `operator_handoff/ACCEPTANCE.md` 的**双参考法**，实现在 `reference/tolerance.py`，
+用 `layer_check/ACCEPTANCE.md` 的**双参考法**，实现在 `reference/tolerance.py`，
 `harness.py` 直接复用它，**不要另写一份**：
 
 > fp32 参考与 bf16 参考之间的距离，**就是**这个用例的预算。
