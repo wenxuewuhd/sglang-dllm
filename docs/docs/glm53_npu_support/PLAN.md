@@ -1129,7 +1129,8 @@ DSA 每步 170 次 aten dispatch，MoE 只要 25 次。
       please export TASK_QUEUE_ENABLE=1/0`（`torch_npu/npu/graphs.py:625` 的
       `capture_begin()`）。**响亮地失败，不会静默降级** —— 这是好事。
       那 1.74× 是 eager 时代的数，图模式下 host 侧本来就没有气泡了。
-- [ ] **P6.10 `expand_pooled_groups_to_topk` 改 int32** —— prefill 的 `aclnnAdd` 花 **5.73 ms**
+- [x] **P6.10 `expand_pooled_groups_to_topk` 改 int32 —— 已修，实测 10.7×，逐位相同**（2026-08-30，`d2da5cce93`）
+      原条目： —— prefill 的 `aclnnAdd` 花 **5.73 ms**
       产出 `[8192,512,4]` 的 int64（134 MB），高于下界 **43×**。token id 最大约 32768，
       **int32 完全够**，既减半流量又避开 Ascend 上被模拟的 int64 向量运算。**在共享代码里**
 - [x] **P6.11 tail kernel —— 已修，实测 32.6×，逐位相同**（2026-08-30）。
