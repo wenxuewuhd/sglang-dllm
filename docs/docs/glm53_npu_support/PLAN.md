@@ -421,13 +421,14 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
   - [ ] **接 spec decode 前必须先解决**：`kpool_decode_update_index_cache` 假设每请求一行，
         MTP 一次多 draft token 会让同一 `req_pool_index` 的多行抢同一个 ring 槽。
         共享 CUDA kernel 有 `kpool_max_closed_pools` 那套多 token 逻辑，NPU 这条没有
-  - [ ] DSA 注意力本体还缺全零 rope 的接线（§2.3 第 3 条），否则拿到 topk 也跑不出注意力
+  - [x] ~~DSA 注意力本体还缺全零 rope 的接线~~ —— 早已接好并在跑；2026-08-30 还把它
+        从每层 expand 改成一次性分配（见 P6.16）
 
 - [x] **Dense FFN** —— 端到端已验（真实 TP16 每卡形状，M=1/16/8192），最差 0.66× 预算。
       两处与预期不同：dense FFN **根本不调 `npu_clipped_swiglu`**（走 `chunk`+`clamp`+`npu_swiglu`），
       所以那个 109× 的默认参数陷阱在这条路上不适用；而且**真实输入下 clamp 从不触发**
       （max|gate_up| = 2.17，limit 是 10），要验 clamp 必须放大输入
-- [ ] **P3.5 出口判据** —— 四模块逐层 golden 对齐
+- [x] ~~**P3.5 出口判据** —— 四模块逐层 golden 对齐~~ —— 五类层全部端到端已验，见上
 
 ### P4 · BF16 端到端 ☐ ← **当前战线：eager 已判定通过，等开 graph**
 - [x] **P4.1 TP16 / 32K / 纯文本 / 关 NPU Graph 启动** —— ✅ **2026-08-29 09:20 跑通**
@@ -560,7 +561,7 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
         ⚠ 那个地板是给 BF16 量的，INT8 多了真实量化误差，超出是预期内的；
         真正的判据是上面的 GSM8K。要给 INT8 单独测地板需要一份 int8 的 CPU 参考
 - ⚠ **磁盘现在只剩 23 GB**（BF16 599 + W8A8 306）。再要腾空间只能动 BF16
-- [ ] P5.4 **出口判据**：精度回归到 BF16 基线 1% 以内
+- [x] ~~P5.4 旧编号的出口判据~~ —— 见上面的 P5.5，已通过（+0.30pp）
 - ⚠ `INF_NAN_MODE_FORCE_DISABLE=1` **必须设**，否则 W8A8 溢出产生 NaN
 
 ### P6 · 性能 ☐（可与 P3–P5 并行）
@@ -987,8 +988,10 @@ prefill 与 decode 分开量：先跑 `max_new_tokens=1` 拿 prefill 墙钟，�
       padding 行通常带 0，于是和真实请求 0 撞同一个槽位，**重复下标的写入顺序未定义，
       真实行的写入可能被覆盖**——而这恰恰只在图捕获（padding batch）下发生。
       所以索引缓存多分配一页、tail ring 多分配一行，专供屏蔽行落地。
-      **extend 仍有同步**（`visible_pool_runs` 里的 `int(...max())`、
-      `_kpool_extend_rows_npu` 的 host 侧构造），但 prefill 本来就不捕获，不需要动
+      ⚠ **「extend 仍有同步」这句已作废**（2026-08-30 逐行审计）：整个
+      `kpool_indexer_npu.py` 里 `.item()`/`.cpu()`/`.tolist()` 一个都没有。
+      extend 侧的 host 侧构造与动态形状也已在 2026-08-30 清掉（见 P3.4），
+      但 prefill 进图另有阻塞，已记账
 - ⚠ 原「所有性能数字都是静态推算」**已作废**：下面是 kernel 级 profiler（`torch_npu.profiler`
   Level1 + PipeUtilization）实测出的排序。**墙钟看不见其中任何一条**。
 
@@ -1017,7 +1020,9 @@ DSA 每步 170 次 aten dispatch，MoE 只要 25 次。
       原始分析：**4.73 ms**，
       `aiv_vec_ratio=0.027`、`aiv_mte2_ratio=0.0`，**既不算也不搬，是纯标量瓶颈**
       （8192 个 program 打在 40 个向量核上）。**在共享代码里**
-- [ ] **P6.12 降低 DSA 的 170 次 host 调用** —— 每省一次约 13.5 µs（开 TQE=2 后约 8 µs）
+- [ ] **P6.12 降低 DSA 的 170 次 host 调用** —— 每省一次约 13.5 µs。
+      ⚠ 原文的「开 TQE=2 后约 8 µs」**已作废**：TQE=2 在图模式下根本起不来（见 P6.9）。
+      而且图模式本身就把 launch 开销吃掉了，**这条在图下的收益需要重新量**
 
 ---
 
