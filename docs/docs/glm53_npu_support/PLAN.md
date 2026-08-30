@@ -2,7 +2,7 @@
 
 > 活文档。**只记当前事实与计划，不记怎么走到这里的** —— 过程看 `git log`。
 > 每条结论都标了证据等级：**实测**（本机跑过）/ **源码**（读代码或头文件得出，未执行）/ **推断**。
-> 最后更新：2026-08-29
+> 最后更新：2026-08-30
 
 ---
 
@@ -21,6 +21,7 @@
 | **eager 精度判定**（回归阶梯第 1 级） | ✅ **8/8 在测出来的地板内**，最差 0.91×。见 `REGRESSION.md` |
 | **整网 NPU Graph** | ✅ **2026-08-29 11:06 跑通**。45 层 / 6 个 bs 桶 / 16 卡 HCCL 全在图内；同 batch 宽度下与 eager **逐位相同**；decode **约 8×**。见 P6.6b |
 | **P4.2 出口判据 GSM8K** | ✅ **97.35%**（全 1319 题、stop rate 100%、图模式 TP16 128 并发），判据 97.50%，差 0.32 个 SE。见 P4.2 |
+| **长上下文** | ✅ **2026-08-30 跑通 1,048,576**，**两个构型都确认**：INT8 TP8（8 张 die，不用整机）与 **BF16 TP16 交付构型**。五深度召回 5/5、前缀对拍 `max\|dlp\| = 0.000e+00`；TP16 上 TTFT 292.1 s、decode 25.5 ms/token。见 **P7** |
 
 **eager 基线的 logits 判定：已通过**（2026-08-29）。地板测出来了 ——
 fp32 与 bf16 跑同一件事，逐提示 mean|dlp| **9.6e-3 ~ 2.85e-1**；
@@ -44,7 +45,8 @@ eager 服务对 fp32 CPU 参考 **8/8 在地板 × 2.0 之内，最差 0.91×**�
 减少 aten dispatch）已经被图吃掉了，device 时间类的（AI_CPU 回退、int64 算术、标量瓶颈 kernel）
 才继续值钱。
 
-⚠ 起服务**必须独占整机**：GLM BF16 只能 TP16（TP8 每卡要 74.9 GB，放不下），
+⚠ **BF16 起服务要独占整机**（不是模型属性，是 BF16 的显存约束 —— 详见下面 §「必须独占整机」
+那条：**INT8 TP8 只要 38.20 GB/die，8 张卡就够**）。
 而 `bootstrap.py:339` 要求每卡空闲显存 ≥ 90%。**停服务后显存不是立刻回收的。**
 ⚠ 现有的性能数字全是 eager 时代的，**开 graph 后要重测**：host 开销类的优化
 （`TASK_QUEUE_ENABLE`、减少 aten dispatch 次数）会被图吃掉，
@@ -80,7 +82,17 @@ device 时间类的（AI_CPU 回退、int64 算术、标量瓶颈 kernel）才�
   **厂商标称值找不到**（`npu-smi` 与 CANN 配置都不给），只能报实测
 - **L2 = 168 MB**（`Ascend910_9362.ini`）。32–64 MB 的工作集实测到 2.2–2.5 TB/s ——
   **小于约 168 MB 的工作集可能根本不碰 HBM**，拿 HBM 带宽当下界会低估
-- **每 kernel 固定开销约 13.5 µs** → **流量小于约 16 MB 的 kernel 一律由 launch 开销主导**，与带宽无关
+- **每 kernel 固定开销不是一个常数，是一个跟构型走的区间**（2026-08-30 更正）：
+  eager + `TASK_QUEUE_ENABLE=1` 下一次 8 KB 的 `ConcatD` 实测 **13.5 µs**；
+  **图模式下本项目自己实测 2.8 µs/kernel**（见 P6.2 那一段）；
+  `glm53_int8_1card` 的 profile 里最小的那几行是 **1.3–1.5 µs**。
+  ⚠ **原文把那个 13.5 µs 当成机器常数写在这里，并据此推出「流量小于约 16 MB 的 kernel
+  一律由 launch 开销主导」—— 那条推论作废。** 16 MB 就是 13.5 µs × 1.25 TB/s 反推的；
+  用 1.5 µs 反推是约 1.8 MB，**差了 9 倍，而且差在会让人放弃优化小 kernel 的方向上**。
+  同一份文档里 P6.2 的 2.8 µs 早就和它打架了，一句除法就能看出来
+  （单卡线的加总校验：launch 主导的 10.179 ms ÷ 2177 个 kernel = 4.7 µs，
+  而若真是 13.5，2177 × 13.5 = 29.4 ms 已经超过整步 33.348 ms 的大半）。
+  **要用这个数就先说清楚是哪个构型下的**；跨构型照抄是这条错误的成因。
 - **`TASK_QUEUE_ENABLE=2` 把 launch 开销从 13.4–15.7 µs 降到 7.7–8.6 µs**（`0` 是最慢的 17.3 µs）。
   实测 DSA decode **1.74×**（4.857 → 2.788 ms），而 device-bound 的 prefill/MoE 纹丝不动。
   ⚠ 仓库自己的 `test/registered/npu/performance/glm5_1/` 里 **decode 节点用的是最慢的 `0`**。
@@ -122,10 +134,22 @@ device 时间类的（AI_CPU 回退、int64 算术、标量瓶颈 kernel）才�
 - **`--page-size` 必须是 64** —— DSA pool 有 `assert self.page_size == 64`。DSv4 用的是 128，照搬会启动失败
 - 纯 TP16 权重 **37.25 GB/die**（= 599/16，无复制）；DP-attention 会把 attention/dense 每 rank 各存一份
 - DSv4 的 TP16/DP16+DeepEP 配方见 `launch_dsv4_a3.sh.example`；**GLM 的见 `launch_glm_bf16.sh.example`**（已进仓库）
+- ⚠ **「必须独占整机」是 BF16 的约束，不是模型的**（2026-08-30 实测推翻）。
+  BF16 TP8 每 die 要 74.9 GB，塞不进 64 GB —— 所以 BF16 只能 TP16。
+  但 **INT8 TP8 每 die 只要 38.20 GB**（实测，与 306.1/8 = 38.26 GiB 对上），剩 22.88 GB，
+  整除性全过（64/64/32/288 都能被 8 整除）。
+  **`ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15` + `--tp-size 8` 直接可用**，
+  启动脚本 `$ROOT/run/launch_glm_w8a8_tp8.sh`。
+  **意义**：日常验证不用再抢整机，8 张卡就够，可以和别的任务并行。
+  ⚠ **但换了配置就不能沿用 TP16 BF16 的基线** —— TP 宽度变了规约顺序就变，精度也不同。
+  要在同一配置上自己造 before/after（做法：`git worktree add --detach <改动前的提交>`，
+  用它录一份基线，再用改动后的对）。
 - **起服务要求整卡近乎全空**：`distributed/bootstrap.py:339` 检查「空闲显存 ≥ 总量 90%」，
   不满足直接 raise。⚠ **停掉 agent 之后显存不是立刻回收的** —— 本项目因此失败过一次
   （停完不到一分钟就起，每卡只有 51% 空闲）。而且 GLM BF16 只能 TP16
-  （TP8 每卡要 74.9 GB，放不下），所以**整网必须独占整机**
+  （TP8 每卡要 74.9 GB，放不下），所以 **BF16 整网必须独占整机**。
+  ⚠ **INT8 不受此限**（TP8 实测 38.20 GB/die）—— 见上面那条。
+  这里曾经把它写成模型属性，于是「要 8 张卡验一下 INT8」被当成不可能的事。
 - **启动脚本里那四个 `SGLANG_OPT_*=False` 现在都走不到**（源码核查，未经一次成功启动确认）：
   它们是 mHC 接到昇腾融合算子（`1cc9eda1c5`）**之前**的绕行，修复把绕行变成了遗留。
   逐条依据写在 `launch_glm_bf16.sh.example` 的注释里。**暂不删** —— 整网基线还没跑通，
@@ -197,12 +221,29 @@ device 时间类的（AI_CPU 回退、int64 算术、标量瓶颈 kernel）才�
 | **NPU 的 bf16 矩阵乘不是 batch-shape 不变的** | 同一份输入只改 M（4096 行 vs 4080 行），过 `wk`+`k_norm` 后 **5/4080 行**差 1 个 bf16 ulp，gate 差 6/4080（实测）。根因在 torch_npu 的 matmul tiling，不在业务代码。**后果：NPU 上任何 prefill-vs-decode 的逐位一致性断言都不成立**，包括 P4 打算用的 KL 一致性 —— 只能定阈值，不能要求 bit-exact |
 | **KDA prefill 的 Triton autotune —— 确认会在真实路径上触发** | 原记「实际服务未触发，列为上线前须确认」，**现已确认：每次 prefill 都走**。`chunk_kda_scaled_dot_kkt_fwd` 由 `_AscendKDAExtendKernel.extend` 直接调用，24-config 的 `do_bench` 扫描在**第一个** config 上就把 AI core 打超时（507014 `aicore timeout`，dies 0/1/2 复现）。单独跑 14 个 config 里 13 个正常，**所以问题在 `do_bench` 本身，不是某个坏 config**。已修：在 NPU backend import 时钉死一个 config（triton 在 `len(configs)==1` 时完全跳过 benchmark），实测 `BK=64` 最快（T=8192/H=4 下 3.98 ms vs BK=32 的 4.68 ms）。**没有改共享的 `kda.py`** |
 
+**AOT `causal_conv1d` 那一族的四个陷阱**（2026-08-30，`glm53_int8_1card` 单卡实测；
+本线未复现，但值得任何碰 conv 路径的人先看）：
+
+| 陷阱 | 表现 |
+|---|---|
+| **`torch.ops.npu.causal_conv1d_update` 按自己文档的 layout 算是错的，且不报错** | 脉冲响应（weight 第 k 抽头设 `10^k`，输出即抽头编号）测出它把 4 抽头窗口读成 `[S1, S2, S2, x]` —— **只有两个不同的历史值**，任何对 3 行 state 的置换都救不回来。真实约定是 `conv_state` 要 **`[cache_len, WIDTH, dim]`（WIDTH 行，不是 WIDTH−1）**，且调用方每次后要 `torch.roll(+1)`。**未文档化，疑似 kernel bug**。⚠ 而且它比它本该替换的 torch 回退**还慢 2.5×**（b=1：689 vs 270 µs，约 0.3 GB/s） |
+| **`conv_state_indices` 传 int64 被接受但静默算错** | 相对误差 **7.5e-1**。**必须 int32**（在 update 算子上实测，varlen 上未测）|
+| **padding lane 的输出是垃圾不是零** | 一次有限、一次非有限。**调用方必须自己丢弃** |
+| **`pad_slot_id` 这个参数根本不被查** | 跳过是硬编码在「下标为负」上的。传 `pad_slot_id=99` 配下标 `99` 会直接 device assert `Index 99 out of range[0 17)` 然后 507035 |
+
+✅ **该用的是另一个**：`torch.ops.npu.causal_conv1d(..., run_mode=1)` —— GDN 路径已经在用
+（`ascend_gdn_backend.py:125`）。**60 µs/call、对 batch 平坦、比 torch 回退快 4.5×、一个 kernel 顶九个**；
+数值在双参考地板内、state 回写逐位精确、`cache_indices` 带 `-1` 时正确跳过。
+⚠ 约束：weight/state/x 的 dtype **必须三者一致且 ∈ {bf16, fp16}**；
+fp32 是**干净的 host 侧拒绝**（不是静默算错 —— 这点是好事）。
+**所以 KDA 要用它，conv 权重必须从 fp32 降到 bf16，这不是逐位不变的改动，要走双参考法。**
+
 ### 2.5 已排除（不要再做）
 
 | 项 | 为什么 |
 |---|---|
 | compressor 的 LayerNorm 变体 | **GLM 从不调 vendor `compressor`**（全仓两处引用均在 DSv4 路径）；其 index-K LayerNorm 是独立模块、压缩前施加、从未融合 |
-| K=4 causal conv1d | `sgl_kernel_npu` 的 Triton kernel `KERNEL_WIDTH` 1–6 全有，decode 已在用 |
+| K=4 causal conv1d | Triton kernel `KERNEL_WIDTH` 1–6 全有。⚠ **「decode 已在用」是错的，2026-08-30 源码核实并已改**：`causal_conv1d_update_npu` 只在 `cache_seqlens` 或 `num_accepted_tokens` 非 None 时才进 Triton，而我们的调用点（`ascend_kda_backend.py:393`）两个都不传 → 走 `torch_causal_conv1d_update_npu`。实测代价**每个 KDA 层 16 个 kernel、4.04 ms/step = 9.4%**（`Slice+Mul+ReduceSum+ConcatD` 就是被拆开的 depthwise conv）。**这条不该留在「已排除」里** —— 算子存在，但我们没用上，见 P6.2 |
 | mHC pre/post | 算子已存在且 DSv4 在用，已接线并验过 |
 | GLM 版 clipped SwiGLU | `npu_clipped_swiglu` 参数传对时逐位精确 |
 | bf16 输出的 `DequantSwigluClampQuant` | 同上，不需要 |
@@ -418,16 +459,24 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
         **这条从待办里划掉。**
   - [ ] **仍未验证**：
         TP>1（单层 harness 意义上）；多 DSA 层共享 pool；只测了 layer 3、一条 prompt
+  - [ ] ⚠ **KDA conv 池若改成 window-major，`ascend_kda_backend.py:700-780` 的
+        speculative 快照路径同样吃这个布局，但未验证**（`glm53_int8_1card` 正在做这个改动，
+        由该线声明、请本线代记 —— commit message 会被 `git log` 埋掉，
+        而下一个碰这块的人是从这里进来的）。
+        **不是「没时间」，是这个部署不跑 MTP**，没有能触发那条路径的负载。
+        **能验的条件**：起一个带 MTP / spec decode 的配置，
+        或者构造一个直接驱动快照路径的单层 harness。
   - [ ] **接 spec decode 前必须先解决**：`kpool_decode_update_index_cache` 假设每请求一行，
         MTP 一次多 draft token 会让同一 `req_pool_index` 的多行抢同一个 ring 槽。
         共享 CUDA kernel 有 `kpool_max_closed_pools` 那套多 token 逻辑，NPU 这条没有
-  - [ ] DSA 注意力本体还缺全零 rope 的接线（§2.3 第 3 条），否则拿到 topk 也跑不出注意力
+  - [x] ~~DSA 注意力本体还缺全零 rope 的接线~~ —— 早已接好并在跑；2026-08-30 还把它
+        从每层 expand 改成一次性分配（见 P6.16）
 
 - [x] **Dense FFN** —— 端到端已验（真实 TP16 每卡形状，M=1/16/8192），最差 0.66× 预算。
       两处与预期不同：dense FFN **根本不调 `npu_clipped_swiglu`**（走 `chunk`+`clamp`+`npu_swiglu`），
       所以那个 109× 的默认参数陷阱在这条路上不适用；而且**真实输入下 clamp 从不触发**
       （max|gate_up| = 2.17，limit 是 10），要验 clamp 必须放大输入
-- [ ] **P3.5 出口判据** —— 四模块逐层 golden 对齐
+- [x] ~~**P3.5 出口判据** —— 四模块逐层 golden 对齐~~ —— 五类层全部端到端已验，见上
 
 ### P4 · BF16 端到端 ☐ ← **当前战线：eager 已判定通过，等开 graph**
 - [x] **P4.1 TP16 / 32K / 纯文本 / 关 NPU Graph 启动** —— ✅ **2026-08-29 09:20 跑通**
@@ -511,7 +560,13 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
 
       ⚠ **两个百分比别混**：未量化权重只占**常驻**的 4.2%（12.9 / 305.7 GiB），
       但 **bs=1 每 token 的流量**里 MoE 只读 top-8/288，于是 KDA 反而是最大单项 ——
-      单卡 TP1 实测每 token 必读 20.7 GiB 里 KDA 占 **8.9 GiB（42%）**，比 routed 专家还多。
+      单卡 TP1 实测每 token 必读 **20.9 GiB** 里 KDA 占 **8932.5 MiB = 41.8%**，
+      与 MoE 三项合计（42.9%）基本打平。
+      （这两个数是对方发现自己第一版算错后订正的：原先每专家字节除以 43 层却乘 42 层，
+      而第 43 个 MoE 层是不建的 MTP 层；分桶又用 `'mlp.gate' in rest` 把 dense 层的
+      `mlp.gate_proj` 算进了 MoE。连带 roofline 合计 17.759 → **17.941 ms**、
+      实测/地板 2.41× → **2.39×**。方向没变，但既然要进文档就用对的数；
+      现在由 `tools/kernel_roofline.py` 自动算，不再手输。）
       **所以「INT8 在小 batch 只小赢」有一半是因为流量的 42% 根本没被量化。**
       TP16 下 KDA 被 16 分（每 die 约 558 MiB/token ≈ 0.45 ms），所以在我们这条线不显眼。
       **量化 KDA 是这份 checkpoint 剩下最大的一个杠杆**，但**用户决定先不做**（2026-08-30）。
@@ -550,11 +605,25 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
       结果都在 `$ROOT/goldens/gsm8k/`。
       旁证：INT8 错的 29 题里 **23 题 BF16 也错** —— 错的是同一批难题，
       不是量化打坏了某一类
+- [x] **P5.6 kpool 三连之后的复测 —— 通过**（2026-08-30，TP8）：
+      **97.42%**（1285/1319、stop rate 100%、0 题打到 max_tokens），
+      `$ROOT/goldens/gsm8k/int8_tp8_kpool_20260830.json`。
+
+      ⚠ **这一轮不是 kpool 改动的精度证据**，别这么读。kpool 三连（P6.7/6.10/6.11）
+      的证据是**同构型前后逐位相同**（`0.000e+00`）—— 那是个比任何评测都强的判据，
+      因为它排除的是"有差异但被采样噪声盖住"这种情况，而 GSM8K 排除不了。
+      这一轮回答的是另一个问题：**改完之后整条链路还是好的**（服务能起、
+      图能捕获、1319 题全部正常停下来）。
+
+      ⚠ **TP8，不能和上面 TP16 那两轮直接并列**：TP 宽度变了，all-reduce 的
+      归约顺序就变了，浮点加法不结合，这本身就会产生差异。97.42% 落在
+      BF16 97.19% / INT8 97.50% 中间、单轮噪声 ±1pp 之内，**结论是"没有异常"，
+      不是"比 97.50% 低了 0.08pp"** —— 后者是在读噪声。
   - [ ] logprob 对拍：INT8 对 fp32 参考 7/8 在 **BF16 时代**的地板内，1 个到 1.32×。
         ⚠ 那个地板是给 BF16 量的，INT8 多了真实量化误差，超出是预期内的；
         真正的判据是上面的 GSM8K。要给 INT8 单独测地板需要一份 int8 的 CPU 参考
 - ⚠ **磁盘现在只剩 23 GB**（BF16 599 + W8A8 306）。再要腾空间只能动 BF16
-- [ ] P5.4 **出口判据**：精度回归到 BF16 基线 1% 以内
+- [x] ~~P5.4 旧编号的出口判据~~ —— 见上面的 P5.5，已通过（+0.30pp）
 - ⚠ `INF_NAN_MODE_FORCE_DISABLE=1` **必须设**，否则 W8A8 溢出产生 NaN
 
 ### P6 · 性能 ☐（可与 P3–P5 并行）
@@ -603,8 +672,29 @@ prefill 按调度器自己的每批计时：BF16 4849 tok/s、INT8 4906 tok/s，
 
 **`glm53_int8_1card` 在单卡上实测推翻了它**：图模式下这些 kernel 合计
 **382 µs/step（0.9%）、每个 2.8 µs**，不是 3.5 ms —— 图把 launch 开销吃掉了。
-⚠ 被推翻的是**机制**，不是「TP16 bs=1 上 INT8 比 BF16 慢 3.5 ms」这个**观测**；
-那个观测的成因目前**未知**，要追就在 TP16 上按同样口径采一次 bs=1 的 profile 两边相减。
+⚠ 被推翻的是**机制**，不是「TP16 bs=1 上 INT8 比 BF16 慢 3.5 ms」这个**观测**。
+
+**2026-08-30 有了一个候选机制，而且是源码确认的**（由 `glm53_int8_1card` 发现）：
+`glm5_next.py:366` 的
+```python
+self.do_fuse_qkvbfg = quant_config is None and head_shard_size == self.tp_size
+```
+**这个条件问错了问题** —— 它问「有没有 quant_config」，该问「这几层是不是被量化了」。
+本线核实：KDA 的 `q/k/v/b/f_a/g_a/f_b/g_b_proj` **每一个都在 W8A8 的 ignore 列表里**
+（抽查 5 个 KDA 层全部 5/5），**连融合模块名 `fused_qkvbfg_a_proj` 自己也在** ——
+厂商显然预期过这条路在量化下被走。
+
+**后果：BF16 走融合路径（`quant_config is None`），INT8 不走。**
+所以 INT8 相对 BF16 白白多出每个 KDA 层 4 个小矩阵乘。
+对方在 TP1 bs=1 实测这笔是 **约 1.68 ms/step、每步 170 次启动**，全部 launch 主导
+（没有一个搬超过 2 MiB）。
+
+⚠ **机制是源码确认的，量级在 TP16 上未测**。可证伪的判据（对方给的）：
+在 TP16 上分别用 BF16 和 INT8 采一份 bs=1 profile，数 `MatMulV2 [1,4096;128,4096]`
+这一组 —— **BF16 应当没有，INT8 应当有 68/step**。
+⚠ 本线的服务级 profiling 在 16 rank 上会段错误，所以这个判据要么等一个能用的采法，
+要么改成 A/B 墙钟（对方修好之后，INT8 打不打这个补丁各测一次）。
+**修在 `glm5_next.py`，由 `glm53_int8_1card` 那条线做**，本线不重复。
 
 **教训**：一个数量级对得上的算术不构成机制证据。当时那句「量级对得上」正是让它
 读起来像结论的东西。
@@ -649,11 +739,31 @@ torch_npu 在调 aclnn 前把输入变连续，于是那个 expand 每层每步�
 （182.1 → 177.8 µs）而每步总和降 23%（7823 → 6022 µs），修复前的长尾在修复后消失。
 这个论证方式值得学 —— 均值降了可以有很多解释，长尾消失基本只有一种。
 
-**本线待做（需要整机）**：cherry-pick 后按判据验 —— profile 里
-`BroadcastTo` 的 `"1,64,1,64" → "<pages>,64,1,64"` 那组（修复前 11/step，
-`aiv_mte3_ratio ≈ 0.95`）**应当完全消失**。
-⚠ 我们的 pool 是 260 万 token，页数约 4 万、单次输出约 320 MiB = **L2 的两倍**，
-所以旁效应在 TP16 上**可能比单卡更大，而不是更小**。
+**本线已 cherry-pick 并上机验完**（`9f2a43aaad`，2026-08-30，TP16 图模式）：
+
+| | 修复前 | 修复后（3 遍） | |
+|---|---|---|---|
+| 短上下文 bs=1 | 25.4 | **23.2 / 23.3 / 23.2** | **−8.7%** |
+| 短上下文 bs=16 | 38.1 | 37.8 / 38.1 / 37.7 | −0.8%（噪声内）|
+| 长上下文 bs=1 | 26.3 | 24.4 / 24.3 | −7.7% |
+
+数值**逐位相同**（零就是零）。**bs=1 的收益复现得很紧**，与单卡那边的 −7.2% 一致。
+
+⚠ **两件要诚实说的**：
+
+① **第一次量到短上下文 bs=16 是 26.3（−31%），三遍复现都是 37.7–38.1，那是离群值。**
+去复跑是因为「短上下文 bs=16 涨 31% 而长上下文 bs=16 一动不动」自相矛盾 ——
+**不一致本身就是要求复现的信号**。按第一个数报就会报出一个假收益。
+
+② **bs=16 几乎没收益，这一点我解释不了。** 按对方的机制（开销是 O(KV pool 页数)、
+与 batch 无关），每步省下的绝对时间应该一样，即 38.1 → 约 35.9（−5.8%），
+实测却是 37.8。**要么修复前那个 38.1 本身偏低**（同一构建早前的扫描量到过 42.9，
+说明 bs=16 的轮间散布不小），**要么这个开销不是 batch 无关的**。
+两边我都没有足够的重复测量来判定 —— 要判得给修复前也跑三遍，那需要 revert 再测。
+**在此之前不要引用「bs=16 无收益」当结论。**
+
+⚠ 没有用 profile 验「BroadcastTo 消失」：16 rank 的服务级 profiling 在本线踩过全 rank
+段错误，而同机同构建、相隔几分钟的墙钟 A/B 在这里够用且风险小得多。
 
 **P6.13 overlap scheduler：开，实测 1.23× 且数值不变**（2026-08-29，A/B，200 题 GSM8K、128 并发）：
 
@@ -752,9 +862,60 @@ PLAN 里「overlap 下 `seq_lens_cpu` 领先设备张量一步」那个担忧**�
         会回落到 AI CPU 的 `aclnnIndex`（decode 那边实测占该层 device 时间的 37.5%），
         必须用扁平 `index_select`；② 对齐检查一开始写成对设备张量取 `bool(...any())`，
         那是 D2H 等待，捕获下还会抛 107027 —— 改成读 host 侧的 `*_cpu` 字段。
-  - [ ] **prefill 进图还差最后一步**：在声明式 registry
-        （`arg_groups/overrides.py` 的 `_inkling_overrides` 那套）里给 GLM 注册
-        full prefill capture，然后**整条链要上机验一次**。
+  - [ ] **prefill 进图的真正阻塞：Ascend 后端没实现 prefill 侧的图 metadata 契约**
+        （2026-08-30 上机定位，**推翻了本条原先的说法**）。
+
+        ⚠ **原先写的「差最后一步：在 registry 里注册」是错的。** 注册根本不是阻塞 ——
+        `--cuda-graph-backend-prefill full` 这个现成的 CLI 参数就能开，实测
+        `prefill.backend` 成功解析成 `full`（`_disable_full_prefill_cudagraph_if_incompatible`
+        的规则表是**空的**，FULL prefill 没有任何兼容性门槛）。
+        ⚠ 顺带：`cuda_graph_config.py:114` 那条注释说 full prefill 是
+        「opt-in via the declarative registry（见 `_inkling_overrides`）」**也不准** ——
+        `_inkling_overrides` 自己的 docstring 写着 full-graph prefill **不在 registry 里设**，
+        因为 cuda-graph 配置在 `__post_init__` 里先于声明被解析。真正的机制是 inline 的
+        `_apply_inkling_prefill_cuda_graph_default()`。
+
+        **真正炸在哪**：捕获跑到 `capture_one_shape` 抛
+        `KeyError: 'block_tables'`（`ascend_backend.py:638`）。原因是
+        `graph_metadata` 只在 `init_cuda_graph_state()` 里分配（`:585`），
+        而**那个函数只被 `decode_cuda_graph_runner.py` 调用**（`:369`、`:539`）；
+        prefill 运行器走的是另一条契约 —— 它只调
+        `init_forward_metadata_out_graph(forward_batch, in_capture=True)`
+        （`prefill_cuda_graph_runner.py:1407`），**从不调 `init_cuda_graph_state`**。
+        Ascend 的 `init_forward_metadata_out_graph` 却假设静态 buffer 已经按 decode 的
+        bs 预分配好了，于是读一个空 dict。
+
+        **决定：记账，暂不做**（用户 2026-08-30）。理由不是"太难"，是**深度未知而收益未量化**：
+
+        - **只知道第 1 个阻塞，不知道一共有几个。** 捕获停在第一个 KeyError，
+          后面还有多少层没接上的线只能一次崩溃一次地发现。这个项目里同类的
+          「接线缺口」有先例 —— 整网拉通时连撞三个，**每修一个才露出下一个**
+        - **在共享文件里，而我们刚决定不跑 DSv4 回归** —— 等于在共享的捕获路径上动手
+          却主动放弃了安全网。而捕获路径的错误特别阴：**值被烘进图里不报错、不崩、
+          数字看着也正常**
+        - **收益从没量化过。** 「prefill 是收益上界最大的一项」的依据只是
+          「GSM8K 一轮有 875 个 prefill 批」，**没有人量出 prefill 占真实负载一步的百分之几** ——
+          想量的那次服务级 profiling 把 16 个 rank 全段错误打挂了
+
+        **什么条件下值得重启这件事**（按顺序，前两步不占卡或只占一次）：
+        1. **先把收益量出来** —— 在一个真实负载下拆出 prefill 与 decode 各占多少。
+           不需要 profiler：`--max-running-requests 1` 跑固定负载，
+           对比 `--chunked-prefill-size` 大小不同的两档，或者直接用调度器日志的
+           per-batch 计时求和（`glm53_int8_1card` 的 `tools/attribute_kernels.py`
+           在低并发下是活的，可以借）
+        2. 收益够大再动手，**并且先补 DSv4 的回归安全网**
+        3. 动手时按「一次崩溃一次」的节奏走，每接上一层就记一层，别攒着
+
+        **所以这是后端工作，不是配置工作**：要给 `AscendAttnBackend` 加一条 prefill 分支，
+        直接从 `forward_batch` 建 metadata（而不是从 decode 的预分配 buffer 取），
+        或者把 buffer 也按 prefill 形状分配。⚠ **在共享文件 `ascend_backend.py` 里**，
+        DSv4 那类非 hybrid 的昇腾模型也走它。
+        ⚠ 设计上还有个未解问题：捕获的 prefill 图里 `block_tables` 也必须是静态的，
+        而它的宽度取决于序列占多少页 —— 这个上界怎么定，需要先想清楚。
+
+        **好消息**：我这三处改写（`_extend_rows` / `visible_pool_runs` 补齐 /
+        compress-write 批量化）**都不是这次失败的原因** —— 捕获在碰到它们之前就炸了。
+        它们已各自上机验过逐位相同。
   - [ ] `_kpool_compress_write_extend_npu` 仍是 host 侧循环（每请求形状不同的散写），难度更高
 
 捕获期间 `.item()`/`.cpu()` 会抛 **107027**（已实测）。
@@ -811,17 +972,82 @@ prefill 与 decode 分开量：先跑 `max_new_tokens=1` 拿 prefill 墙钟，�
       （26 µs 搬 1.5 MiB = 带宽地板的 20 倍）。**这个旋钮改数值不改性能，别动。**
       roofline：post 高于带宽下界 2.6×、pre 9.5×（去掉 sinkhorn 是 5×）——
       **prefill 下不是 host 开销主导**，和 DSA 的 100× 不是一回事
-- [ ] P6.2 **KDA prefill conv1d** —— **已量化**：Ascend 的 extend 把深度卷积拆成 **3 次调用**，
+- [ ] P6.2 **KDA 的 conv1d，prefill 与 decode 是同一个上游问题的两面**（2026-08-30，
+      根因由 `glm53_int8_1card` 找到；**该线正在做，本线不要重复**）。
+      **根因**：`memory_pool_npu.py:38-48` 把 KDA 的 conv 池建成 **channel-major**
+      `[17, 24576, 3]`，而 GDN 建成 **window-major**；wheel 里那个 AOT Ascend C 算子
+      `torch.ops.npu.causal_conv1d_update` 要的正是 window-major，
+      **所以 GDN 用得上、KDA 用不上**。把 KDA 池翻面可能一次解决 decode（4.04 ms/step）
+      和 prefill 两侧。⚠ 约束：该算子要求 weight/state 是 bf16，而 GLM 的 conv 权重是 fp32，
+      **有真实的精度问题要验**。
+      ⚠⚠ **这个函数还有一个已知的正确性缺陷，不只是慢**（2026-08-30，
+      `glm53_int8_1card` 实测）：`causal_conv1d_fn_npu` 在**一个 extend 批里混合
+      `has_initial_state`** 时会**写坏 conv state**（输出是对的，只有 state 回写坏）。
+
+      | 批内 `has_initial_state` | state err（`\|state\|` ≈ 4.2）|
+      |---|---|
+      | 全 True / 全 False | **0** |
+      | `F,T,F,T` / `T,F,T,F` | **5.84 / 5.98** |
+
+      触发条件是**一个 extend 批里同时有 prefix-cache 命中和冷请求**，生产上完全可达。
+      ⚠ **`check_kda` 抓不到**（基线 6/6 全绿）—— 它只比对 golden 那个槽位。
+
+      **本线记录在案的所有精度数字都不受影响，但那是碰巧**：我们全部 8 个启动脚本都带
+      `--disable-radix-cache`（服务端 `disable_radix_cache=True` 已核实），
+      没有 prefix-cache 命中，于是 `has_initial_state` 每批一致为 False，
+      触发形状从未出现。**那个 flag 在那儿是为了让测量可复现，不是为了躲这个 bug。**
+      ⛔ **所以：在这条修好之前，不要打开 radix cache 去跑精度评测** ——
+      而"上生产先把 prefix cache 打开"恰恰是最自然的下一步动作。
+
+      原 prefill 侧的量化：Ascend 的 extend 把深度卷积拆成 **3 次调用**，
       而共享 CUDA 路径对整个 qkv 宽度只做 **1 次打包调用**。实测 **6.5 ms / 单层 14.3 ms = 45%**，
       而且这 3 次调用**各带 3 次 host 等待**（prefill 全部 9 次 host 往返都在这里）。原条目： —— `causal_conv1d_fn_npu` 内部退回 `F.conv1d`（`sgl_kernel_npu` 上游的实现选择）；
       且 Ascend 后端拆成 3 次调用而共享后端只做 1 次
-- [ ] P6.3 **MoE SwiGLU clamp** —— 现在是 2×clamp + `cat` + `npu_swiglu` 四个 kernel，可换成一个 `npu_clipped_swiglu`
-- [ ] P6.4 DeepEP-normal 的 D2H 同步（`moe_runner/ascend.py:270-274`，prefill 每 forward 42 次）—— 修在第三方 wheel 里，先 profiling
+- [x] **P6.3 SwiGLU clamp —— 关闭**（2026-08-30，由 `glm53_int8_1card` 实测收尾）。
+      ⚠ **只对 shared expert 成立，别按字面读成 routed**：「2×clamp + `cat` + `npu_swiglu`
+      四个 kernel」按形状对应的是 **shared expert**（`deepseek_v2.py:463-471`）；
+      **routed 那条早已不是这个形态** —— 1× 向量界 clamp + `npu_dequant_swiglu_quant`，
+      两个 kernel、没有 `cat`。
+
+      **`torch_npu.npu_clipped_swiglu` 是好的**：参数传对
+      （`alpha=1.0, limit=10.0, bias=0.0, interleaved=False`）时与两步式**四种情况全部逐位相同**，
+      包括把输入放大 48× 让 limit 真正咬到的两种。两个反向对照都有牙：
+      全默认参数 `max|Δ|=156`（就是 §2.4 那个 109× 陷阱），
+      对「完全不 clamp」`max|Δ|=2.9e4`（证明它真的在 clamp）。
+
+      ⚠⚠ **和同族的假算子形成直接对照，这条比收益值钱**：
+      `custom::npu_dequant_swiglu_clamp_quant` **静默忽略 `clamp_limit`**（与不 clamp 逐位相同），
+      而 `torch_npu.npu_clipped_swiglu` 参数传对就精确。
+      **同一族、名字都带 clamp、一个真一个假。逐个验，不能类推。**
+
+      **收益很小**：可融合的只有 shared expert 那段，约 **108 µs（0.3%）**，低于单次 profile 的噪声底，
+      所以判据用 **kernel 计数**（`ClipByValueV2 [1,4096]` 42→0）而不是墙钟。
+      做它的理由是逐位相同、验证近乎零成本、顺带去掉 45 个 kernel
+- [x] ~~P6.4 DeepEP-normal 的 D2H 同步~~ —— **对当前部署配方不成立，关闭**（2026-08-30）。
+      那 42 次 D2H 在 `pre_permute_deepep_normal_to_ascend` 里，而 `--moe-a2a-backend none`
+      走的是 `pre_permute_ascend_tp_to_ascend`（`moe_runner/ascend.py:249`）——
+      **对 GLM 是死代码**。与 §4 早先记的「DeepEP 那条 GLM 走不到」一致。
+      只有 DSv4 的 `--moe-a2a-backend deepep` 才命中
 - [ ] P6.5 NoPE 未融合的 split+RMSNorm（与 P3.3 同源，一起做）；顺带删掉那个看起来是死代码的 `q.clone()`
-- [ ] **P6.7 kpool indexer 的 expand+tail**（实测，单层单 4096-chunk 的最大单项）——
-      `expand_pooled_groups_to_topk` 中间物化了 `[4096, 512, 4]` 的 int64（67 MB）再 reshape，
-      占 6.3 ms / 单层。11 个 DSA 层 → 每个 4096-token chunk 约 69 ms。**在共享代码里**
-      （`kpool_fp8_index.py:379`），改动会影响 CUDA 路径，先 profiling 再决定
+- [x] **P6.7 kpool indexer 的 expand+tail —— 已修，15.9×**（2026-08-30）。
+      ⚠ **它不是第三条待办，它就是 P6.10 和 P6.11 加在一起的那个观测。**
+      原记录「`expand_pooled_groups_to_topk` 物化 `[4096,512,4]` 的 int64 再 reshape，
+      占 **6.3 ms/单层**」—— 那 6.3 ms 里，expand 的 int64 中间物化是 P6.10，
+      tail 的寻址退化是 P6.11。修完这两条，这一条自动没了。
+
+      实测（把改动前后的两份 `kpool_fp8_index.py` 各自 import 进来，跑完整的 expand+tail）：
+
+      | rows | 改前 | 改后 | |
+      |---|---|---|---|
+      | **4096** | **6.257 ms** | 0.393 ms | **15.9×** |
+      | 8192 | 12.482 ms | 0.845 ms | 14.8× |
+
+      **6.257 与原记录的 6.3 ms 对得上**，说明这两个观测确实是同一件事。
+      按 11 个 DSA 层折算，每个 4096-token chunk 从约 **69 ms → 4.3 ms**。输出逐位相同。
+
+      **教训**：同一段代码被从两个角度量过两次（一次按函数、一次按「阶段」），
+      就会在待办清单上变成两条，让人以为还有活没干。
+      **合并的判据是数字对得上，不是名字像。**
 - [x] **P6.6 NPU Graph —— 四类层单层捕获全部跑通并验过数值**（实测，die 14/15）。
       回归脚本 `layer_check/graph_capture/`，判据是三问：能不能捕获 / replay 还跟不跟设备输入走 /
       从图里读出来的数还对不对（双参考法）。**逐位**是这里的常态，不是巧合 ——
@@ -910,8 +1136,10 @@ prefill 与 decode 分开量：先跑 `max_new_tokens=1` 拿 prefill 墙钟，�
       padding 行通常带 0，于是和真实请求 0 撞同一个槽位，**重复下标的写入顺序未定义，
       真实行的写入可能被覆盖**——而这恰恰只在图捕获（padding batch）下发生。
       所以索引缓存多分配一页、tail ring 多分配一行，专供屏蔽行落地。
-      **extend 仍有同步**（`visible_pool_runs` 里的 `int(...max())`、
-      `_kpool_extend_rows_npu` 的 host 侧构造），但 prefill 本来就不捕获，不需要动
+      ⚠ **「extend 仍有同步」这句已作废**（2026-08-30 逐行审计）：整个
+      `kpool_indexer_npu.py` 里 `.item()`/`.cpu()`/`.tolist()` 一个都没有。
+      extend 侧的 host 侧构造与动态形状也已在 2026-08-30 清掉（见 P3.4），
+      但 prefill 进图另有阻塞，已记账
 - ⚠ 原「所有性能数字都是静态推算」**已作废**：下面是 kernel 级 profiler（`torch_npu.profiler`
   Level1 + PipeUtilization）实测出的排序。**墙钟看不见其中任何一条**。
 
@@ -930,17 +1158,207 @@ DSA 每步 170 次 aten dispatch，MoE 只要 25 次。
       please export TASK_QUEUE_ENABLE=1/0`（`torch_npu/npu/graphs.py:625` 的
       `capture_begin()`）。**响亮地失败，不会静默降级** —— 这是好事。
       那 1.74× 是 eager 时代的数，图模式下 host 侧本来就没有气泡了。
-- [ ] **P6.10 `expand_pooled_groups_to_topk` 改 int32** —— prefill 的 `aclnnAdd` 花 **5.73 ms**
+- [x] **P6.10 `expand_pooled_groups_to_topk` 改 int32 —— 已修，实测 10.7×，逐位相同**（2026-08-30，`d2da5cce93`）
+      原条目： —— prefill 的 `aclnnAdd` 花 **5.73 ms**
       产出 `[8192,512,4]` 的 int64（134 MB），高于下界 **43×**。token id 最大约 32768，
       **int32 完全够**，既减半流量又避开 Ascend 上被模拟的 int64 向量运算。**在共享代码里**
-- [ ] **P6.11 重写 `_append_kpool_tail_to_topk_kernel`** —— ⚠ **中断时已有关键进展，别从头做**：
+- [x] **P6.11 tail kernel —— 已修，实测 32.6×，逐位相同**（2026-08-30）。
+      **一行改动**：`tl.load(... safe_history_cols ...)` → `tl.load(... cols ...)`。
+      那个 clamp **改不了任何被 mask 保留的通道**（`is_history` 是 `cols < history_len`
+      而 `history_len <= N_COLS`，所以取值处 `cols` 本来就在范围内），它只改了**地址表达式** ——
+      对 `cols` 非仿射，于是连续向量 load 退化成逐元素寻址。**这就是这个 kernel 的全部开销**，
+      与 profile 的 `aiv_vec_ratio=0.027`、`aiv_mte2_ratio=0.0`（既不算也不搬）完全对上。
+
+      实测（`probe/p6_11_tail_clamp.py`，单卡，两个变体并排跑）：
+
+      | rows | 带 clamp | 去掉 | |
+      |---|---|---|---|
+      | **8192（部署形状）** | 5.313 ms | **0.163 ms** | **32.6×** |
+      | 4096 | 2.603 | 0.092 | 28.3× |
+      | 1024 | 0.576 | 0.088 | 6.6× |
+      | 16 | 0.087 | 0.087 | 1.0× |
+
+      四种形状**输出全部逐位相同** —— 这同时证明了 **triton-ascend 遵守「被屏蔽的通道不访问内存」
+      这个契约**，而那正是去掉 clamp 的前提。收益随行数增长、小行数归零，符合「每 program 的
+      寻址开销」这个解释。
+      **这个模式在别处扫过一遍了**（`glm53_int8_1card` 按同样的判据查了自己的热路径，
+      结论是**否定的**，值得记下来免得有人重扫）：
+      - 它那 25 个小向量算子**根本不是 Triton** —— 是 `torch_causal_conv1d_update_npu`
+        拼出来的 aten 算子（`Slice+Mul+ReduceSum+ConcatD`）。同样是「时间不在字节里」，
+        但**病因不同**：这条是**寻址退化**（改一行表达式），那条是**算子个数**（要换算子）
+      - 全包 80 处 `tl.minimum/maximum` 里绝大多数是 softmax 累加器
+        （`new_e_max = tl.maximum(...)`），**不是地址表达式**
+      - 唯二同形状的两处在 `flash_block_score_decode.py:911/919-920`，
+        但 **GLM 走不到**（我们的 NPU/DSA 代码一处都不 import，GLM 用厂商的
+        `npu_lightning_indexer`）。⚠ **而且它在 wheel 里不在本仓库**
+        （`sgl_kernel_npu/indexer/`）—— 即使哪天可达，也不能在树内改，得打补丁或走上游
+
+      **这条修复的价值两边差 32 倍，而且是量化过的**：prefill 侧（8192 行）值 **32.6×**；
+      而在对方 bs=1 decode 的 profile 里，这个 kernel 是 **50.1 µs/step、11 次、4.6 µs/次** ——
+      **已经贴在启动开销上，可省的是 0**。与本表 `rows=16 → 1.0×` 是同一件事的两个独立观测。
+      **「同一个优化在两边价值差很远」这次有了数。**
+
+      **整网已验**（2026-08-30，TP8 INT8 / die 8-15）：与 P6.10 一起，对**同一配置下
+      改动前的基线**逐位相同（`0.000e+00`，3256 token 长提示 + 短提示各 60 decode token）。
+      单卡探针只证明单个函数等价，这一步证明接线没被改坏。
+      ⚠ **在共享代码里**（`kpool_fp8_index.py`），CUDA 路径同样走这个 kernel。
+      掩码 load 的契约在 CUDA 上同样成立，且 clamp 本就来自上游原始提交
+      （`0b9c38484e`，CUDA 上开发）而非为昇腾加的防御 —— 但**本线没有 CUDA 机器可验**。
+
+      ⚠ **原记录里那条「4.73 ms 全部来自被 clamp 的 gather load」是对的，但我一开始猜错了是哪一个**：
+      kernel 里有两处 clamp 的 load，我先怀疑页表那个，查调用点才发现
+      **NPU 路径 `page_table` 和 `topk_offsets` 两个都不传**（`kpool_indexer_npu.py:600-606`），
+      `HAS_PAGE_TABLE=False`，那段根本没编进来。是历史值那个 load。
+      **「哪一个」这件事必须查调用点，不能从 kernel 里看。**
+
+      原记录（保留）：当初设计的「三处 store」重写方案**既不必要、本身也是错的**
+      （三处 store 地址区间重叠、同一 CTA 内跨线程竞态）—— **那条路不要再走**，
+      `git stash` 第一条是它未验证的半成品。原始分析：
       实测**那 4.73 ms 全部来自被 clamp 的 gather load**，单把它去掉就是 **5.557 → 0.282 ms（约 20×）**。
       而当初设计的「三处 store」重写方案**既不必要、本身也是错的**（三处 store 地址区间重叠，
       同一 CTA 内跨线程竞态）—— **那条路不要再走**。未验证的半成品在 `git stash` 第一条。
       原始分析：**4.73 ms**，
       `aiv_vec_ratio=0.027`、`aiv_mte2_ratio=0.0`，**既不算也不搬，是纯标量瓶颈**
       （8192 个 program 打在 40 个向量核上）。**在共享代码里**
-- [ ] **P6.12 降低 DSA 的 170 次 host 调用** —— 每省一次约 13.5 µs（开 TQE=2 后约 8 µs）
+- [ ] **P6.12 降低 DSA 的 170 次 host 调用** —— ⚠ 原文写「每省一次约 13.5 µs」，
+      **那个单价已作废**（见 §1，它是 eager 下一次 8 KB ConcatD 的观测，不是机器常数）。
+      图下的单价是 **2.8 µs** 量级，收益要按那个重算。
+      ⚠ 原文的「开 TQE=2 后约 8 µs」**已作废**：TQE=2 在图模式下根本起不来（见 P6.9）。
+      而且图模式本身就把 launch 开销吃掉了，**这条在图下的收益需要重新量**
+
+### P7 · 长上下文 ✅（2026-08-30，INT8 W8A8 TP8 上闭环；BF16 TP16 的交付构型确认待做）
+
+**结论：GLM-5.3-Flash 在 8 张 die 上跑通了 checkpoint 声称的完整 1,048,576 上下文**，
+五个深度的针全部召回。**不需要整机** —— 这一条推翻了「长上下文得先做容量测算才知道能不能跑」
+的预期：容量这一关在 TP8 上就过了。
+
+构型：`launch_glm_longctx.sh.example`（W8A8 TP8 / die 8-15 / 端口 30023 /
+`--mem-fraction-static 0.90` / `--max-running-requests 8` / chunk 8192 /
+graph 开 / overlap 开 / **radix 关**）。KV 池 **1,363,904 token / 17.89 GB**。
+
+工具：`tools/check_long_context.py`（三个探针，见下）。
+
+#### 容量：每 token 的 KV 是 14080 B，且**每个 die 存一份**
+
+| 部署 | KV 池 | #tokens | B/token |
+|---|---|---|---|
+| BF16 TP16（`glm_bf16_graph_1104.log`）| 15.67 GB | 1,195,072 | 14080 |
+| INT8 TP8 mrr=128（`tp8_int8_gsm8k_1343.log`）| 12.32 GB | 939,712 | 14080 |
+| INT8 TP8 mrr=8 本轮 | 17.97 GB | 1,370,624 | 14080 |
+
+拆开正好是 **11 个 DSA 层 × (kv_lora 512 + index_head_dim 128) × 2 B**。
+MLA latent 不按 TP 切，所以这是**每 die** 的值。三份独立部署整除到同一个常数 ——
+**这个数可以直接拿去做容量估算**。
+
+- 一条 1M token 的请求要 **13.75 GiB/die**。TP8 池子 17.89 GiB → 装得下，**并发上限 1**。
+- **34 个 KDA 层的状态与上下文长度无关**（TP8 实测约 20 MiB/槽）。
+  这正是混合架构值钱的地方：长上下文的边际成本只在那 11 个 DSA 层。
+- **卡并发的是谁，随上下文长度换人**：mamba 每槽 ÷ KV 每 token 的交叉点，
+  TP8 约 **1490 token**、TP1 约 **11150 token**（单卡线实测 149.8 MiB/槽）。
+  交叉点随 TP 度数下降 —— mamba 每槽被切分，而 KV 每 die 每 token 不变。
+  ⚠ **同一句「并发被 X 卡住」在两个工况下一句对一句错，写结论必须带工况。**
+
+#### ⚠ 1M 下必须显式传 `--max-running-requests`（新发现，此前没人记过）
+
+`kv_cache_configurator.resolve_max_num_reqs` 在不传时算
+`estimated = token_capacity / context_len * 512`，然后 `max(min(estimated, 4096), 2048)`
+—— **那个 2048 的下界与 `context_len` 无关**。1M 上下文下它会把
+`req_to_token`（`(mrr+1) × context_len × 4 B`）顶到 **8.6 GB/die**。
+
+而 `req_to_token` 是在 KV 池定容**之后**分配的（`_resolve_memory_pool_config`：
+先 `_profile_available_bytes` → `config_from_budget` → `resolve_max_num_reqs` → 建池），
+**不从 KV 预算里扣**，吃的是 `mem_fraction_static` 留的 slack。
+所以它**不会表现成 OOM，会表现成「莫名其妙少了几个 GB」**。传 8 只要 34 MB。
+
+同一类的还有一个：`_zero_rope` 的零 rope 缓存是 **O(KV 池)**（1.24M token 时 159 MiB），
+也是定容之后惰性分配。**提高 mem-fraction 会同时放大它。**
+
+#### 三个探针，缺一不可
+
+| 探针 | 判据 | 抓什么 / 抓不到什么 |
+|---|---|---|
+| **召回** | 五个深度（0/25/50/75/99%）的针全中 | 唯一能说「稀疏选择选对了区域」的。**与构型无关**，TP8 INT8 上的结论对 TP16 BF16 也成立 |
+| **前缀不变性** | **逐位相同**，不是「在地板内」 | 抓「长尾往回够到了前缀」—— 那种情况**针照样找得到而 logits 已经漂了** |
+| **时序曲线** | 机制指得出来 + 预测成立 | 抓「有东西在扫全长」 |
+
+前缀不变性为什么该是逐位相同：模型全程因果，且前缀长度取 `chunked_prefill_size` 的整数倍时，
+两次跑切成同样的 chunk、同样的 GEMM 形状。**取非整数倍就不成立**（末 chunk 宽度不同 →
+形状地板回来），工具会警告。
+
+#### 阶梯（全部在同一台 `--context-length 1048576` 的服务上跑）
+
+| 提示 token | 召回 | TTFT (s) | 二次模型预测 | 误差 | decode ms/token | 前缀不变性 |
+|---|---|---|---|---|---|---|
+| 32,640 | **5/5** | 6.7（热态）| — | — | 27.6 | — |
+| 130,944 | **5/5** | 28.3 | — | — | 28.2 | **0.000e+00 / 32767 位** |
+| 261,952 | **5/5** | 60.8 | 61.5 | −1.1% | 28.9 | — |
+| 523,904 | **5/5** | 139.4 | 142.3 | −2.0% | 30.2 | — |
+| **1,048,448** | **5/5** | **347.6** | 363 | +4.2% | **32.9** | **0.000e+00 / 32767 位** |
+
+⭐ **`--context-length` 不影响给定长度请求的成本**，实测两次独立印证：
+130,944 的提示在 ctx=131072 与 ctx=1048576 两台服务上 TTFT 都是 **28.3 s**；
+32,640 的提示在 ctx=32768 上 6.6 s、在 ctx=1048576 上热态 6.7 s
+（冷启 8.7 s 的差全是首请求热身，`--skip-server-warmup`）。
+**所以整条阶梯一台服务就能跑完** —— 省 4 次重启，每次约 4 分钟。
+
+#### prefill 有真实的二次项，而且二次的是「选」不是「算」
+
+只用 32k / 128k **两个点**拟合 `T(n) = a·n + b·n²`
+（a = 1.976e-4 s/token，b = 1.415e-10 s/token²），在 256k / 512k / 1M 上误差
+**−1.1% / −2.0% / +4.2%**。1M 处二次项占 **43%**。
+
+机制指得出来：kpool indexer 给第 r 行 query 打分时要扫 `r/index_kpool` 个 pool，
+整条 prefill 是 **n²/8 次 pool 打分**。稀疏注意力本体是线性的（每行只看 `topk=2048`）。
+
+**这一项在服务日志里不用 profile 就能看见**：`Prefill batch` 那行的
+`input throughput (token/s)` 是**逐 chunk** 打的。同样 8192 token 的 chunk，
+512k 请求里头部 3740 → 尾部 3052；1M 请求里头部 3740 → 尾部 2237。
+**判断长上下文 prefill 是否健康，先看这条曲线是不是线性上升；超线性就是另一个 bug。**
+
+#### decode 近似平坦，但「近似」的含义要说准
+
+27.6 (32k) → 28.2 → 28.9 → 30.2 → **32.9 (1M)**：**32× 上下文只涨 19.6%**，
+每翻一倍稳定 +1.1 ms，拟合 `decode(n) ≈ 27.3 + 5.4e-6·n` ms（1M 处线性项 5.7 ms）。
+
+**封顶的是「读多少 KV」（`index_topk=2048` 固定），涨的是「在多少候选里选」
+（`n/4` 个 pool，32k 是 8192 个、1M 是 262144 个）。这是两件事，别混。**
+decode 之所以没像 prefill 那样二次，是因为它每步只选一次，而 prefill 要为 n 行各选一次。
+
+#### BF16 TP16 交付构型 —— ✅ 已确认（2026-08-30 19:02，整机）
+
+`--context-length 1048576 --max-running-requests 8 --mem-fraction-static 0.85`，
+其余同 `launch_glm_bf16.sh.example`。KV 池 **1,193,728 token / 15.65 GB**
+（= 14077 B/token，**第四份独立部署印证 14080**），1M 需 1,048,576 -> 富余 145,152。
+
+| 提示 token | 召回 | TTFT (s) | decode ms/token | 前缀不变性 |
+|---|---|---|---|---|
+| 32,640 | **5/5** | 6.3 | **20.2** | — |
+| **1,048,448** | **5/5** | **292.1** | **25.5** | **0.000e+00 / 32767 位** |
+
+**两个构型并排（同一条提示、同一套判据）**：
+
+| | TP8 INT8（8 die）| TP16 BF16（16 die）| 比 |
+|---|---|---|---|
+| 32,640 decode | 27.6 ms/tok | 20.2 | 1.37x |
+| 1,048,448 TTFT | 347.6 s | 292.1 s | 1.19x |
+| 1,048,448 decode | 32.9 ms/tok | 25.5 | 1.29x |
+
+⚠ **die 数翻倍只换来 1.19x / 1.29x，原因可以指名**：1M 的 prefill 里约 43% 是
+kpool 的「选」，而 `index_n_heads = 32` 在 TP16 下**每 die 只剩 2 个头**（TP8 是 4，
+TP1 是全部 32）。**主导项恰好不是被 TP 切得最干净的那部分。**
+=> 推论一：**日常长上下文验证走 TP8 是划算的** —— 慢 19%，省下整台机器。
+=> 推论二：**任何在窄 TP 上量出来的 indexer / DSA 比值，都是整个 TP 谱系里最有利的一端，
+   不能往多卡外推。**
+
+#### 还没做的
+
+- [ ] **长上下文 + 并发**。本轮全是单请求（1M 下并发上限本来就是 1），
+      但 256k 以下可以并发，而「批里有别人时才会发生的事」单请求结构上碰不到（RESUME 教训 7）。
+- [ ] **开 radix cache 之后重跑**。本轮全程 `--disable-radix-cache`：
+      `causal_conv1d_fn_npu` 混合 `has_initial_state` 会写坏冷请求的 conv state（P6.2），
+      **开着它出来的召回数字不可信**。
+- [ ] **1M 的性能优化**。二次项占 43% 是可攻击的，但先量清楚 prefill 在真实负载里的占比
+      （与 P3.4 的重启条件同理）。
 
 ---
 

@@ -742,7 +742,7 @@ class MambaPool:
                             temporal_state_shape[2],
                         ),
                         dtype=ssm_dtype,
-                        device="cuda",
+                        device=device,
                     )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token
                 # during target verify.
@@ -810,7 +810,7 @@ class MambaPool:
                                 conv_shape[1],
                             ),
                             dtype=conv_dtype,
-                            device="cuda",
+                            device=device,
                         )
                         for conv_shape in dense_conv_shapes
                     ]
@@ -4309,6 +4309,36 @@ class HybridLinearKVPool(KVCache):
             seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,
             round_scale=round_scale,
+        )
+
+    def kpool_spec_update_index_cache(
+        self,
+        layer_id: int,
+        key: torch.Tensor,
+        slot_score: torch.Tensor,
+        ape: torch.Tensor,
+        block_tables: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        write_start: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        num_draft_tokens: int,
+        num_accept_tokens: Optional[torch.Tensor] = None,
+    ) -> None:
+        assert (
+            self.use_dsa
+        ), "kpool_spec_update_index_cache called when use_dsa is False"
+        layer_id = self._transfer_full_attention_id(layer_id)
+        self.full_kv_pool.kpool_spec_update_index_cache(
+            layer_id=layer_id,
+            key=key,
+            slot_score=slot_score,
+            ape=ape,
+            block_tables=block_tables,
+            req_pool_indices=req_pool_indices,
+            write_start=write_start,
+            out_cache_loc=out_cache_loc,
+            num_draft_tokens=num_draft_tokens,
+            num_accept_tokens=num_accept_tokens,
         )
 
     @property

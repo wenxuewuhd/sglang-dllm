@@ -128,44 +128,6 @@ int32 上限 2.1e9，**要到 20 亿的上下文才会溢出**。
 
 ---
 
-## 4. `layers/quantization/mxfp4_flashinfer_trtllm_moe.py` —— 只报告，**没改**
-
-**问题**：`maybe_fuse_routed_scale_and_shared_add()` 的**第一句**是
-
-```python
-from sglang.srt.layers.quantization.expert_pack import ExpertPackMoEMethod
-```
-
-而 `expert_pack.py` 的模块头部是 `from sgl_kernel.quantization import ggml_moe_a8_vec`。
-`sgl_kernel` 是 CUDA 扩展。于是在任何 quant-method 判断之前就
-`ModuleNotFoundError: No module named 'sgl_kernel'`。
-
-**谁会碰到**：`DeepseekV2MoE.forward_normal` **每次 forward 的结尾**都调它，
-而 GLM 的 MoE 就是它（`glm5_next.py:106`：`from ...deepseek_v2 import DeepseekV2MoE as Glm5NextMoE`）。
-所以 **GLM 在昇腾上的每一次 MoE decode 都会撞上**；DSv4 / 任何非 CUDA 平台的
-DeepseekV2 系 MoE 同理。
-
-**实测**（2026-08-29，`layer_check/graph_capture/cap_runner_layers.py`，A3 单卡）：
-GLM layer 3 的 MoE 在图捕获的第一次 forward 就抛这个异常。
-之前没暴露，是因为 `check_moe.py` / `cap_moe.py` 都是**手搭 moe runner**、
-不经过 `DeepseekV2MoE.forward`。
-
-**为什么没改**：共享路径（`layers/quantization/`），按本文件的规矩先报告。
-
-**建议的修法**（一行位置）：把那个 import 挪进 `isinstance` 判断里，或者包一层
-`try: ... except ImportError: ExpertPackMoEMethod = ()`。函数体里另外三个
-Mxfp4* import 也是 CUDA-only 但它们**没有**模块级的 `sgl_kernel` 依赖，所以只有
-`expert_pack` 这一条是致命的。
-
-**绕过（测试用，不进产品路径）**：
-`layer_check/graph_capture/runner_fixture.py:patch_shared_path_gaps()`
-把这个函数替成它自己的 `fused=False` 分支（昇腾必然走的那条）。
-
-**回归**：CUDA 侧不受影响（import 本来就成功）。修完需要在 CUDA 上跑一次
-DeepseekV2/V4 的 MoE 前向确认 `fused` 判定没变。
-
----
-
 ## 4. `layers/quantization/mxfp4_flashinfer_trtllm_moe.py` —— 把一个 CUDA-only 的 import 包起来
 
 **改动**：`maybe_fuse_routed_scale_and_shared_add()` 里对 `ExpertPackMoEMethod` 的 import

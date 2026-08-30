@@ -164,10 +164,24 @@ def max_visible_pool_runs(n_rows: int, batch: int, kpool: int) -> int:
 
     Within one request the row's key count rises by exactly one per row, so
     ``pool_lens = key_count // kpool`` changes once every ``kpool`` rows and the
-    request contributes at most ``ceil(q_len / kpool) + 1`` runs. Summed over the
-    batch that is at most ``ceil(n_rows / kpool) + batch``; the extra 1 is slack.
+    request contributes at most ``ceil(q_len / kpool) + 1`` runs.
+
+    Summing that needs ``sum_b ceil(q_len_b / kpool) <= n_rows / kpool + batch``:
+    **the sum of ceilings is not the ceiling of the sum.** The previous form,
+    ``ceil(n_rows / kpool) + batch + 1``, dropped that second ``batch`` and is a
+    real bound only while every request is long compared to ``kpool``. Eight
+    requests of two rows each need 16 runs and it allowed 13, and an overflowing
+    ``max_runs`` is not a tight fit -- ``visible_pool_runs`` scatters into a
+    ``max_runs + 1`` buffer, so the run index runs off the end and the AI CPU
+    raises (measured 2026-08-30: `ScatterElements` errcode 0x2a, aclnnSWhere
+    507018, during speculative verify capture).
+
+    Extend batches here always carry long requests, which is why this held; a
+    verify batch carries ``num_draft_tokens`` rows per request, which is short by
+    construction. The ``n_rows`` cap makes it exact for that case -- a run cannot
+    span less than one row.
     """
-    return -(-n_rows // kpool) + batch + 1
+    return min(n_rows, -(-n_rows // kpool) + 2 * batch + 1)
 
 
 def select_pools(
@@ -293,6 +307,15 @@ class KPoolNPUIndexerMixin:
         silent -- wrong pool lengths, right shapes -- which is why this checks twice
         rather than picking the cleverer of the two.
         """
+        from sglang.srt.runtime_context import max_speculative_num_draft_tokens
+
+        # Off under speculative decoding: the draft model's DSA layer id is
+        # `num_hidden_layers`, above every target layer id, so "ids increase
+        # within one forward" cannot tell a draft forward from a continuation of
+        # the target's. That hit would be silent -- right shapes, wrong pool
+        # lengths -- and this costs only the 0.68 ms/step it saves.
+        cacheable = max_speculative_num_draft_tokens() is None
+
         seq_lens = forward_batch.seq_lens
         key = (
             seq_lens.data_ptr(),
@@ -302,7 +325,7 @@ class KPoolNPUIndexerMixin:
             batch,
             int(forward_batch.batch_size),
         )
-        cached = self._kpool_step_meta.get("entry")
+        cached = self._kpool_step_meta.get("entry") if cacheable else None
         if cached is not None and cached[0] == key and layer_id > cached[1]:
             return cached[2]
 
@@ -322,7 +345,8 @@ class KPoolNPUIndexerMixin:
         pooled = build_pooled_page_table_64(block_tables, self.index_kpool)
         block_table = pooled[req_index_row.long()].contiguous()
         meta = (seq_lens_row, req_index_row, pool_lens_row, cu_seqlens_q, block_table)
-        self._kpool_step_meta["entry"] = (key, layer_id, meta)
+        if cacheable:
+            self._kpool_step_meta["entry"] = (key, layer_id, meta)
         return meta
 
     def _kpool_head_gate_npu(self, x: torch.Tensor) -> torch.Tensor:
@@ -487,6 +511,65 @@ class KPoolNPUIndexerMixin:
             valid=tail_valid.reshape(-1),
         )
 
+    def _kpool_spec_write_npu(
+        self, *, key, gate_score, forward_batch, layer_id, block_tables, pool
+    ):
+        """Compress-write for a speculative batch; returns the per-row key counts.
+
+        ``write_start`` is where this mode's N rows land, and the two modes
+        differ: target-verify appends N unverified tokens at ``seq_lens``, and
+        the draft-extend pass that follows rewrites those same N slots from
+        ``seq_lens - N`` with the accept count in hand.
+        """
+        # Not off the attention backend: `get_attn_backend()` hands back the
+        # `_AscendKDAHybrid` wrapper, which forwards no such attribute (measured
+        # -- it raised AttributeError here, which is the good outcome; the
+        # wrapper trap in this project is usually a silent default). The runtime
+        # context is also what sized `tail_extra_slots`, so the assert in
+        # `kpool_spec_update_index_cache` compares two values from one source.
+        from sglang.srt.runtime_context import max_speculative_num_draft_tokens
+
+        n_draft = max_speculative_num_draft_tokens()
+        n_rows = key.shape[0]
+        batch = n_rows // n_draft
+        assert batch * n_draft == n_rows, (n_rows, n_draft)
+
+        seq_lens = forward_batch.seq_lens[:batch].long()
+        if forward_batch.forward_mode.is_target_verify():
+            write_start = seq_lens
+            num_accept_tokens = None
+        else:
+            write_start = seq_lens - n_draft
+            spec_info = forward_batch.spec_info
+            num_accept_tokens = (
+                None if spec_info is None else spec_info.num_accept_tokens
+            )
+
+        pool.kpool_spec_update_index_cache(
+            layer_id=layer_id,
+            key=key,
+            slot_score=gate_score,
+            ape=self.index_kpool_compress_ape,
+            block_tables=block_tables,
+            req_pool_indices=forward_batch.req_pool_indices[:batch],
+            write_start=write_start,
+            out_cache_loc=forward_batch.out_cache_loc[:n_rows],
+            num_draft_tokens=n_draft,
+            num_accept_tokens=num_accept_tokens,
+        )
+
+        # Row (b, i) sees write_start[b] + i + 1 keys; one formula for both
+        # modes because write_start already carries the difference.
+        i_n = torch.arange(n_draft, device=key.device, dtype=torch.int64)
+        seq_lens_row = (write_start.unsqueeze(1) + i_n.unsqueeze(0) + 1).reshape(-1)
+        req_index_row = (
+            torch.arange(batch, device=key.device, dtype=torch.int64)
+            .unsqueeze(1)
+            .expand(batch, n_draft)
+            .reshape(-1)
+        )
+        return seq_lens_row.to(torch.int32), req_index_row.to(torch.int32)
+
     @staticmethod
     def _extend_rows(extend_seq_lens, seq_lens, n_rows: int):
         """Per-query-row sequence length and owning request, from device tensors.
@@ -569,9 +652,13 @@ class KPoolNPUIndexerMixin:
             return torch.full(
                 (x.shape[0], out_cols), -1, dtype=torch.int32, device=x.device
             )
-        if not (mode.is_decode_or_idle() or mode.is_extend()):
+        # TARGET_VERIFY answers True to is_extend(), so it has to be pulled out
+        # ahead of the extend branch; DRAFT_EXTEND_V2 answers False to both.
+        is_spec = mode.is_target_verify() or mode.is_draft_extend_v2()
+        if not (is_spec or mode.is_decode_or_idle() or mode.is_extend()):
             raise NotImplementedError(
-                f"The Ascend kpool indexer supports decode and extend, got {mode}."
+                f"The Ascend kpool indexer supports decode, extend and "
+                f"speculative verify, got {mode}."
             )
 
         pool = get_token_to_kv_pool()
@@ -585,7 +672,16 @@ class KPoolNPUIndexerMixin:
 
         # Write the cache before scoring: a query sees every pool that closed at
         # or before its own position, its own included.
-        if mode.is_decode_or_idle():
+        if is_spec:
+            seq_lens_row, req_index_row = self._kpool_spec_write_npu(
+                key=key,
+                gate_score=gate_score,
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                block_tables=block_tables,
+                pool=pool,
+            )
+        elif mode.is_decode_or_idle():
             batch = key.shape[0]
             pool.kpool_decode_update_index_cache(
                 layer_id=layer_id,

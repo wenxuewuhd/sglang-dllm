@@ -392,8 +392,15 @@ def expand_pooled_groups_to_topk(
     assert page_table is None or topk_offsets is None
 
     device = group_ids.device
-    offsets = torch.arange(pool_size, device=device, dtype=torch.int64)
-    token_ids = group_ids.to(torch.int64).unsqueeze(-1) * pool_size + offsets
+    # int32, not int64. A pool id is at most context_length / pool_size, so a token id
+    # is at most context_length -- 32768 here, ~2^20 even on a 1M-context model --
+    # against int32's 2.1e9. The wide type cost twice on Ascend: the [rows, groups,
+    # pool_size] intermediate is 128 MB at the deployment shape (8192 x 512 x 4) and
+    # exists only to be narrowed again, and int64 vector arithmetic is emulated.
+    # Measured: 7.179 ms against 0.671 ms at that shape, bit-identical output
+    # (probe/p6_10_expand_int32.py).
+    offsets = torch.arange(pool_size, device=device, dtype=torch.int32)
+    token_ids = group_ids.to(torch.int32).unsqueeze(-1) * pool_size + offsets
     token_ids = token_ids.reshape(group_ids.shape[0], topk)
     valid = (
         group_valid.unsqueeze(-1)
@@ -404,16 +411,19 @@ def expand_pooled_groups_to_topk(
     if page_table is not None:
         assert page_table.ndim == 2
         assert page_table.shape[0] == group_ids.shape[0]
-        safe_ids = token_ids.clamp(min=0, max=page_table.shape[1] - 1)
+        # gather's index must be int64, so this branch pays the widening that the
+        # others no longer do. It is also not a path Ascend takes -- the NPU indexer
+        # passes neither page_table nor topk_offsets.
+        safe_ids = token_ids.clamp(min=0, max=page_table.shape[1] - 1).to(torch.int64)
         output = torch.gather(page_table, dim=1, index=safe_ids).to(torch.int32)
     elif topk_offsets is not None:
         if topk_offsets.ndim == 2:
             assert topk_offsets.shape[1] == 1
             topk_offsets = topk_offsets.squeeze(1)
         assert topk_offsets.ndim == 1
-        output = (token_ids + topk_offsets.to(torch.int64).unsqueeze(1)).to(torch.int32)
+        output = token_ids + topk_offsets.to(torch.int32).unsqueeze(1)
     else:
-        output = token_ids.to(torch.int32)
+        output = token_ids
 
     return torch.where(valid, output, torch.full_like(output, -1))
 
@@ -520,9 +530,18 @@ def _append_kpool_tail_to_topk_kernel(
     tail_count = seq_len % POOL_SIZE
 
     is_history = cols < history_len
-    safe_history_cols = tl.minimum(cols, N_COLS - 1)
+    # Index with `cols`, not a clamped copy of it. The clamp cannot change a lane the
+    # mask keeps -- `is_history` is `cols < history_len` and `history_len <= N_COLS` --
+    # so it only ever rewrote addresses that are never read. What it did change is the
+    # address expression: non-affine in `cols`, so the contiguous vector load became
+    # per-element addressing. That is the whole cost of this kernel, which profiles at
+    # aiv_vec_ratio 0.027 and aiv_mte2_ratio 0.0 -- neither computing nor moving.
+    # Measured on A3 at the deployment shape (8192 rows x 2048 cols): 5.313 ms with the
+    # clamp, 0.163 ms without, bit-identical output (probe/p6_11_tail_clamp.py). The
+    # speedup tracks the row count -- 32x at 8192 rows, 1x at 16 -- as an addressing
+    # cost should.
     history_value = tl.load(
-        topk_ptr + row * topk_stride_0 + safe_history_cols * topk_stride_1,
+        topk_ptr + row * topk_stride_0 + cols * topk_stride_1,
         mask=mask & is_history,
         other=-1,
     )

@@ -254,15 +254,22 @@ def _compare_decode(a: dict, b: dict) -> int:
         return 0
     n = min(len(a["out_ids"]), len(b["out_ids"]))
     first = next((t for t in range(n) if a["out_ids"][t] != b["out_ids"][t]), None)
+    # Only the shared prefix. Past a divergence the two runs are scoring different
+    # continuations, so their logprobs are not comparable and the number that comes
+    # out is meaningless -- measured elsewhere at 2.8e-01 against 1.9e-02 for the
+    # same change, a 15x difference produced entirely by comparing across a fork.
+    upto = n if first is None else first
     dlp = max(
-        (abs(a["out_logprobs"][t] - b["out_logprobs"][t]) for t in range(n)), default=0.0
+        (abs(a["out_logprobs"][t] - b["out_logprobs"][t]) for t in range(upto)),
+        default=0.0,
     )
     if first is None:
         print(f"           decode: {n} tokens identical, max|dlp|={dlp:.3e}")
         return 0
     print(
         f"           decode: DIVERGES at generated token {first} "
-        f"({a['out_ids'][first]} vs {b['out_ids'][first]}), max|dlp|={dlp:.3e}"
+        f"({a['out_ids'][first]} vs {b['out_ids'][first]}); "
+        f"max|dlp|={dlp:.3e} over the {upto} shared tokens"
     )
     return 1
 
