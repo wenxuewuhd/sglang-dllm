@@ -474,6 +474,25 @@ class DeepseekV2MLP(nn.Module):
                 # 567.9 us/step across the 42 shared experts, and it spent 13.5 us
                 # per call to move 8 KB -- 37 vector cores started to do nothing
                 # (aiv_vec_time 0.02 us). It was never about bandwidth.
+                # `torch_npu.npu_clipped_swiglu(alpha=1.0, limit=swiglu_limit,
+                # bias=0.0, interleaved=False)` replaces these two calls exactly --
+                # verified bit-identical at [1,4096] and [16,4096] with the input
+                # scaled 48x so the limit actually bites, against two controls with
+                # teeth (its own defaults are off by max|d|=156, and it differs from
+                # *not* clamping by 2.9e4). It is nonetheless not used here, because
+                # it is slower: measured 8.22 us/call against 4.27 for npu_swiglu
+                # plus 2.64 for this clamp, so folding 42 shared experts plus 3 dense
+                # layers into one kernel each costs +65.6 us/step while removing 45
+                # kernels. Whole-step effect was -0.026 ms, i.e. nothing.
+                #
+                # Worth keeping in mind before the next fusion: fewer kernels is a
+                # proxy for less fixed cost, and the proxy fails when the fused
+                # kernel is not doing equivalent work per launch.
+                #
+                # ⚠ Do not reach for the sibling `custom::npu_dequant_swiglu_clamp_quant`
+                # on the routed path by analogy -- it silently ignores clamp_limit
+                # (see the note in npu/moe/activation.py). Same family, both named
+                # clamp, one honours it and one does not.
                 from sglang.srt.hardware_backend.npu.moe.activation import (
                     apply_swiglu_limit_,
                 )
