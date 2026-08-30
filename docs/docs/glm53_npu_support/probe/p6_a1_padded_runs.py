@@ -61,7 +61,15 @@ def main() -> int:
     exact = run_indexer(query, key, weights, cu, lens, block_table)
     print(f"exact:  {n_runs} runs -> out {tuple(exact.shape)} {exact.dtype}")
 
-    for extra in (1, 8, n_runs):
+    # 1 / 8 / n_runs were the original three. The fix to `max_visible_pool_runs`
+    # (ceil-of-sum was not sum-of-ceils) adds one `batch` more padded runs than
+    # before, so the values a real extend batch now produces are +batch: 8 at the
+    # measured serving shape, 128 at max_running_requests. Asking the operator
+    # directly is the only reproducible way to ask -- through the server, eight
+    # concurrent requests group into prefill batches nondeterministically, and an
+    # A/B of the two bounds came back with max|dlp| up to 2.7 that reproduced at
+    # 1.9 when the SAME build was run against itself (measured 2026-08-30).
+    for extra in (1, 8, 16, 128, n_runs):
         # Padding a prefix sum means repeating the last value: the added runs start
         # where they end, so they span no query rows.
         cu_p = torch.cat([cu, cu[-1:].repeat(extra)])
