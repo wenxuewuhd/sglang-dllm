@@ -992,11 +992,26 @@ prefill 与 decode 分开量：先跑 `max_new_tokens=1` 拿 prefill 墙钟，�
       而共享 CUDA 路径对整个 qkv 宽度只做 **1 次打包调用**。实测 **6.5 ms / 单层 14.3 ms = 45%**，
       而且这 3 次调用**各带 3 次 host 等待**（prefill 全部 9 次 host 往返都在这里）。原条目： —— `causal_conv1d_fn_npu` 内部退回 `F.conv1d`（`sgl_kernel_npu` 上游的实现选择）；
       且 Ascend 后端拆成 3 次调用而共享后端只做 1 次
-- [ ] P6.3 **SwiGLU clamp —— ⚠ 只对 shared expert 成立，别按字面读成 routed**
-      （2026-08-30 更正）。「2×clamp + `cat` + `npu_swiglu` 四个 kernel」按形状对应的是
-      **shared expert**（`deepseek_v2.py:463-471`）。**routed 那条早已不是这个形态** ——
-      它是 1× 向量界 clamp + `npu_dequant_swiglu_quant`，两个 kernel、没有 `cat`。
-      可换成一个 `npu_clipped_swiglu` 的是前者
+- [x] **P6.3 SwiGLU clamp —— 关闭**（2026-08-30，由 `glm53_int8_1card` 实测收尾）。
+      ⚠ **只对 shared expert 成立，别按字面读成 routed**：「2×clamp + `cat` + `npu_swiglu`
+      四个 kernel」按形状对应的是 **shared expert**（`deepseek_v2.py:463-471`）；
+      **routed 那条早已不是这个形态** —— 1× 向量界 clamp + `npu_dequant_swiglu_quant`，
+      两个 kernel、没有 `cat`。
+
+      **`torch_npu.npu_clipped_swiglu` 是好的**：参数传对
+      （`alpha=1.0, limit=10.0, bias=0.0, interleaved=False`）时与两步式**四种情况全部逐位相同**，
+      包括把输入放大 48× 让 limit 真正咬到的两种。两个反向对照都有牙：
+      全默认参数 `max|Δ|=156`（就是 §2.4 那个 109× 陷阱），
+      对「完全不 clamp」`max|Δ|=2.9e4`（证明它真的在 clamp）。
+
+      ⚠⚠ **和同族的假算子形成直接对照，这条比收益值钱**：
+      `custom::npu_dequant_swiglu_clamp_quant` **静默忽略 `clamp_limit`**（与不 clamp 逐位相同），
+      而 `torch_npu.npu_clipped_swiglu` 参数传对就精确。
+      **同一族、名字都带 clamp、一个真一个假。逐个验，不能类推。**
+
+      **收益很小**：可融合的只有 shared expert 那段，约 **108 µs（0.3%）**，低于单次 profile 的噪声底，
+      所以判据用 **kernel 计数**（`ClipByValueV2 [1,4096]` 42→0）而不是墙钟。
+      做它的理由是逐位相同、验证近乎零成本、顺带去掉 45 个 kernel
 - [x] ~~P6.4 DeepEP-normal 的 D2H 同步~~ —— **对当前部署配方不成立，关闭**（2026-08-30）。
       那 42 次 D2H 在 `pre_permute_deepep_normal_to_ascend` 里，而 `--moe-a2a-backend none`
       走的是 `pre_permute_ascend_tp_to_ascend`（`moe_runner/ascend.py:249`）——
