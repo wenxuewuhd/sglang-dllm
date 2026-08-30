@@ -1060,9 +1060,9 @@ class AscendAttnBackend(AttentionBackend):
         attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0)
         return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-    # One zero page per (device, dtype, page shape), aliased across the whole
-    # cache -- see _nope_zero_rope.
-    _nope_rope_page: dict = {}
+    # One all-zero rope tensor per (device, dtype, shape), allocated on first
+    # use and shared by every DSA layer -- see _nope_zero_rope.
+    _nope_rope_zeros: dict = {}
 
     #: The only rope width npu_sparse_flash_attention accepts (measured: None, 0,
     #: 16, 32 and 128 all raise).
@@ -1095,35 +1095,45 @@ class AscendAttnBackend(AttentionBackend):
         every score -- and against a torch MLA reference the result comes back at
         rel 3e-3, which is bf16 output rounding.
 
-        A real key rope would be a second paged cache, ~10% more KV holding
-        nothing but zeros. One zero page aliased across every page with a
-        stride-0 ``expand`` gives bit-identical results, and the query side takes
-        the same treatment.
+        A real key rope is a second paged cache holding nothing but zeros.  The
+        stride-0 ``expand`` that used to stand here was meant to avoid paying for
+        it, and it did not: the operator's docs say non-contiguous inputs are
+        unsupported, and torch_npu makes the input contiguous before the call, so
+        the expand was materialised **on every call**.  Measured on one A3 die
+        (2026-08-30, kernel profile of a real decode step): one
+        ``BroadcastTo`` per DSA layer per step, ``[1,64,1,64] -> [19403,64,1,64]``,
+        ``aiv_mte3_ratio`` 0.95 -- 159 MiB of stores to produce zeros, 11 times a
+        step, 0.70 ms of a 42.8 ms step.  Worse, the cost is O(KV pool), not
+        O(batch) or O(sequence): growing the pool to 1.52 M tokens took it to
+        1.34 ms.
 
-        ⚠ The operator's docs say non-contiguous inputs are unsupported, so the
-        aliasing is observed behaviour, not promised behaviour. If a CANN update
-        stops honouring the stride, allocate real tensors instead -- correct,
-        just larger.
+        So allocate the zeros once and keep them.  Same bytes on the wire into the
+        operator, but written at startup instead of 11 times per token.  The cache
+        is keyed by the full shape and shared across every DSA layer, so it is one
+        allocation (159 MiB at 1.24 M KV tokens, scaling with the pool), not one
+        per layer.
         """
         w = self.NOPE_ROPE_WIDTH
-        key = (k_nope.device, k_nope.dtype, tuple(k_nope.shape[1:-1]))
-        page = self._nope_rope_page.get(key)
-        if page is None:
-            page = torch.zeros(
-                (1, *k_nope.shape[1:-1], w), dtype=k_nope.dtype, device=k_nope.device
-            )
-            self._nope_rope_page[key] = page
-        k_pe = page.expand(k_nope.shape[0], *([-1] * (k_nope.dim() - 1)))
-        q_key = (q_nope.device, q_nope.dtype, q_nope.dim())
-        q_page = self._nope_rope_page.get(q_key)
-        if q_page is None:
-            q_page = torch.zeros(
-                (1,) * (q_nope.dim() - 1) + (w,),
-                dtype=q_nope.dtype,
-                device=q_nope.device,
-            )
-            self._nope_rope_page[q_key] = q_page
-        return q_page.expand(*q_nope.shape[:-1], w), k_pe
+        return (
+            self._zero_rope((*q_nope.shape[:-1], w), q_nope.dtype, q_nope.device),
+            self._zero_rope((*k_nope.shape[:-1], w), k_nope.dtype, k_nope.device),
+        )
+
+    def _zero_rope(
+        self, shape: tuple, dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
+        """A contiguous all-zero tensor of `shape`, allocated at most once.
+
+        Shared across DSA layers and across decode steps.  Nothing writes to it,
+        so aliasing one buffer everywhere is safe, and handing back the *same*
+        tensor every call is what lets NPU graph capture bake a stable address.
+        """
+        key = (device, dtype, shape)
+        t = self._nope_rope_zeros.get(key)
+        if t is None:
+            t = torch.zeros(shape, dtype=dtype, device=device)
+            self._nope_rope_zeros[key] = t
+        return t
 
     def forward_sparse(
         self,
