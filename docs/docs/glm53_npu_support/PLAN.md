@@ -485,7 +485,7 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
       `--floor`（判定必须显式传进来，不给默认阈值）
   - [ ] prefill-vs-decode 的 KL 一致性 —— 还没做
 
-### P5 · W8A8 compressed-tensors ☐（权重已转出，等上机加载）
+### P5 · W8A8 compressed-tensors ✅（已闭环：转换 → 加载 → 精度判据全过）
 - [x] **P5.0 权重已转换**（2026-08-29）：`/mnt/workspace/models/GLM-5.3-Flash-W8A8`，
       **62 shard / 306.1 GiB / 564 秒**，转换器 `tools/bf16_to_int8_ct.py`。
       **不需要机器** —— 激活是 per-token 动态量化，没有要校准的东西、没有前向要跑，
@@ -506,11 +506,24 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
 - [x] **P5.2 ignore list** —— 直接抄 checkpoint 的 `modules_to_not_convert` 原文（1509 条）：
       KDA 34 层全部、indexer 全套、`hc_*` 全部、所有 norm/embed/router/lm_head
 - [x] ~~P5.3 288 专家校准~~ —— **不需要**。激活是动态的，没有静态激活 scale 要标定
-- [ ] **P5.4 上机第一关：能不能被加载**。格式是照代码契约写的，**还没真正加载过一次**。
-      起服务加载 `GLM-5.3-Flash-W8A8` 是接手这块的人的第一件事
-- [ ] **P5.5 出口判据**：GSM8K 回归到 BF16 基线 **1% 以内**。
-      基线就是 `$ROOT/goldens/gsm8k/` 那两轮（97.04 / 97.35%）。
-      **每侧 2 轮**才够（1 轮时 1pp 只有 1.5σ，2 轮 2.1σ），BF16 那侧已经有了
+- [x] **P5.4 加载 —— 通过**（2026-08-29 21:56）：`quant=compressed-tensors`，
+      权重 **19.57 GB/die**（BF16 是 37.25，约一半，这是格式正确的独立证据），无报错。
+      省下的 17.7 GB 全给了 KV：pool 从 111 万涨到 **260 万 token**。
+      冒烟：短提示正确；**3256 token 长提示（稀疏路径生效）段落六个事实全对**
+- [x] **P5.5 出口判据 —— 通过**（2026-08-30，每侧 2 轮）：
+
+      | | run 1 | run 2 | 均值 |
+      |---|---|---|---|
+      | BF16 | 97.04% | 97.35% | **97.19%** |
+      | **INT8 W8A8** | 97.80% | 97.19% | **97.50%** |
+
+      差 **+0.30pp**（差值 SE 0.46pp），判据「1% 以内」**通过**。
+      结果都在 `$ROOT/goldens/gsm8k/`。
+      旁证：INT8 错的 29 题里 **23 题 BF16 也错** —— 错的是同一批难题，
+      不是量化打坏了某一类
+  - [ ] logprob 对拍：INT8 对 fp32 参考 7/8 在 **BF16 时代**的地板内，1 个到 1.32×。
+        ⚠ 那个地板是给 BF16 量的，INT8 多了真实量化误差，超出是预期内的；
+        真正的判据是上面的 GSM8K。要给 INT8 单独测地板需要一份 int8 的 CPU 参考
 - ⚠ **磁盘现在只剩 23 GB**（BF16 599 + W8A8 306）。再要腾空间只能动 BF16
 - [ ] P5.4 **出口判据**：精度回归到 BF16 基线 1% 以内
 - ⚠ `INF_NAN_MODE_FORCE_DISABLE=1` **必须设**，否则 W8A8 溢出产生 NaN
@@ -525,6 +538,56 @@ analyse 报 `no such table: TASK` / `The collected data has been lost`。
 **要 profile 就走 `layer_check/kernel_profile.py` 那条单模块路线**（Level1 + PipeUtilization，
 已验证可用）；服务级的先别碰，真要碰就降到低并发、去掉 `record_shapes`、
 并且**准备好服务会挂**。
+**P6.15 INT8 与 BF16 的吞吐：基本持平，局部 INT8 更快**（2026-08-30，空闲机器实测）。
+
+⚠ **先纠正一处错误结论**：此前根据 GSM8K 的「aggregate tok/s」报过
+「INT8 比 BF16 慢 1.47×（159 vs 234）」，**那是错的**。
+**aggregate tok/s 不是吞吐指标** —— 它把 128 路满批（约 2000 tok/s）和
+单请求长尾（约 30 tok/s）平均在一起，谁碰上一条不收敛的生成谁就难看。
+那一轮 INT8 有 2–3 条请求跑到了 32768 的上下文上限，独占机器约 1210 秒；
+两轮的**满批阶段长度几乎一样**（INT8 1200 s vs BF16 1230 s），
+985 秒的差全在尾巴上。
+
+**按 `#running-req ≥ 120` 开窗口比较（这才是可比的部分）**：
+
+| | 满批 gen throughput 均值 | 中位 |
+|---|---|---|
+| INT8 | **263** | 251 |
+| BF16 run1 / run2 | 245 / 249 | 246 / 248 |
+
+**INT8 反而快约 6%。** 干净重跑的 e2e 也落在 BF16 的轮间散布内
+（INT8 1512 s / 209 tok/s，对 BF16 的 1490 s / 206 与 1360 s / 234）。
+
+分阶段受控 A/B（`bench_graph_decode.py`）：
+
+| decode ms/token | bs=1 | bs=8 | bs=128 |
+|---|---|---|---|
+| BF16 | 25.4 | 35.0 | 71.7 |
+| INT8 | **28.9（慢 14%）** | 36.6 | **66.0（快 8%）** |
+
+prefill 按调度器自己的每批计时：BF16 4849 tok/s、INT8 4906 tok/s，**差 1% 以内**。
+
+**bs=1 那 14% 的成因（源码 + 计数，非 kernel profile）**：量化线性走
+`NPUW8A8Int8DynamicLinearMethod.apply`，每次 `npu_quant_matmul` 之前都要单独发一次
+`torch.ops.npu.npu_dynamic_quant(x)` —— BF16 路径没有这个 kernel。
+按 checkpoint 实际量化的模块数（12 个 MLA 层 × 4 + 43 个 shared expert × 2 + 3 个 dense × 2）
+= **每次 forward 多 140 个 kernel**，3.5 ms / 140 ≈ 25 µs 一个，量级对得上。
+bs=128 时这笔固定开销摊薄，int8 GEMM 的收益反超 —— 这就是符号翻转的原因。
+
+**「MoE 会不会偷偷反量化回 bf16」这个假设是错的**（源码核实）：MoE 路径
+**一个额外 kernel都没多** —— 激活量化被融进了 `npu_moe_init_routing_v2(quant_mode=1)`
+（gmm1 的输入）和 `npu_dequant_swiglu_quant`（gmm2 的输入）。
+`process_weights_after_loading` 转置成 `[E,K,N]` 并转 `FRACTAL_NZ`，对齐前置检查通过，
+两份日志里**都没有 "Skipping FRACTAL_NZ format cast" 警告** —— 快路径在用。
+
+**结论：INT8 不需要性能修复。** 真要动 bs=1 那 140 个 kernel，得把 dynamic quant
+融进前面的 RMSNorm（`npu_add_rms_norm_quant` 那类），是逐层接线且有数值风险，
+而且对真实服务负载（大 batch）没有收益。
+
+⚠ **给后来者的度量建议**：别再用 GSM8K 的 aggregate tok/s 判吞吐。
+用 `#running-req` 对齐后的满批 `gen throughput`，或者直接用 `bench_graph_decode.py`。
+要让墙钟可复现，把 `--max-tokens` 压到 4096（实测 p99 是 891、最大 11891），不损精度。
+
 **P6.13 overlap scheduler：开，实测 1.23× 且数值不变**（2026-08-29，A/B，200 题 GSM8K、128 并发）：
 
 | | 墙钟 | q/s | token/s | 准确率 |
@@ -777,6 +840,14 @@ DSA 每步 170 次 aten dispatch，MoE 只要 25 次。
       （463/8192 = 5.65% 的 token 选错，最差那个输出偏 34%），**同一块 die 上换 fp32
       精确恢复到地板**。耗时 decode +36 µs、prefill 8192 +383 µs（整层的 8%）。
       顺带一条：**`moe_router_dtype` 这个配置项在 sglang 全仓没有任何消费者**
+- [ ] **MoE 的 `weight_scale` 被降到 bf16，linear 侧保持 fp32**（源码 + 实测，**未处理**）：
+      `NPUW8A8Int8MoEMethod.process_weights_after_loading`（`moe_methods.py:528`）
+      把每通道 scale 从 fp32 降成 **bf16**，而 `linear_method_npu.py:129` 保持 fp32。
+      在本 checkpoint 上实测：这在权重本身约 9.1e-3 的量化误差之上，
+      再叠一层系统性的每通道增益误差，**均值 1.7e-3、最大 2.5e-3**。
+      torch_npu 文档说 `npu_grouped_matmul` 的 `scale` 在 `group_list` 是张量时
+      **fp32 也合法**，所以改回 fp32 是可行的 —— 但没测它会不会选到同一个 kernel，
+      而且 97.19% 的结果不构成动它的理由。**记作线索，不是 bug。**
 - [ ] **DSv4 的一处潜在 bug**：bf16 fallback 读 int8 buffer 却**不施加 scale**（`ascend_dsv4_backend.py:637-641`），
       仅因 `:685` 无条件强制 int8 而不可达
 - [ ] **triton-ascend 的 `_hadamard128` codegen 缺陷**（UB 越界，上下文相关）—— 值得上报。

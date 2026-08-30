@@ -119,11 +119,14 @@ GPU 参考实现在 `upstream/xinyuan/glm-5.3-flash-support @ 0b9c38484e`（本�
 | P3 逐模块对拍 | ✅ 五类层（DSA / KDA / MoE / mHC / dense FFN）端到端全验 |
 | **P4 端到端** | ✅ **闭环**。TP16 整网跑通；logprob 对拍 8/8 在实测地板内；**GSM8K 97.35%**（判据 97.50%）|
 | **P6 NPU Graph** | ✅ 45 层整网捕获；同 batch 宽度下与 eager **逐位相同**；decode **约 8×** |
-| P5 W8A8 | ◐ **权重已转出**（306.1 GiB，62 shard，校验通过），**等上机加载验证** |
+| **P5 W8A8** | ✅ **闭环**。加载通过（`quant=compressed-tensors`，19.57 GB/die）；**GSM8K 两轮均值 97.50% vs BF16 97.19%，差 +0.30pp** |
 | P6 性能优化 | ☐ 进行中：图下的排序要重做 |
 
 **算子开发需求 0 项** —— 五条推断出来的缺口逐条上机核实，五条全部证伪，
 `operator_handoff/` 已清空。
+
+**INT8 与 BF16 吞吐基本持平**（满批下 INT8 反而快约 6%）—— 此前「INT8 慢 1.47×」的说法
+**已证伪**，那是 GSM8K aggregate tok/s 被单请求长尾污染，见 PLAN P6.15。
 
 **当前关键路径**：图模式下的性能重排。两个已量出来的方向 ——
 ① **prefill 没进图**（GSM8K 那种短输出高翻台负载实测 875 个 prefill 批 / 每批仅 163 token，
