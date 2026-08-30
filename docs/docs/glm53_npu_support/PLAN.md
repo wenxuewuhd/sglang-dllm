@@ -1029,7 +1029,38 @@ DSA 每步 170 次 aten dispatch，MoE 只要 25 次。
 - [ ] **P6.10 `expand_pooled_groups_to_topk` 改 int32** —— prefill 的 `aclnnAdd` 花 **5.73 ms**
       产出 `[8192,512,4]` 的 int64（134 MB），高于下界 **43×**。token id 最大约 32768，
       **int32 完全够**，既减半流量又避开 Ascend 上被模拟的 int64 向量运算。**在共享代码里**
-- [ ] **P6.11 重写 `_append_kpool_tail_to_topk_kernel`** —— ⚠ **中断时已有关键进展，别从头做**：
+- [x] **P6.11 tail kernel —— 已修，实测 32.6×，逐位相同**（2026-08-30）。
+      **一行改动**：`tl.load(... safe_history_cols ...)` → `tl.load(... cols ...)`。
+      那个 clamp **改不了任何被 mask 保留的通道**（`is_history` 是 `cols < history_len`
+      而 `history_len <= N_COLS`，所以取值处 `cols` 本来就在范围内），它只改了**地址表达式** ——
+      对 `cols` 非仿射，于是连续向量 load 退化成逐元素寻址。**这就是这个 kernel 的全部开销**，
+      与 profile 的 `aiv_vec_ratio=0.027`、`aiv_mte2_ratio=0.0`（既不算也不搬）完全对上。
+
+      实测（`probe/p6_11_tail_clamp.py`，单卡，两个变体并排跑）：
+
+      | rows | 带 clamp | 去掉 | |
+      |---|---|---|---|
+      | **8192（部署形状）** | 5.313 ms | **0.163 ms** | **32.6×** |
+      | 4096 | 2.603 | 0.092 | 28.3× |
+      | 1024 | 0.576 | 0.088 | 6.6× |
+      | 16 | 0.087 | 0.087 | 1.0× |
+
+      四种形状**输出全部逐位相同** —— 这同时证明了 **triton-ascend 遵守「被屏蔽的通道不访问内存」
+      这个契约**，而那正是去掉 clamp 的前提。收益随行数增长、小行数归零，符合「每 program 的
+      寻址开销」这个解释。
+      ⚠ **在共享代码里**（`kpool_fp8_index.py`），CUDA 路径同样走这个 kernel。
+      掩码 load 的契约在 CUDA 上同样成立，且 clamp 本就来自上游原始提交
+      （`0b9c38484e`，CUDA 上开发）而非为昇腾加的防御 —— 但**本线没有 CUDA 机器可验**。
+
+      ⚠ **原记录里那条「4.73 ms 全部来自被 clamp 的 gather load」是对的，但我一开始猜错了是哪一个**：
+      kernel 里有两处 clamp 的 load，我先怀疑页表那个，查调用点才发现
+      **NPU 路径 `page_table` 和 `topk_offsets` 两个都不传**（`kpool_indexer_npu.py:600-606`），
+      `HAS_PAGE_TABLE=False`，那段根本没编进来。是历史值那个 load。
+      **「哪一个」这件事必须查调用点，不能从 kernel 里看。**
+
+      原记录（保留）：当初设计的「三处 store」重写方案**既不必要、本身也是错的**
+      （三处 store 地址区间重叠、同一 CTA 内跨线程竞态）—— **那条路不要再走**，
+      `git stash` 第一条是它未验证的半成品。原始分析：
       实测**那 4.73 ms 全部来自被 clamp 的 gather load**，单把它去掉就是 **5.557 → 0.282 ms（约 20×）**。
       而当初设计的「三处 store」重写方案**既不必要、本身也是错的**（三处 store 地址区间重叠，
       同一 CTA 内跨线程竞态）—— **那条路不要再走**。未验证的半成品在 `git stash` 第一条。

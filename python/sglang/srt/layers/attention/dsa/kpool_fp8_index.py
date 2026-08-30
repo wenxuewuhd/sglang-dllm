@@ -520,9 +520,18 @@ def _append_kpool_tail_to_topk_kernel(
     tail_count = seq_len % POOL_SIZE
 
     is_history = cols < history_len
-    safe_history_cols = tl.minimum(cols, N_COLS - 1)
+    # Index with `cols`, not a clamped copy of it. The clamp cannot change a lane the
+    # mask keeps -- `is_history` is `cols < history_len` and `history_len <= N_COLS` --
+    # so it only ever rewrote addresses that are never read. What it did change is the
+    # address expression: non-affine in `cols`, so the contiguous vector load became
+    # per-element addressing. That is the whole cost of this kernel, which profiles at
+    # aiv_vec_ratio 0.027 and aiv_mte2_ratio 0.0 -- neither computing nor moving.
+    # Measured on A3 at the deployment shape (8192 rows x 2048 cols): 5.313 ms with the
+    # clamp, 0.163 ms without, bit-identical output (probe/p6_11_tail_clamp.py). The
+    # speedup tracks the row count -- 32x at 8192 rows, 1x at 16 -- as an addressing
+    # cost should.
     history_value = tl.load(
-        topk_ptr + row * topk_stride_0 + safe_history_cols * topk_stride_1,
+        topk_ptr + row * topk_stride_0 + cols * topk_stride_1,
         mask=mask & is_history,
         other=-1,
     )
