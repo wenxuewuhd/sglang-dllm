@@ -197,6 +197,23 @@ device 时间类的（AI_CPU 回退、int64 算术、标量瓶颈 kernel）才�
 | **NPU 的 bf16 矩阵乘不是 batch-shape 不变的** | 同一份输入只改 M（4096 行 vs 4080 行），过 `wk`+`k_norm` 后 **5/4080 行**差 1 个 bf16 ulp，gate 差 6/4080（实测）。根因在 torch_npu 的 matmul tiling，不在业务代码。**后果：NPU 上任何 prefill-vs-decode 的逐位一致性断言都不成立**，包括 P4 打算用的 KL 一致性 —— 只能定阈值，不能要求 bit-exact |
 | **KDA prefill 的 Triton autotune —— 确认会在真实路径上触发** | 原记「实际服务未触发，列为上线前须确认」，**现已确认：每次 prefill 都走**。`chunk_kda_scaled_dot_kkt_fwd` 由 `_AscendKDAExtendKernel.extend` 直接调用，24-config 的 `do_bench` 扫描在**第一个** config 上就把 AI core 打超时（507014 `aicore timeout`，dies 0/1/2 复现）。单独跑 14 个 config 里 13 个正常，**所以问题在 `do_bench` 本身，不是某个坏 config**。已修：在 NPU backend import 时钉死一个 config（triton 在 `len(configs)==1` 时完全跳过 benchmark），实测 `BK=64` 最快（T=8192/H=4 下 3.98 ms vs BK=32 的 4.68 ms）。**没有改共享的 `kda.py`** |
 
+**AOT `causal_conv1d` 那一族的四个陷阱**（2026-08-30，`glm53_int8_1card` 单卡实测；
+本线未复现，但值得任何碰 conv 路径的人先看）：
+
+| 陷阱 | 表现 |
+|---|---|
+| **`torch.ops.npu.causal_conv1d_update` 按自己文档的 layout 算是错的，且不报错** | 脉冲响应（weight 第 k 抽头设 `10^k`，输出即抽头编号）测出它把 4 抽头窗口读成 `[S1, S2, S2, x]` —— **只有两个不同的历史值**，任何对 3 行 state 的置换都救不回来。真实约定是 `conv_state` 要 **`[cache_len, WIDTH, dim]`（WIDTH 行，不是 WIDTH−1）**，且调用方每次后要 `torch.roll(+1)`。**未文档化，疑似 kernel bug**。⚠ 而且它比它本该替换的 torch 回退**还慢 2.5×**（b=1：689 vs 270 µs，约 0.3 GB/s） |
+| **`conv_state_indices` 传 int64 被接受但静默算错** | 相对误差 **7.5e-1**。**必须 int32**（在 update 算子上实测，varlen 上未测）|
+| **padding lane 的输出是垃圾不是零** | 一次有限、一次非有限。**调用方必须自己丢弃** |
+| **`pad_slot_id` 这个参数根本不被查** | 跳过是硬编码在「下标为负」上的。传 `pad_slot_id=99` 配下标 `99` 会直接 device assert `Index 99 out of range[0 17)` 然后 507035 |
+
+✅ **该用的是另一个**：`torch.ops.npu.causal_conv1d(..., run_mode=1)` —— GDN 路径已经在用
+（`ascend_gdn_backend.py:125`）。**60 µs/call、对 batch 平坦、比 torch 回退快 4.5×、一个 kernel 顶九个**；
+数值在双参考地板内、state 回写逐位精确、`cache_indices` 带 `-1` 时正确跳过。
+⚠ 约束：weight/state/x 的 dtype **必须三者一致且 ∈ {bf16, fp16}**；
+fp32 是**干净的 host 侧拒绝**（不是静默算错 —— 这点是好事）。
+**所以 KDA 要用它，conv 权重必须从 fp32 降到 bf16，这不是逐位不变的改动，要走双参考法。**
+
 ### 2.5 已排除（不要再做）
 
 | 项 | 为什么 |
