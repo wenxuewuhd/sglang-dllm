@@ -122,6 +122,16 @@ device 时间类的（AI_CPU 回退、int64 算术、标量瓶颈 kernel）才�
 - **`--page-size` 必须是 64** —— DSA pool 有 `assert self.page_size == 64`。DSv4 用的是 128，照搬会启动失败
 - 纯 TP16 权重 **37.25 GB/die**（= 599/16，无复制）；DP-attention 会把 attention/dense 每 rank 各存一份
 - DSv4 的 TP16/DP16+DeepEP 配方见 `launch_dsv4_a3.sh.example`；**GLM 的见 `launch_glm_bf16.sh.example`**（已进仓库）
+- ⚠ **「必须独占整机」是 BF16 的约束，不是模型的**（2026-08-30 实测推翻）。
+  BF16 TP8 每 die 要 74.9 GB，塞不进 64 GB —— 所以 BF16 只能 TP16。
+  但 **INT8 TP8 每 die 只要 38.20 GB**（实测，与 306.1/8 = 38.26 GiB 对上），剩 22.88 GB，
+  整除性全过（64/64/32/288 都能被 8 整除）。
+  **`ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15` + `--tp-size 8` 直接可用**，
+  启动脚本 `$ROOT/run/launch_glm_w8a8_tp8.sh`。
+  **意义**：日常验证不用再抢整机，8 张卡就够，可以和别的任务并行。
+  ⚠ **但换了配置就不能沿用 TP16 BF16 的基线** —— TP 宽度变了规约顺序就变，精度也不同。
+  要在同一配置上自己造 before/after（做法：`git worktree add --detach <改动前的提交>`，
+  用它录一份基线，再用改动后的对）。
 - **起服务要求整卡近乎全空**：`distributed/bootstrap.py:339` 检查「空闲显存 ≥ 总量 90%」，
   不满足直接 raise。⚠ **停掉 agent 之后显存不是立刻回收的** —— 本项目因此失败过一次
   （停完不到一分钟就起，每卡只有 51% 空闲）。而且 GLM BF16 只能 TP16
@@ -1089,6 +1099,9 @@ DSA 每步 170 次 aten dispatch，MoE 只要 25 次。
       **已经贴在启动开销上，可省的是 0**。与本表 `rows=16 → 1.0×` 是同一件事的两个独立观测。
       **「同一个优化在两边价值差很远」这次有了数。**
 
+      **整网已验**（2026-08-30，TP8 INT8 / die 8-15）：与 P6.10 一起，对**同一配置下
+      改动前的基线**逐位相同（`0.000e+00`，3256 token 长提示 + 短提示各 60 decode token）。
+      单卡探针只证明单个函数等价，这一步证明接线没被改坏。
       ⚠ **在共享代码里**（`kpool_fp8_index.py`），CUDA 路径同样走这个 kernel。
       掩码 load 的契约在 CUDA 上同样成立，且 clamp 本就来自上游原始提交
       （`0b9c38484e`，CUDA 上开发）而非为昇腾加的防御 —— 但**本线没有 CUDA 机器可验**。
