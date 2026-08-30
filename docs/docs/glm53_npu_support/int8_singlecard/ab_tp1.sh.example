@@ -17,7 +17,11 @@ PORT=${PORT:-30013}
 RUN=/mnt/workspace/y00359136/work/glm53_dev/env/run
 LOG=$RUN/glm_w8a8_tp1_${NAME}_$(date +%H%M).log
 
-pkill -f "[s]glang.launch_server" 2>/dev/null
+# Kill only *our* server, by port. `pkill -f "[s]glang.launch_server"` matches every
+# sglang process this OS user owns, and there is a second session working on the same
+# box -- it took down their TP8 run mid-GSM8K on 2026-08-30. The bracket keeps the
+# pattern from matching pkill's own command line.
+pkill -f -- "[-]-port ${PORT}" 2>/dev/null
 echo "waiting for die $DIE to come back to idle..."
 # Physical die $DIE is the (DIE+1)-th HBM figure npu-smi prints (the phy-id
 # column runs 0..15 in order).
