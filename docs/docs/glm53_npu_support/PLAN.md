@@ -514,7 +514,24 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
       单卡 TP1 实测每 token 必读 20.7 GiB 里 KDA 占 **8.9 GiB（42%）**，比 routed 专家还多。
       **所以「INT8 在小 batch 只小赢」有一半是因为流量的 42% 根本没被量化。**
       TP16 下 KDA 被 16 分（每 die 约 558 MiB/token ≈ 0.45 ms），所以在我们这条线不显眼。
-      **量化 KDA 是这份 checkpoint 剩下最大的一个杠杆**，但厂商没做，做之前要先问为什么。
+      **量化 KDA 是这份 checkpoint 剩下最大的一个杠杆**，但**用户决定先不做**（2026-08-30）。
+
+      查清楚了两件事（源码 + 保留下来的 FP8 index）：
+      ① **KDA 在原始权重里根本不是 fp8，是 BF16** —— 它的 q/k/v/o_proj
+      一个 `weight_scale_inv` 都没有；② `modules_to_not_convert` 是**逐层精确点名**的，
+      `o_proj` 出现在 **34/34 个 KDA 层、0/11 个 DSA 层**。
+      **所以这不是笼统的模式匹配，是厂商刻意逐层挑出来排除的，我们的转换没漏东西。**
+
+      不做的理由主要不是收益（单卡实测 1.14×，TP16 下 KDA 被 16 分、收益小得多），
+      **而是「测不出它坏」**：KDA 是线性注意力的递归路径，权重误差会沿 SSM 状态
+      随序列累积，而不像标准注意力每步从 KV 重新读；`modules_to_not_convert` 同时排除了
+      `A_log` / `dt_bias` / `conv1d`——正是 HF 强制留 fp32 的那批递归参数
+      （**投影本身没有那个约束，所以这是怀疑不是解释**）。
+      如果怀疑成立，**症状是长序列上的缓慢漂移，而 GSM8K 那种几百 token 的题目看不见**。
+      真要做的顺序：量化 → GSM8K 每侧 2 轮 → **再加一个长上下文判据**。
+      ⚠ 还有个接线坑：ignore 列表里直接写着融合名
+      `model.layers.N.self_attn.qkv_proj`（和 `fused_qkvbfg_a_proj`），
+      只删 q/k/v_proj 不够 —— `should_ignore_layer` 命中融合名就不展开，整层仍是 bf16。
 
 
 - [x] ~~P5.3 288 专家校准~~ —— **不需要**。激活是动态的，没有静态激活 scale 要标定
@@ -579,12 +596,18 @@ analyse 报 `no such table: TASK` / `The collected data has been lost`。
 
 prefill 按调度器自己的每批计时：BF16 4849 tok/s、INT8 4906 tok/s，**差 1% 以内**。
 
-**bs=1 那 14% 的成因（源码 + 计数，非 kernel profile）**：量化线性走
-`NPUW8A8Int8DynamicLinearMethod.apply`，每次 `npu_quant_matmul` 之前都要单独发一次
-`torch.ops.npu.npu_dynamic_quant(x)` —— BF16 路径没有这个 kernel。
-按 checkpoint 实际量化的模块数（12 个 MLA 层 × 4 + 43 个 shared expert × 2 + 3 个 dense × 2）
-= **每次 forward 多 140 个 kernel**，3.5 ms / 140 ≈ 25 µs 一个，量级对得上。
-bs=128 时这笔固定开销摊薄，int8 GEMM 的收益反超 —— 这就是符号翻转的原因。
+**bs=1 那 14%（+3.5 ms/token）的现象成立，但我给的成因是错的，在此撤回。**
+原先写的是：量化线性每次 `npu_quant_matmul` 前单发一次 `npu_dynamic_quant`，
+每 forward 多约 140 个 kernel，3.5 ms / 140 ≈ 25 µs 一个「量级对得上」。
+那是**源码 + 计数推出来的，从没 kernel profile 过**。
+
+**`glm53_int8_1card` 在单卡上实测推翻了它**：图模式下这些 kernel 合计
+**382 µs/step（0.9%）、每个 2.8 µs**，不是 3.5 ms —— 图把 launch 开销吃掉了。
+⚠ 被推翻的是**机制**，不是「TP16 bs=1 上 INT8 比 BF16 慢 3.5 ms」这个**观测**；
+那个观测的成因目前**未知**，要追就在 TP16 上按同样口径采一次 bs=1 的 profile 两边相减。
+
+**教训**：一个数量级对得上的算术不构成机制证据。当时那句「量级对得上」正是让它
+读起来像结论的东西。
 
 **「MoE 会不会偷偷反量化回 bf16」这个假设是错的**（源码核实）：MoE 路径
 **一个额外 kernel都没多** —— 激活量化被融进了 `npu_moe_init_routing_v2(quant_mode=1)`
@@ -615,9 +638,22 @@ torch_npu 在调 aclnn 前把输入变连续，于是那个 expand 每层每步�
 估计每步约 0.6–0.7 ms，在 28.9 ms 的 step 里约 **2.4%** —— 比在单卡上占比还高，
 而**墙钟一直看不见它**。
 
-改法（对方正在测）：不 expand，按 (device, dtype, 完整 shape) 缓存一次全零张量，
-所有 DSA 层共用。数值上恒等（零就是零），代价是一次性约 159 MiB HBM。
-**等对方的实测收益出来再决定是否 cherry-pick 到本线。**
+改法：不 expand，按 (device, dtype, 完整 shape) 缓存一次全零张量，所有 DSA 层共用。
+数值上恒等（零就是零），代价是一次性约 159 MiB HBM。
+**已在 `int8_singlecard` 分支上改好并实测（单 die，bs=1）：42.823 → 39.741 ms/step，−7.2%。**
+
+⚠ **收益比那两个 kernel 本身大得多，而多出来的部分是推断**：BroadcastTo 自己只值
+0.80 ms，剩下 2.3 ms 对方归因为 **L2 冲刷**（159 MiB 几乎正好是 L2 的 168 MB，
+每个 DSA 层写一遍就冲干净；34 个 KDA 层与 11 个 DSA 层交错，挨着的 KDA 层替它付钱）。
+**支持它的是分布形状而不是均值**：KDA qkv matmul 的中位数只降 2.4%
+（182.1 → 177.8 µs）而每步总和降 23%（7823 → 6022 µs），修复前的长尾在修复后消失。
+这个论证方式值得学 —— 均值降了可以有很多解释，长尾消失基本只有一种。
+
+**本线待做（需要整机）**：cherry-pick 后按判据验 —— profile 里
+`BroadcastTo` 的 `"1,64,1,64" → "<pages>,64,1,64"` 那组（修复前 11/step，
+`aiv_mte3_ratio ≈ 0.95`）**应当完全消失**。
+⚠ 我们的 pool 是 260 万 token，页数约 4 万、单次输出约 320 MiB = **L2 的两倍**，
+所以旁效应在 TP16 上**可能比单卡更大，而不是更小**。
 
 **P6.13 overlap scheduler：开，实测 1.23× 且数值不变**（2026-08-29，A/B，200 题 GSM8K、128 并发）：
 
