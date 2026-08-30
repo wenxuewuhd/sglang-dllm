@@ -1,0 +1,62 @@
+#!/bin/bash
+# GLM-5.3-Flash INT8 W8A8，TP8。**日常验证走这个** —— 只要 8 张 die，不用抢整机，
+# 而且精度结论和 BF16 TP16 一致（长上下文那轮两个构型都验过）。
+#
+# 复制到 $GLM_ENV/run/ 后改三处：ASCEND_RT_VISIBLE_DEVICES、env.sh 路径、PORT。
+set -x
+
+# ⚠ 这里填**你抢到的那 8 个 die 的 Phy-ID**（npu-smi 里的第二列，0..15）。
+#    一张 NPU 卡有 2 个 die，**不必连号**，凑够 8 个就行。
+export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15
+
+source $GLM_ENV/env.sh
+export PYTHONNOUSERSITE=1
+export PYTHONPATH=$REPO/python:$PYTHONPATH
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+export INF_NAN_MODE_FORCE_DISABLE=1
+export TASK_QUEUE_ENABLE=1
+export SGLANG_SET_CPU_AFFINITY=1
+
+# 这四个是 mHC 接到昇腾融合算子之前的绕行，源码核查显示 GLM 在 NPU 上四条都走不到。
+# 留着是因为改它们要重跑一次精度，而它们眼下不花任何代价。逐条理由见
+# launch_glm_bf16.sh.example 的注释。
+export SGLANG_OPT_DEEPGEMM_HC_PRENORM=False
+export SGLANG_OPT_FP8_WO_A_GEMM=0
+export SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
+export SGLANG_OPT_USE_FUSED_HASH_TOPK=False
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+ulimit -n 65536
+
+# 参数为什么是这些：
+#   --page-size 64          **必须**。DSA pool 有 assert page_size == 64
+#   --disable-radix-cache   **必须留着**。causal_conv1d_fn_npu 在混合 has_initial_state
+#                           时会写坏 conv state（PLAN P6.2），开着它的精度数字不可信
+#   --mem-fraction-static 0.85  权重 38.20 GB/die，留给 KV 池约 12.3 GB（938k token）
+#   --max-running-requests 128  和 --cuda-graph-max-bs-decode 一致；不设的话 max_bs
+#                           默认 256，会去捕 36 个用不上的桶，白花捕获时间和显存
+#   （图和 overlap 都开着 —— 去掉 --disable-cuda-graph 才是开图，decode 约 8x）
+#
+# ⚠ 换配置重启前，等 npu-smi 自己说话，别看秒表：kill 后 3 秒重起，
+#   bootstrap.py 的「每卡空闲 >= 90%」检查会放行，然后在加载权重时炸 OOM。
+#   16 个 die 全部回到约 3 GB 实测要 2-3 分钟。
+
+PORT=${PORT:-30023}
+exec $VENV/bin/python -m sglang.launch_server \
+    --model-path /mnt/workspace/models/GLM-5.3-Flash-W8A8 \
+    --trust-remote-code \
+    --device npu \
+    --tp-size 8 \
+    --moe-a2a-backend none \
+    --dtype bfloat16 --kv-cache-dtype auto \
+    --page-size 64 \
+    --chunked-prefill-size ${CHUNK:-8192} \
+    --max-running-requests ${MAXREQ:-128} \
+    --context-length ${CTX:-32768} \
+    --mem-fraction-static ${MEMFRAC:-0.85} \
+    --disable-radix-cache \
+    --cuda-graph-max-bs-decode ${MAXREQ:-128} \
+    --skip-server-warmup \
+    --watchdog-timeout 9000 \
+    --host 127.0.0.1 --port ${PORT}
