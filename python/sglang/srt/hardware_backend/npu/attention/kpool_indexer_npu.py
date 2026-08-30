@@ -164,10 +164,24 @@ def max_visible_pool_runs(n_rows: int, batch: int, kpool: int) -> int:
 
     Within one request the row's key count rises by exactly one per row, so
     ``pool_lens = key_count // kpool`` changes once every ``kpool`` rows and the
-    request contributes at most ``ceil(q_len / kpool) + 1`` runs. Summed over the
-    batch that is at most ``ceil(n_rows / kpool) + batch``; the extra 1 is slack.
+    request contributes at most ``ceil(q_len / kpool) + 1`` runs.
+
+    Summing that needs ``sum_b ceil(q_len_b / kpool) <= n_rows / kpool + batch``:
+    **the sum of ceilings is not the ceiling of the sum.** The previous form,
+    ``ceil(n_rows / kpool) + batch + 1``, dropped that second ``batch`` and is a
+    real bound only while every request is long compared to ``kpool``. Eight
+    requests of two rows each need 16 runs and it allowed 13, and an overflowing
+    ``max_runs`` is not a tight fit -- ``visible_pool_runs`` scatters into a
+    ``max_runs + 1`` buffer, so the run index runs off the end and the AI CPU
+    raises (measured 2026-08-30: `ScatterElements` errcode 0x2a, aclnnSWhere
+    507018, during speculative verify capture).
+
+    Extend batches here always carry long requests, which is why this held; a
+    verify batch carries ``num_draft_tokens`` rows per request, which is short by
+    construction. The ``n_rows`` cap makes it exact for that case -- a run cannot
+    span less than one row.
     """
-    return -(-n_rows // kpool) + batch + 1
+    return min(n_rows, -(-n_rows // kpool) + 2 * batch + 1)
 
 
 def select_pools(
@@ -293,14 +307,14 @@ class KPoolNPUIndexerMixin:
         silent -- wrong pool lengths, right shapes -- which is why this checks twice
         rather than picking the cleverer of the two.
         """
-        from sglang.srt.model_executor.forward_context import get_attn_backend
+        from sglang.srt.runtime_context import max_speculative_num_draft_tokens
 
         # Off under speculative decoding: the draft model's DSA layer id is
         # `num_hidden_layers`, above every target layer id, so "ids increase
         # within one forward" cannot tell a draft forward from a continuation of
         # the target's. That hit would be silent -- right shapes, wrong pool
         # lengths -- and this costs only the 0.68 ms/step it saves.
-        cacheable = get_attn_backend().speculative_num_draft_tokens is None
+        cacheable = max_speculative_num_draft_tokens() is None
 
         seq_lens = forward_batch.seq_lens
         key = (
@@ -507,9 +521,15 @@ class KPoolNPUIndexerMixin:
         the draft-extend pass that follows rewrites those same N slots from
         ``seq_lens - N`` with the accept count in hand.
         """
-        from sglang.srt.model_executor.forward_context import get_attn_backend
+        # Not off the attention backend: `get_attn_backend()` hands back the
+        # `_AscendKDAHybrid` wrapper, which forwards no such attribute (measured
+        # -- it raised AttributeError here, which is the good outcome; the
+        # wrapper trap in this project is usually a silent default). The runtime
+        # context is also what sized `tail_extra_slots`, so the assert in
+        # `kpool_spec_update_index_cache` compares two values from one source.
+        from sglang.srt.runtime_context import max_speculative_num_draft_tokens
 
-        n_draft = get_attn_backend().speculative_num_draft_tokens
+        n_draft = max_speculative_num_draft_tokens()
         n_rows = key.shape[0]
         batch = n_rows // n_draft
         assert batch * n_draft == n_rows, (n_rows, n_draft)
