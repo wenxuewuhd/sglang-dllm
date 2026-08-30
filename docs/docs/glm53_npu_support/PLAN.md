@@ -207,6 +207,14 @@ device 时间类的（AI_CPU 回退、int64 算术、标量瓶颈 kernel）才�
 
 ### 2.4 陷阱（能跑但算错 / 名实不符）
 
+⚠ **`top_logprobs_num` 会打死整个服务**（2026-08-30 实测）。请求里带
+`{"return_logprob": true, "top_logprobs_num": 5}` 触发一个此前没编译过的 Triton kernel
+的 JIT，**`bishengir-compile` 自身 SIGSEGV**（LLVM 栈回溯让人去提 llvm-project 的 bug），
+八个 rank 全部 `Scheduler hit an exception`，服务当场死 —— **不是返回错误，是进程没了**。
+与下面 `_hadamard128` 的 codegen UB 同族，**建议一起上报上游**。
+生产含义：任何客户端都能用一个合法的 OpenAI 兼容参数把服务打掉。
+
+
 | 陷阱 | 表现 |
 |---|---|
 | **FIA 在 TND 布局省略 `num_key_value_heads`** | 错 **200×**，**不报错**。BSND 下同一默认值却是对的。已修 `ascend_backend.py` 的 prefill 调用点（全文件唯一漏传的） |
