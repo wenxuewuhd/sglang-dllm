@@ -801,7 +801,7 @@ kpool 那条线的逐位验证是同一类结构（比对的是 logprob，不是
 | 例 | 判据读了什么 | 漏了什么 | 为什么当时没发现 |
 |---|---|---|---|
 | conv state（本节上文） | golden 槽位的输出 | **非 golden 槽位的 state 回写** | `--disable-radix-cache` 让触发形状从未出现 |
-| W8A8 权重重映射（§8.4 那条在做的） | 权重张量本身 | **`weight_scale`** | per-channel scale 装错只表现成「精度差一点」，不崩 |
+| W8A8 权重重映射（本轮在做的 shared expert 融合） | 权重张量本身 | **`weight_scale`** | per-channel scale 装错只表现成「精度差一点」，不崩 |
 
 **第二例还多一层**：`w13` 的 gate/up 拼接顺序由 `switch_w13` 这个 **flag** 决定
 （`fused_moe_triton/layer.py:669`），不是固定约定。一个「元素全对、顺序反了」的权重
