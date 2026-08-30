@@ -207,6 +207,31 @@ device 时间类的（AI_CPU 回退、int64 算术、标量瓶颈 kernel）才�
 
 ### 2.4 陷阱（能跑但算错 / 名实不符）
 
+⛔ **`tensor.is_cuda` 在这台机器上是 True，所以每一处 `if x.is_cuda` 的门 NPU 都会通过。**
+`hardware_backend/npu/utils.py:152` 导入 `torch_npu.contrib.transfer_to_npu`，之后：
+
+| 判据 | NPU 上的值 | |
+|---|---|---|
+| `tensor.is_cuda` | **True** | ❌ 撒谎 |
+| `tensor.device.type` | `"npu"` | ✅ |
+| `sglang.is_cuda()` | False | ✅ |
+| `torch.cuda.is_available()` | False | ✅ **因为 utils.py:155 手工补回来了** |
+
+⚠ **最后一行是这条的形状**：那行补丁的注释写着「Re-mock torch.cuda.is_available cuz
+transfer_to_npu mocks it True」—— **别名早就被知道，补的是撞上的那一个实例，不是这一类。**
+
+**实际后果（2026-08-30 实测）**：`logprob_processor.py:528` 的
+`if ... and pruned_states.is_cuda` 放 NPU 进了一个 CUDA 专用的融合 Triton kernel，
+而它的编译让 **`bishengir-compile` SIGSEGV，八个 rank 全死** ——
+**任何客户端传一个合法的 `top_logprobs_num` 就能打掉服务**。已修（改判 `device.type`），
+验过 k=1/5/8/20 全部正常返回。
+
+⚠ **`srt/` 下还有 88 处张量级 `.is_cuda` 门没查。** 每一处背后的 CUDA 快路径
+在 NPU 上都是**静默启用**的。这一处靠打死进程暴露了自己；
+**其余的更可能是「安静地算错」，那才是这类问题的常见形态。**
+=> **新写代码不要用 `tensor.is_cuda` 判平台**，用 `device.type` 或 `sglang.is_cuda()`。
+
+
 ⚠ **`top_logprobs_num` 会打死整个服务**（2026-08-30 实测）。请求里带
 `{"return_logprob": true, "top_logprobs_num": 5}` 触发一个此前没编译过的 Triton kernel
 的 JIT，**`bishengir-compile` 自身 SIGSEGV**（LLVM 栈回溯让人去提 llvm-project 的 bug），
