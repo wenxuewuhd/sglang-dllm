@@ -270,6 +270,61 @@ class KPoolNPUIndexerMixin:
     logits, so the transform picks up at the expand.
     """
 
+    #: Per-forward batch metadata, shared by every DSA layer. See _step_metadata.
+    _kpool_step_meta: dict = {}
+
+    def _step_metadata(self, forward_batch, block_tables, batch: int, layer_id: int):
+        """Batch metadata derived once per forward instead of once per DSA layer.
+
+        None of `seq_lens_row`, `req_index_row`, `pool_lens_row`, `cu_seqlens_q` or
+        the pooled block table depend on the layer -- they are functions of
+        `seq_lens` and `block_tables`, which are fixed for the whole forward. There
+        are 11 DSA layers, so each was being rebuilt 11 times. Measured on one A3
+        die (bs=1, INT8, graph on): 602 us/step across Range (66 calls a step, six
+        `arange`s per layer), FloorDiv, GatherV3 and a Cast -- of which ten
+        elevenths is pure repetition.
+
+        Invalidated two ways, because either alone has a hole. The fingerprint
+        catches new values in the same buffers (`seq_lens` is a persistent tensor
+        written in place, so its storage does not move but its `_version` bumps).
+        The layer ordering catches a fresh forward that happens to reuse identical
+        buffers: DSA layers run in increasing id within one forward, so seeing an id
+        at or below the cached one means we have wrapped. A stale hit here would be
+        silent -- wrong pool lengths, right shapes -- which is why this checks twice
+        rather than picking the cleverer of the two.
+        """
+        seq_lens = forward_batch.seq_lens
+        key = (
+            seq_lens.data_ptr(),
+            seq_lens._version,
+            block_tables.data_ptr(),
+            block_tables._version,
+            batch,
+            int(forward_batch.batch_size),
+        )
+        cached = self._kpool_step_meta.get("entry")
+        if cached is not None and cached[0] == key and layer_id > cached[1]:
+            return cached[2]
+
+        device = seq_lens.device
+        seq_lens_row = seq_lens[:batch].to(torch.int32)
+        req_index_row = torch.arange(batch, device=device, dtype=torch.int32)
+        pool_lens_row = torch.div(
+            seq_lens_row, self.index_kpool, rounding_mode="floor"
+        ).to(torch.int32)
+        cu_seqlens_q = torch.arange(
+            1, pool_lens_row.shape[0] + 1, device=device, dtype=torch.int32
+        )
+        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+            build_pooled_page_table_64,
+        )
+
+        pooled = build_pooled_page_table_64(block_tables, self.index_kpool)
+        block_table = pooled[req_index_row.long()].contiguous()
+        meta = (seq_lens_row, req_index_row, pool_lens_row, cu_seqlens_q, block_table)
+        self._kpool_step_meta["entry"] = (key, layer_id, meta)
+        return meta
+
     def _kpool_head_gate_npu(self, x: torch.Tensor) -> torch.Tensor:
         """The per-head gate, in fp32.
 
@@ -543,8 +598,13 @@ class KPoolNPUIndexerMixin:
                 seq_lens=forward_batch.seq_lens[:batch],
                 out_cache_loc=forward_batch.out_cache_loc[:batch],
             )
-            seq_lens_row = forward_batch.seq_lens[:batch].to(torch.int32)
-            req_index_row = torch.arange(batch, device=x.device, dtype=torch.int32)
+            (
+                seq_lens_row,
+                req_index_row,
+                pool_lens_row_cached,
+                cu_seqlens_q_cached,
+                block_table_cached,
+            ) = self._step_metadata(forward_batch, block_tables, batch, layer_id)
         else:
             self._kpool_compress_write_extend_npu(
                 key, gate_score, forward_batch, layer_id, block_tables, pool
@@ -556,18 +616,20 @@ class KPoolNPUIndexerMixin:
         if not return_indices:
             return None
 
-        pool_lens_row = torch.div(
-            seq_lens_row, self.index_kpool, rounding_mode="floor"
-        ).to(torch.int32)
+        pool_lens_row = (
+            pool_lens_row_cached
+            if mode.is_decode_or_idle()
+            else torch.div(
+                seq_lens_row, self.index_kpool, rounding_mode="floor"
+            ).to(torch.int32)
+        )
         if mode.is_decode_or_idle():
             # Decode has one query row per request, so every row is already its
             # own run. Skipping the segmentation skips its `int(...max())` and
             # its data-dependent output shape -- both fatal to graph capture, and
             # decode is the mode that gets captured.
-            cu_seqlens_q = torch.arange(
-                1, pool_lens_row.shape[0] + 1, device=x.device, dtype=torch.int32
-            )
-            run_pool_lens, run_req = pool_lens_row, req_index_row.long()
+            cu_seqlens_q = cu_seqlens_q_cached
+            run_pool_lens, run_req = pool_lens_row, None
         else:
             # Always the padded form, so the captured path and the eager path are
             # the same path. The operator treats the empty runs as a no-op --
@@ -581,9 +643,13 @@ class KPoolNPUIndexerMixin:
                     self.index_kpool,
                 ),
             )
-        pooled_page_table = build_pooled_page_table_64(
-            block_tables, self.index_kpool
-        ).contiguous()
+        # Decode reuses the per-forward pooled block table; extend still builds its
+        # own, because `run_req` there comes from the run segmentation.
+        pooled_page_table = (
+            None
+            if mode.is_decode_or_idle()
+            else build_pooled_page_table_64(block_tables, self.index_kpool).contiguous()
+        )
 
         selected = select_pools(
             query=query.contiguous(),
@@ -591,7 +657,11 @@ class KPoolNPUIndexerMixin:
             weights=self._kpool_head_gate_npu(x),
             cu_seqlens_q=cu_seqlens_q,
             pool_lens=run_pool_lens,
-            block_table=pooled_page_table[run_req].contiguous(),
+            block_table=(
+                block_table_cached
+                if run_req is None
+                else pooled_page_table[run_req].contiguous()
+            ),
             group_topk=self.index_topk // self.index_kpool,
         )
 
