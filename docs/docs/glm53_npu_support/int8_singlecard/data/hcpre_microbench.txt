@@ -1,0 +1,133 @@
+device        : Ascend910_9362
+visible dies  : 2
+TASK_QUEUE_ENABLE=1  torch 2.10.0+cpu  torch_npu 2.10.0.post4
+deployed shape: x(1,M,4,4096) bf16, fn(24,16384) fp32 = 1.50 MiB, sinkhorn_iters=20
+mode          : eager.  Read the profiler's device Duration(us); the
+                wall-clock columns are host bound and graph mode removes them.
+
+=== envelope: what npu_hc_pre actually accepts ===
+(each line is a real call; a rejection prints the operator's own message)
+  hc_mult          accepted: [4]
+                   rejected 2: The hc of x only support 4, actual 2.
+                   rejected 3: The hc of x only support 4, actual 3.
+                   rejected 6: The hc of x only support 4, actual 6.
+                   rejected 8: The hc of x only support 4, actual 8.
+  hidden           accepted: [4096, 7168]
+                   rejected 1024: The d of x only support 4096 or 7168, actual 1024.
+                   rejected 2048: The d of x only support 4096 or 7168, actual 2048.
+                   rejected 8192: The d of x only support 4096 or 7168, actual 8192.
+  sinkhorn_iters   accepted: [0, 1, 20, 100]
+  fn as bf16       rejected: hc_fn's dtype should be FLOAT32.
+  x as fp16        rejected: x's dtype should be BFLOAT16.
+  x as fp32        rejected: x's dtype should be BFLOAT16.
+
+=== M sweep: does HcPre amortise over tokens? ===
+     M   p50 us     p10     p90  wall us  us/token  x floor   traffic MiB
+-------------------------------------------------------------------------
+     1    27.17   26.36   28.30    74.65    27.170     21.0x         1.54
+     2    28.39   27.14   29.40    68.19    14.195     21.4x         1.58
+     4    28.03   27.22   29.50    60.83     7.008     20.2x         1.66
+     8    28.43   27.64   29.78    65.87     3.554     18.7x         1.81
+    16    29.83   28.42   30.90    64.75     1.864     16.7x         2.13
+    32    35.78   34.84   37.98    61.32     1.118     15.5x         2.75
+    64    44.53   43.02   46.68    65.93     0.696     13.3x         4.00
+   128    63.50   62.64   64.88    69.37     0.496     11.6x         6.51
+   256    96.07   95.06   97.70   103.56     0.375      9.9x        11.52
+   512   146.95  145.86  149.64   154.27     0.287      8.1x        21.54
+  1024   252.05  250.68  253.98   259.87     0.246      7.2x        41.58
+  4096   936.81  934.42  940.82   944.97     0.229      6.9x       161.81
+
+  fit over M=1024..4096:  T(M) = 23.8 us + 0.223*M us
+  break-even (marginal == fixed) at M = 107
+  M=1 27.2 us -> M=16 29.8 us (91% of it) -> M=64 44.5 us (61%)
+  at 90 sites/step: 2.445 ms/step at M=1, 2.685 ms/step at M=16, 22.684 ms/step at M=1024.
+  => HcPre is a per-STEP constant across the whole deployed decode range.
+     It amortises per *token* (16x at bs=16) but never leaves the step.
+
+=== pipes: which unit is busy inside HcPre ===
+case     core          blk   dur us    aicore_time       aiv_time  _scalar_ratio  aic_mac_ratio  ic_mte2_ratio  aiv_vec_ratio  _scalar_ratio  iv_mte2_ratio  e_utilization
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+M=1      MIX_AIC     20/40    27.58         16.196         18.976          0.618          0.084          0.078          0.012          0.263          0.134         58.662
+M=16     MIX_AIC     20/40    30.36         16.795         22.540          0.566          0.080          0.087          0.117          0.336          0.172         55.266
+M=1024   MIX_AIC     20/40   247.55         71.361        240.649          0.388          0.386          0.380          0.611          0.394          0.154         28.817
+
+  at M=1: 27.6 us wall on device, of which
+    scalar    9.75 (cube side) +  5.03 (vector side) us
+    MAC       1.35 us
+    MTE2 in   1.27 +  2.56 us
+    VEC       0.22 us
+    neither core busy:  8.60 us
+  -> the operator is scalar/control bound, not memory and not MAC
+
+=== split: HcPre vs its own three-op decomposition ===
+  agreement split-vs-fused: y 7.81e-03 post 1.39e-04 comb 5.12e-05 (|y| up to 3.91)
+
+  kernel                                           shapes                                  n   p50 us
+  HcPre                                            "1,1,4,4096;24,16384;3;24"             30    27.53
+  aclnnMatmul_MatMulV3Common_MatMulV3              "1,16384;16384,24"                     30    24.67
+  HcPreSinkhorn                                    "1,1,24;1,1,1;3;24;1,1,4,4096"         30    10.34
+  HcPreInvRms                                      "1,1,4,4096"                           30     3.74
+  wall (host bound, eager) fused         73.67 us/call
+  wall (host bound, eager) split        141.00 us/call
+
+=== refs: what else costs this much on this die ===
+  the fn weight is 1.50 MiB; its 1.25 TB/s floor is 1.26 us
+
+  kernel                                         dtypes               shapes                              n   p50 us
+  aclnnMatmul_MatMulCommon_MatMulV2              DT_BF16;DT_BF16      "1,16384;24,16384"                 30    28.24
+  HcPre                                          DT_BF16;FLOAT;FLOAT; "1,1,4,4096;24,16384;3;24"         30    27.43
+  aclnnMatmul_MatMulV3Common_MatMulV3            FLOAT;FLOAT          "1,16384;24,16384"                 30    23.53
+  aclnnReduceSum_ReduceSumOpAiCore_ReduceSum     FLOAT;INT64          "24,16384;2"                       30     7.84
+  HcPost                                         DT_BF16;DT_BF16;FLOA "1,4096;1,4,4096;1,4;1,4,4"        30     6.29
+  aclnnInplaceCopy_TensorMoveAiCore_TensorMove   FLOAT                "24,16384"                         30     4.69
+  aclnnAdds_AddAiCore_Add                        FLOAT;FLOAT          "1;"                               30     1.42
+
+  host-side enqueue cost, eager (this is NOT device time; graph mode removes it):
+    HcPre        enqueue  39.13 us/call   wall  39.33 us/call
+    torch.add    enqueue  21.97 us/call   wall  22.13 us/call
+
+=== iters: how much of HcPre is Sinkhorn? ===
+   iters   p50 us     p10     p90   aicore     aiv
+       1    23.11   22.08   24.52    15.89   18.67
+       2    23.82   22.86   24.68    15.80   18.64
+       5    24.12   23.18   24.88    15.79   18.64
+      10    25.23   24.22   25.92    15.85   18.71
+      20    27.39   26.42   28.80    15.83   18.74
+      40    31.79   30.76   32.90    15.87   18.88
+
+  0.223 us per Sinkhorn iteration; the deployed 20 iterations are 4.5 us = 16% of the call
+  aicore_time/aiv_time barely move with iters: the extra time is not core-busy
+
+=== ceiling: what if all 90 call sites were one call? ===
+  UPPER BOUND ONLY.  The two sites in a layer are sequentially dependent
+  (site 2's input is hc_post of the attention output), and layers are a
+  chain, so this is not reachable without changing the model.
+  aclnnMatmul_MatMulV3Common_MatMulV3            "1,16384;16384,24"               p50=   24.18 us
+  aclnnBatchMatMul_BatchMatMulNd_BatchMatMulV2   "90,1,16384;90,16384,24"         p50=  244.86 us
+
+  90 separate GEMVs: 2.176 ms
+  1 grouped GEMV of 90 groups: 0.245 ms
+  ceiling on batching the GEMV: 8.9x (1.931 ms/step)
+
+=== l2: is the cost a cold weight read? ===
+  same fn x90 (L2 hot)               n=  900 p50=  27.86 p10=  26.44 p90=  29.32  90 calls = 2.500 ms
+  90 distinct fn, 135 MiB (L2 cold)  n=  900 p50=  28.06 p10=  26.68 p90=  29.48  90 calls = 2.523 ms
+
+=== native: CANN's own aclnnMhcPreSinkhorn, head to head ===
+  CANN ships MhcPre / MhcSinkhorn / MhcPreSinkhorn (aclnn_ops_infer).
+  torch_npu binds npu_mhc_pre / npu_mhc_sinkhorn but those have no
+  ascend910_93 kernel binary here (they fail with 561103); the fused
+  MhcPreSinkhorn does have one but no torch binding, so it is called
+  through ctypes below.
+  agreement vs npu_hc_pre: hIn 0.00e+00 hPost 3.58e-07 hRes 2.98e-07
+  workspace aclnn asks for: 304 MiB
+
+  kernel                                         shapes                              n   p50 us
+  HcPre                                          "1,1,4,4096;24,16384;3;24"         30    27.47
+  HcPre                                          "1,1024,4,4096;24,16384;3;24"      30   250.28
+  HcPre                                          "1,16,4,4096;24,16384;3;24"        30    29.72
+  aclnnMhcPreSinkhorn_MhcPreSinkhornAiCore_Mhc   "1,1,4,4096;24,16384;3;24"         30    86.66
+  aclnnMhcPreSinkhorn_MhcPreSinkhornAiCore_Mhc   "1,1024,4,4096;24,16384;3;24"      30   270.57
+  aclnnMhcPreSinkhorn_MhcPreSinkhornAiCore_Mhc   "1,16,4,4096;24,16384;3;24"        30    97.27
+
+profiler output under /var/tmp/glm53/hcpre_microbench (delete when done)
