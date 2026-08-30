@@ -1,51 +1,47 @@
-# 接手指南（2026-08-30，P4 与 P5 都已闭环；本线已按用户指示暂停）
+# 接手指南（2026-08-30）
 
-新 session 从这里开始，然后读 `PLAN.md`。**上一份交接的内容已经全部消化，本文件是新的。**
-第一次接触这个项目、想从零把环境和精度跑通的，看 [`REPRODUCE.md`](./REPRODUCE.md)。
+**本线已按用户指示暂停。** 新 session 从这里开始，然后读 `PLAN.md`。
+第一次接触这个项目、想从零跑通的，看 [`REPRODUCE.md`](./REPRODUCE.md)。
+
+**状态只写在这一份文件里。** `README.md` 曾经也有一张状态表，于是有两张、其中一张是旧的
+—— 一个事实写两遍，迟早只更新一遍。
 
 ---
 
 ## 一句话现状
 
-**BF16 和 INT8 两条线都闭环了，NPU Graph 也开着。算子开发需求 0 项。**
+**BF16 和 INT8 两条线都闭环，NPU Graph 开着，算子开发需求 0 项。**
 
 | | |
 |---|---|
-| 整网 | TP16 / 45 层 / 真实 HCCL / graph |
-| 精度（BF16） | GSM8K 两轮 97.04 / 97.35%，判据 97.50%，在噪声内 |
-| **精度（INT8 W8A8）** | 两轮 97.80 / 97.19%，**对 BF16 +0.30pp**，判据「1% 以内」**通过** |
+| 整网 | TP16（也验过 TP8）/ 45 层 / 真实 HCCL / graph |
+| 精度（BF16） | GSM8K 两轮均值 **97.19%** |
+| 精度（INT8 W8A8） | 两轮均值 **97.50%**，对 BF16 **+0.30pp**，判据「1% 以内」通过 |
 | graph vs eager | 同 batch 宽度下**逐位相同**；decode 约 **8×** |
 | overlap scheduler | 开着，实测 **1.23×**，数值不变 |
 | chunked prefill | 单请求 / 并发 / 2 chunk / 3 chunk 全绿，**逐位相同** |
+| kpool 三连 | P6.7 / P6.10 / P6.11 已修，**逐位相同**，最大单项 32.6× |
 
-**下一步是 P6 性能**：图下的排序要重做，主线是让 prefill 也进图。
+**TP8 也能跑 INT8**（38.20 GB/die）。「GLM 必须独占整机」是 **BF16 的约束**
+（TP8 下 74.9 GB/die），不是模型属性 —— 这条曾经被当成模型属性写进计划。
 
-⚠ **本线 2026-08-30 起暂停**（用户指示：INT8 精度验完就暂停）。最后一件事是
-kpool 三连之后在 TP8 上复测 GSM8K = **97.42%**（见 PLAN 的 P5.6，注意那里写的
-两条"这个数不能拿来说明什么"）。机器基本让给 `glm53_int8_1card`；
-**有约 30 个 commit 等用户 push**（`ecbfcd7584..HEAD`）。
+## 机器（两个 session 共用一台 A3，同一个 OS 用户）
 
-## 机器现在的分工（2026-08-30 起）
+另一个 session **`glm53_int8_1card`** 在做 INT8 单卡性能分析
+（TP1，worktree `../wt-int8-singlecard`，分支 `int8_singlecard`，端口 30013）。
 
-另一个 session **`glm53_int8_1card`** 在同一台机器上做 INT8 单卡性能分析
-（TP1，固定用 **die 0**，worktree `../wt-int8-singlecard`，分支 `int8_singlecard`）。
-
-- **我们这条线的单卡活用 die 14/15**（`layer_check/`、`probe/` 一直是
-  `ASCEND_RT_VISIBLE_DEVICES=14`），和它不冲突
-- **但 TP16 要全部 16 个 die**，所以起整网前必须先跟它说，它停服 + 等释放约 3–5 分钟
-- 用 `SendMessage` 直接发给 `glm53_int8_1card`
-- ⛔ **这台机器上不要用全局 pkill**。两个 session 是**同一个 OS 用户**，
-  `pkill -f "sglang.launch_server"` 会连对方的一起杀。只杀自己端口的：
-  `pkill -f -- "[-]-port 30003"`（方括号防自匹配）。
+- ⛔ **不要用全局 pkill。** 同一个 OS 用户，`pkill -f "sglang.launch_server"` 会连对方一起杀。
+  只杀自己端口的：`pkill -f -- "[-]-port 30003"`（方括号防自匹配）。
   2026-08-30 因为这个丢过一次 GSM8K 全量跑。
 
   **真正的风险不是被打断，是被打断得不明显**：杀在评测中间会响亮地报错，
   杀在**两次测量之间**，你拿到的是一半旧构型一半新构型的数字而毫无察觉。
-
-⚠ **消息不是可靠的互斥，`npu-smi` 才是真相** —— 这台机器上还有别的用户。
-今天出过两次：放卡后不到一小时被第三方占走；以及在 `npu-smi` 看着空的情况下起服务，
-**别人在加载权重那一两分钟里插进来**，于是在 MoE 的 `create_weights` 处 OOM
-（看起来像显存不够，其实是被插队）。**起服务前和开始加载前各看一眼。**
+- ⚠ **消息不是可靠的互斥，`npu-smi` 才是真相** —— 机器上还有第三方。
+  出过两次：放卡后不到一小时被占走；以及在 `npu-smi` 看着空的情况下起服务，
+  **别人在加载权重那一两分钟里插进来**，于是在 MoE `create_weights` 处 OOM
+  （看起来像显存不够，其实是被插队）。**起服务前和开始加载前各看一眼。**
+- 服务停掉后 HBM 要 2–3 分钟才回落。**轮询 `npu-smi` 到每个 die 约 3 GB 再起下一个**，
+  不然会在权重加载处 OOM。等待循环**只看自己那几个 die**（对方的永远不会归零）。
 
 ## 精度是怎么判的（方法比数字重要）
 
@@ -71,137 +67,78 @@ kpool 三连之后在 TP8 上复测 GSM8K = **97.42%**（见 PLAN 的 P5.6，注
 差点把一条好改动判死。`logit_check.py` 的 decode 侧此前**也有这个 bug**
 （`max|dlp|` 算的是全长不是分叉前的前缀），2026-08-30 才修。细节见 `REGRESSION.md` 末节。
 
-## graph 这一轮验了什么（细节在 `PLAN.md` P6.6b / P6.6c）
+⚠ **验收只覆盖「被读的东西」，看不见「被写的东西」。** 2026-08-30 吃过一次：
+`check_kda` 6/6 全绿、kpool 的 logprob 对拍 `0.000e+00`，而 `causal_conv1d_fn_npu`
+正在写坏 conv state。两套信号都亮着，bug 在下面 —— 因为 `check_kda` 只比对一个槽，
+而 logprob 对拍只看被读的量。**逐位相同排除不了「写坏了一块暂时没人读的内存」。**
+补法见 `check_kda.py --check-mixed-state`，原理与实测见 `REGRESSION.md` 末节。
 
-- 45 层整网捕获：6 个 bs 桶 `[1,2,4,8,12,16]`，**15 秒捕完、图池只花 0.8 GB**。
-  显存完全不是问题（原先担心的那条落空），KV pool 与 eager 一模一样
-- 16 卡 HCCL 全在图里重放（此前只有 2 卡实测）
-- **同一 batch 宽度下 graph 与 eager 逐位相同**：短提示 prefill、1000 个 decode token、
-  两条 3255/3252 token 的长提示 + 200 decode token，`max|dlp|` 全是 `0.000e+00`
-- **换 batch 宽度就不再逐位相同了，但这不是 padding 的锅**：`bs=8` 和 `bs=16`
-  **一行 padding 都没有**，误差却和有 3 行 padding 的 `bs=13` 一样大（mean|dlp| ~2.1e-2）。
-  变量是 batch 宽度，量级正好等于独立测出来的**形状地板**。P6.6a 修的那条站得住
+## 剩下的活（按性质分，不是按优先级）
 
-## 图模式的性能基线（第一份，细节在 `PLAN.md` P6 开头）
+### A. 正确性欠账 —— 7 条，共同形状是「都不报错，都在等一个开关被打开」
 
-bs=1 **27.5 ms/token**（eager 是 220–238），16 并发短上下文 **449 token/s**。
-prefill 约 4000–4500 token/s。
-**长上下文的 decode 代价是真的**：同样 16 并发，13 token 上下文 35.6 ms/token，
-3256 token 上下文 **73.1 ms/token**，翻倍 —— 这就是 P6.7 / P6.10 / P6.11 那几条
-kpool 开销该去的地方，而它们**全是 device 时间类的，图吃不掉**。
+| 条目 | 现在为什么碰不到 |
+|---|---|
+| `do_cp_balance_attn` 有与已修 `forward_sparse` **完全相同**的 3-D/PA_BSND 缺陷 | 一期不开 prefill CP。**开 CP 前必修**，会撞 `561002` |
+| `causal_conv1d_fn_npu` 混合 `has_initial_state` 时写坏 conv state | ⛔ **我们全部启动脚本带 `--disable-radix-cache`，所以没走到**。见 PLAN P6.2 |
+| `get_kv_buffer()` 二元组语义随 pool 类而变，`forward_sparse` 只按一种解读 | 走的那条恰好是对的解读 |
+| `set_kv_buffer:679` 在 `cache_v is None` 检查**之前**就 `cache_v.to(...)` | GLM 走共享实现 |
+| MoE `weight_scale` 被降 bf16、linear 侧保持 fp32 | 实测叠加误差 均值 1.7e-3 / 最大 2.5e-3。**记作线索，不是 bug** |
+| DSv4 bf16 fallback 读 int8 buffer 不施加 scale | `:685` 无条件强制 int8，不可达 |
+| triton-ascend `_hadamard128` codegen UB 越界 / `deep_ep` 打包 bug | 已绕过，**值得上报上游** |
 
-⚠ 量的时候 prefill 和 decode 要分开（先 `max_new_tokens=1` 再 129 相减），
-否则 3256 token × 16 并发的 5.2 万 prefill token 会把 decode 完全盖掉。
-脚本在 `tools/bench_graph_decode.py`（padding 那条是 `tools/check_graph_padding.py`）。
+⚠ **conv 那条是这批里唯一「开关随时会被打开」的**：打开 prefix cache 是上生产最自然的
+第一个动作。**在它修好之前，不要打开 radix cache 去跑精度评测。**
 
-## GSM8K：P4 与 P5 都已闭环
+### B. 性能续做 —— ⚠ 与单卡那条线**重叠**，开第二条线做等于安排撞车
 
-**97.35%**（1284/1319）、stop rate **100.00%**、抽取失败 0 —— 判据 97.50%，差 0.32 个 SE。
-run 1 是 97.04%，但那轮有 9 例是**抽取器**把 `\boxed{70\%}` 判成无答案，不是模型错，已修。
-一轮 1360 秒（128 并发）；**eager 下同样的事要 11 小时以上**。
-结果连同响应原文存在 `$ROOT/goldens/gsm8k/`。
+P6.3 SwiGLU clamp（只对 shared expert 成立）、P6.5 NoPE split+RMSNorm、
+P6.12 DSA host 调用（图下要重测）、P6.6 剩余 host 同步、
+`_kpool_compress_write_extend_npu` 的 host 循环、预热 971–1022×。
 
-**不用再跑第三轮**：GSM8K 是固定的全部 1319 题、与 cookbook 同一套，题目抽样方差抵消，
-只剩解码随机性（上界 0.47pp）。
-DSv4 那个跑三轮是因为 GPQA 只有 **198 题**（单轮 ±6pp），量级完全不同。
+### C. 验证缺口 —— 要机器
 
-**P5（INT8）也已经用这两轮做基线判完了**：
+prefill-vs-decode 的 KL 一致性；INT8 对 **int8 CPU 参考**的 logprob 地板
+（现在只能借 BF16 时代的地板，超出属预期内）；
+spec decode 前置（`kpool_decode_update_index_cache` 假设每请求一行）。
 
-| | run 1 | run 2 | 均值 |
-|---|---|---|---|
-| BF16 | 97.04% | 97.35% | 97.19% |
-| **INT8 W8A8** | 97.80% | 97.19% | **97.50%** |
+### 记账不做的
 
-差 **+0.30pp**，判据「1% 以内」**通过**（每侧 2 轮，差值 SE 0.46pp）。
-INT8 错的 29 题里 **23 题 BF16 也错** —— 错的是同一批难题。
-
-## 这一轮性能上已经落地的（细节见 PLAN P6.13 / P6.14）
-
-- **overlap scheduler 开了，1.23×，数值一步没动**（248 → 304 token/s，对 eager 仍逐位相同）。
-  它此前关着只是为了让 graph-vs-eager 的对拍只有一个变量。**已改成默认配方**
-- **prefill 图别去试开关**：去掉 `--disable-prefill-cuda-graph` 完全没用 ——
-  NPU 上 prefill 默认后端是 `tc_piecewise`，而 `server_args.py` 的兼容性规则第一条
-  「non-CUDA hardware (HIP/NPU/CPU/MPS/XPU)」把它整个否掉了。要开是**两件代码工作**：
-  在声明式 registry 里给 GLM 注册 full prefill capture，**并且先清掉 extend 侧的 host 同步**
-  （否则捕获期间必抛 107027）。收益上界大，但代价是真代码
-- ⚠ **服务级 profiling 会把服务打挂**（16 rank 全段错误），采到的数据也是废的。
-  要 profile 走 `layer_check/kernel_profile.py` 那条单模块路线
-- **INT8 与 BF16 吞吐基本持平**，满批下 INT8 反而快约 6%。
-  ⚠ 此前「INT8 慢 1.47×」的说法**已证伪** —— 那是拿 GSM8K 的 aggregate tok/s 当吞吐，
-  而它把 128 路满批（约 2000 tok/s）和单请求长尾（约 30 tok/s）平均在一起。
-  **别再用那个指标**，用 `#running-req` 对齐后的 `gen throughput` 或 `bench_graph_decode.py`。
-  bs=1 时 INT8 慢 14%（量化线性每次 `npu_quant_matmul` 前要单发一次 `npu_dynamic_quant`，
-  每 forward 多 140 个 kernel），bs=128 时摊薄后反超 8%。见 PLAN P6.15
-
-## chunked prefill：已完整验完（2026-08-30）
-
-单请求、并发、2 chunk、3 chunk 四种组合全绿。最强的一条：**19858 token 切成
-8192+8192+3520，同时 8 路后台请求全程 decode，结果对无并发那次逐位相同**
-（`max|dlp| = 0.000e+00`），后台请求 0 降级。细节见 PLAN P3.4。
-
-## 下一步（已定顺序）
-
-**主线：让 prefill 也进图。** 这是目前收益上界最大的一项 —— GSM8K 那种短输出高翻台的负载
-实测 **875 个 prefill 批、每批仅 163 token**，而 prefill 全程在 eager 跑。
-
-⚠ **2026-08-30 上机试过了，阻塞点和原先以为的不一样。** 原先记的是「差 registry 注册」，
-**那是错的**：`--cuda-graph-backend-prefill full` 现成参数就能开，也确实开成了。
-真正炸的是 `KeyError: 'block_tables'` —— **Ascend 后端只实现了 decode 的图 metadata 契约**，
-prefill 运行器走的是另一条路（只调 `init_forward_metadata_out_graph`，
-从不调 `init_cuda_graph_state`）。这是后端工作，在共享的 `ascend_backend.py` 里。详见 PLAN P3.4。
-
-三处准备工作已完成并各自上机验过（**都不是这次失败的原因**，捕获在碰到它们之前就炸了）：
-
-1. [x] `_extend_rows` 与 `visible_pool_runs` 都已改成设备侧 + 静态形状（CPU 等价 + 上机复核都过）
-2. [ ] `_kpool_compress_write_extend_npu` 仍是 host 侧循环（每请求形状不同的散写）——
-       **比前两个难一档**：写的是 KV 索引缓存，改错是静默数据损坏而不是报错，
-       核心部分离线验不了
-3. [ ] ~~给 `AscendAttnBackend` 加 prefill 侧的图 metadata 契约~~ ——
-       **记账，暂不做**（用户 2026-08-30）。深度未知（只知道第 1 个阻塞）、
-       收益未量化、且在共享文件里而 DSv4 回归又不跑。
-       **重启条件写在 PLAN P3.4：先把 prefill 占真实负载一步的比例量出来。**
-
-**prefill 进图既然记账了，主线就换成已经量化过的那批。** 已有的两个指向 ——
-① **长上下文 64 并发就拐**（1044 → 1130 只涨 8%，而 KV 用量才 0.04、mamba 满 1.00），
-指向 kpool 的 device 时间（P6.7 / P6.10 / P6.11），**图吃不掉**；
-② P6.9 `TASK_QUEUE_ENABLE=2` 在 eager 下测得 1.74×，**图下可能已被吃掉，要重测**。
-其中 **P6.11 有实测线索别浪费**：那 4.73 ms 全来自被 clamp 的 gather load，
-去掉是 5.557 → 0.282 ms；而原设计的「三处 store」重写方案作者已判定是错的（地址区间重叠），
-**那条路不要再走**。
+- **prefill 进图** —— 真正的阻塞是 `KeyError: 'block_tables'`：
+  **Ascend 后端只实现了 decode 的图 metadata 契约**（原先记的「差 registry 注册」是错的，
+  `--cuda-graph-backend-prefill full` 现成参数就能开）。深度未知、收益未量化、
+  且在共享文件里而 DSv4 回归又不跑。**重启条件写在 PLAN P3.4：先把 prefill 占真实负载的比例量出来。**
+- **量化 KDA** —— 用户 2026-08-30 决定先不做。但它是这份 checkpoint 剩下**最大的杠杆**：
+  厂商 FP8 checkpoint 就没量化 KDA 的 q/k/v/o_proj，而 bs=1 时它占每 token 流量的 **41.8%**。
+  TP16 下被 16 分（约 0.45 ms/token）所以在多卡这条线不显眼。
 
 ## 还没碰的（别当成已验）
 
-① **prefill 图没开** —— 见上面主线的第 2、3 步。⚠ 注意「extend 侧还有 host 同步」
-   这个说法**是错的、已作废**：逐行审计过，`kpool_indexer_npu.py` 里
-   `.item()`/`.cpu()`/`.tolist()` 一个都没有。挡住捕获的是**被烘进图的 host 侧构造**
-   和**动态输出形状**，两件不同的事
+① prefill 图没开。⚠ 「extend 侧还有 host 同步」这个说法**是错的、已作废**：
+   逐行审计过，`kpool_indexer_npu.py` 里 `.item()`/`.cpu()`/`.tolist()` 一个都没有。
+   挡住捕获的是**被烘进图的 host 侧构造**和**动态输出形状**，两件不同的事
 ② `enable_torch_compile` + `npugraph_ex`（`patch_model_npu`）那条路
 ③ MTP / spec decode 下的捕获
 ④ DeepEP-normal 的 MoE（出厂配方走 `--moe-a2a-backend none`，是已验的 TP dispatcher）
 
 ## 对外页面（别新建，要更新那一个）
 
-算子清单的对外呈现页：https://claude.ai/code/artifact/54dbfb20-667f-465d-84c1-ea7d0cc1a827
+https://claude.ai/code/artifact/54dbfb20-667f-465d-84c1-ea7d0cc1a827
 
 ⚠ **更新时必须把这个 URL 传给 Artifact 工具**，否则会新建一页而不是更新它。
 **以仓库为准**（算子结论在 `PLAN.md` §2）。
 
-**现在页脚和 banner 写着「端到端精度尚未跑通」，已经严重过期**：
-整网跑通、eager 与 graph 的 logits 判定通过、**GSM8K 97.35%（BF16）与 97.50%（INT8）都过了**。
-P4 和 P5 都闭环了。**这一页需要重写一次。**
+**页脚和 banner 还写着「端到端精度尚未跑通」，严重过期** —— P4 和 P5 都闭环了。
+**这一页需要重写一次。**
 
-## 欠账
+## 欠账台账
 
-`SHARED_CHANGES.md` 有 5 条已改 + 3 条待决。其中：
-- **DSv4 的 GPQA 回归没跑**（swiglu_limit 那条改动欠的，公开对标值 73.23%，198 题）。
-  ⚠ **本项目决定不跑**（用户 2026-08-29 拍板）。但那条改动**确实会改变 DSv4 的数值**
-  （给它的 routed 专家加上本就该有的 clamp，实测修前 2.85× budget 判失败、修后 0.35×），
-  所以这是一条**已知且被接受的风险，合入前需要下游确认**，不是一条会有人认领的待办。
-  DSv4 权重在 P1.2 后已删（只留元数据），真要跑得重新下载约 275 GB
-- **待决 ②** `seq_lens_cpu_list` 在捕获时被烘死 —— GLM 逃过，
-  但**对任何走 FIA 的非 DSA 昇腾模型是活的静默 bug**
-- `git stash` 里有 kpool 共享路径的半成品（tail kernel，作者已判定原方案是错的；
-  但**实测那 4.73 ms 全部来自被 clamp 的 gather load，去掉就是 5.557 → 0.282 ms**）
+`SHARED_CHANGES.md`：5 条已改 + 3 条待决。其中 **DSv4 的 GPQA 回归没跑**
+（swiglu_limit 那条改动欠的）—— ⚠ **本项目决定不跑**（用户 2026-08-29 拍板）。
+但那条改动**确实会改变 DSv4 的数值**（给 routed 专家加上本就该有的 clamp，
+实测修前 2.85× budget 判失败、修后 0.35×），所以这是一条
+**已知且被接受的风险，合入前需要下游确认**，不是一条会有人认领的待办。
+DSv4 权重在 P1.2 后已删（只留元数据），真要跑得重新下载约 275 GB。
 
 ## 七条最贵的教训
 
@@ -229,3 +166,8 @@ P4 和 P5 都闭环了。**这一页需要重写一次。**
    graph 的 padding batch，都是**批里有别人时才会发生的事**，单请求/单层测试
    结构上碰不到。要问的是「这个失败模式需要什么条件才会出现」，
    而不是「我的测试通过了吗」
+
+8. **共享机器上最贵的不是被打断，是被打断得不明显。** 见上面「机器」一节
+9. **一次采样不是地板。** 做 `--check-mixed-state` 时按槽用它自己那一次 uniform 采样
+   当地板，**把一个干净的槽判成了污染**（它是自己那次采样的 2.4 倍，却远低于另一个槽的采样）。
+   和第 4 条是同一条，只是这次踩在「测了，但只测了一次」上
