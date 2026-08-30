@@ -55,7 +55,7 @@
 ## 1. 一句话
 
 **单卡 bs=1 decode 起始 42.8 ms/token，权重带宽 roofline 是 17.94 ms，即 2.39× [实测]。
-四条优化之后是 36.8 ms（−14.1%），见 §6。**
+五条优化之后是 34.0 ms（−20.5%），见 §6。**
 时间的 39% 在 KDA、28% 在 MoE，而 **MoE 读专家权重的那两个 `GroupedMatmul` 已经贴在
 带宽地板上（1.03×）** —— 注意这 1.03× 只属于那两个 kernel，不是整个 MoE 家族（家族是 1.56×，
 差额几乎全是路由簿记，见 §2）。
@@ -314,7 +314,7 @@ ConcatD  KDA              34    297.3  0.7% 77.5%      8.7       0.8       0.6  
 
 ## 6. 做了哪些优化，各自实测收益
 
-**三条落地，全部逐位不变。** 基线链条一次只动一个变量；每一步都有 profiler 的 device 时间和
+****五条落地**：前三条逐位不变，后两条走形状地板判据。** 基线链条一次只动一个变量；每一步都有 profiler 的 device 时间和
 墙钟两个独立仪器，**每一步都吻合** —— 这不是巧合，§1 说过这条链路 100% device-bound。
 
 | 构型 | device ms/step | 墙钟 ms/token | kernel/step | 相对上一行 |
@@ -323,10 +323,12 @@ ConcatD  KDA              34    297.3  0.7% 77.5%      8.7       0.8       0.6  
 | **B** = A + §6.1 零 rope 不再每层物化 | 39.741 | 39.8 | 3556 | −7.2% |
 | **C** = B + §6.2 KDA conv state fp32 + padding clamp | 38.727 | 38.6 | 3352 | −2.5% |
 | **D** = C + §6.3 MoE 两个循环不变量 | 37.679 | 37.6 | 3220 | −2.7% |
-| **E** = D + §6.4 KDA 小投影融合 | **36.802** | **36.6** | **3084** | −2.3% |
-| | **−14.1%** | **−14.5%** | **−494** | |
+| **E** = D + §6.4 KDA 小投影融合 | 36.802 | 36.6 | 3084 | −2.3% |
+| **F** = E + §6.5 conv 池翻面 → AOT 算子 | **34.023** | **34.1** | **2710** | **−7.6%** |
+| | **−20.5%** | **−20.3%** | **−868** | |
 
-bs=16 同链条：75.4 → 72.9 → 71.4 → 70.3 → **69.6 ms/token**。
+bs=16 同链条：75.4 → 72.9 → 71.4 → 70.3 → 69.6 → **60.1 ms/token（−20.3%）**。
+**bs=16 的收益比 bs=1 还大** —— 卷积是每 token 的活，从来摊薄不掉。
 
 **精度**：§6.1 与 §6.3 端到端逐 token 相同（3 条提示 × 64 token，3/3）；
 §6.2 由 `check_kda` 判定 **18/18 张量逐位相同**（float64 `==`）。**没有一条动了数值。**
@@ -434,6 +436,70 @@ INT8 相对 BF16 白付了这 1.68 ms。这是「TP16 bs=1 INT8 慢 3.5 ms」那
 一个候选解释。⚠ **只在 TP1 上量过**，TP16 下 KDA 被 16 分，这些矩阵乘小得多，占比未知。
 **可证伪的判据**：TP16 上 BF16 与 INT8 各采一份 bs=1 profile，数
 `MatMulV2 [1,4096;128,4096]` 的次数 —— BF16 应当没有，INT8 应当有 68/step。
+
+---
+
+### 6.5 把 KDA 的 conv 池翻成 window-major，接上 AOT 算子 [−2.78 ms/step，−7.6%]
+
+**这一条是最大的。** KDA 的 decode 卷积原本是**每层九个 torch 算子**，根因是布局：
+
+| | conv 池布局 | 能到达的入口 |
+|---|---|---|
+| GDN（`is_kda=False`） | **window-major** | `torch.ops.npu.causal_conv1d`（AOT，一个 kernel） |
+| **KDA（`is_kda=True`）** | **channel-major** `[17, 24576, 3]` | `causal_conv1d_update_npu` —— **带 torch 回退的那个** |
+
+`sgl_kernel_npu/mamba/causal_conv1d.py:1379`：`cache_seqlens` 与 `num_accepted_tokens`
+都为 None 时（**正是我们**）落进 `torch_causal_conv1d_update_npu`，Triton kernel 走不到。
+
+⚠ **PLAN §2.5 曾把这条列在「已排除（不要再做）」下，并写着「decode 已在用」—— 后半句是错的。**
+已更正（`811de9e6a9`）。**挂在「别再看了」下面的错误是最贵的一类：没人会去复查它。**
+
+**逐 kernel 对账**：
+
+```
+Slice / ReduceSum / IndexPutV2 / Index / Cast /
+ConcatD / BroadcastTo / Mul / Swish        各 34 → 0     −3167 µs
+causal_conv1d_4                              0 → 34       +545 µs
+                                                        ─────────
+                                                          −2622 µs
+```
+
+整步 36.802 → **34.023 ms**，kernel 3084 → **2710**。
+
+#### 实际是 9 处消费点，不是任务书列的 7 处
+
+多出来的两处**都是同一个形状：只在旧布局下碰巧成立的代码**（见 §7b.9）。
+`conv_states_shape` 把原始池形状暴露出去，而 `_init_track_conv_indices` 读它的 `[-1]`
+当卷积窗口长度 —— 翻面后会读到 **24576 而不是 3**，不报错。
+另一处是 `check_kda.py` 的 `RankRunner.states()`，**同一个文件里的第三个硬编码**。
+
+#### conv 权重必须降到 bf16，但 cast 放在 NPU 侧
+
+算子硬要求 weight / activation / conv state 三者同 dtype ∈ {bf16, fp16}，fp32 是
+**干净的 host 侧拒绝**。但 cast 放进 `_get_conv_weights_t` 而不是参数本身 ——
+改 `params_dtype` 会**把 CUDA 一起改了**，而 CUDA 的 `kda_backend.py` 在 conv 权重非 fp32 时
+**静默地**（返回 False）放弃它的 K3 融合。那个缓存转置本来就每层做一次，所以 cast 免费。
+
+#### `x.contiguous()` 不是装饰，而且它暴露了单变量 A/B 的盲区
+
+融合投影（§6.4）把 qkv 作为一个宽输出的**最后一维前缀切片**交出来 ——
+**bs=1 时它是连续的（只有一行），bs≥2 才不是**。所以它只在图捕获走到 bs≥2 的桶时才炸，
+而且**两个调用点各炸一次**（decode 一次、extend 一次）。
+
+⚠ **agent 的单层验证 24/24 全绿是完全正确的** —— 它的 worktree 基线在融合提交之前，
+未融合路径下 qkv 是全新的连续张量。**单变量 A/B 保证归因干净，但交互只有集成时才看得见。**
+
+算子是**拒绝**（`RuntimeError: x must be contiguous`）而不是按错误的步长读。
+⚠ **这是运气**：这条改动本来就不是逐位相同的，如果它静默读错，我大概率发现不了。
+本项目已知的四个算子约束里**三个是静默的**（`causal_conv1d_update` 的 layout、
+`clamp_limit` 被忽略、int64 下标算错），响亮的只有 dtype 那一个。
+
+#### 验证
+
+- **AI core trap = 0**，padded batch（并发 **3 / 13**，非桶值）全过
+- 单层 **24/24 在预算内**，`out.decode` 与 `state.ssm.final` 四个用例**全部改善**
+- 端到端 teacher-forced **mean|dlp| 8.05e-03**（对构型 D），地板 0~2.6e-2
+- ⚠ **未验证**：MTP / speculative 快照路径、mask-track 散写分支 —— 见 §8
 
 ---
 
@@ -667,88 +733,51 @@ conv 池翻面的服务级验证第一次跑失败了，**不是改动的问题*
 
 ---
 
-## 8. 下一步：KDA 的 conv 池翻面（最大的一块，精度门已过）
+## 8. 还没做的，以及两条**没验证**的
 
-### 病灶
+### 8.1 ⚠ 两条改动的一部分路径本部署验证不了
 
-**KDA 的 decode conv1d 是被 torch 拆开来做的，每层 16 个 kernel、合计 4.04 ms/step（占一步 9.4%）。**
-根因是布局：
+**这不是「没时间」，是这个部署没有能触发它们的负载。** 写在这里而不只写在 commit 里，
+因为 `git log` 会把它埋掉，而下一个人是从 PLAN / RESUME 进来的。
 
-| | conv 池布局 | 能用的入口 |
+| 路径 | 为什么验不了 | 什么条件下能验 |
 |---|---|---|
-| GDN（`is_kda=False`） | **window-major** | `torch.ops.npu.causal_conv1d`（AOT，一个 kernel） |
-| **KDA（`is_kda=True`）** | **channel-major** `[17, 24576, 3]` | `causal_conv1d_update_npu`（**带 torch 回退的那个**） |
+| **MTP / speculative 快照路径**（`ascend_kda_backend.py` 约 700–780） | 这个部署不跑 MTP / spec decode，没有负载能走到它。两处改动在代码里都标了 `UNVERIFIED` | 起一个带 MTP / spec decode 的配置；或构造一个直接驱动快照路径的单层 harness |
+| **mask-track 散写分支**（`has_mamba_track_mask`） | `check_kda` 用 `enable_mamba_extra_buffer=False` 建池，且从不设 `mamba_track_mask`，**这条分支从未执行过** | 让 harness 构造带 track mask 的池 |
 
-分叉点在 `hardware_backend/npu/memory_pool_npu.py:38-48`，注释自己写着两族的约定相反。
-而 `sgl_kernel_npu/mamba/causal_conv1d.py:1379`：`cache_seqlens` 与 `num_accepted_tokens`
-都是 None 时（**正是我们**）落到 `torch_causal_conv1d_update_npu`，Triton kernel 走不到。
+⚠ mask-track 那条**转而验了它依赖的不变量**：算子的 state 回写与 `x[L-3:L]` 在 L=64/256/8192
+下**逐位相同**，而那正是散写要写的东西。**构造不出那条路径时，验它必须成立的性质，
+比不验强，也比假装验过诚实** —— 但它不是端到端测试，不要当成端到端测试引用。
 
-⚠ **PLAN §2.5 曾把「K=4 causal conv1d」列在「已排除（不要再做）」下，并写着「decode 已在用」**
-—— 后半句是错的，已更正（`811de9e6a9`）。**挂在"别再看了"下面的错误是最贵的一类。**
-这和 **P6.2**（prefill 侧 `causal_conv1d_fn_npu` 退回 `F.conv1d`）是同一个上游问题的两面。
+⚠ 另有一条**与本线改动无关、但被这次重构顺带发现的实测缺陷**，见 §7b.8：
+`causal_conv1d_fn_npu`（**正在被删掉的那条路**）在一批内混合 `has_initial_state` 时写坏 conv state。
+PLAN P6.2 已就此记了一条禁令：**修好之前不要打开 radix cache 跑精度评测**。
 
-### 目标算子（实测）
+### 8.2 剩下的目标（构型 F = 34.023 ms 上重算，并做了加总校验）
 
-`torch.ops.npu.causal_conv1d(..., run_mode=1)` —— **GDN 路径已经在用**（`ascend_gdn_backend.py:125`）：
+五项之和 **10.406 ms = 整步的 30.6%**，未超 100%，无重复计数；层族分解配平
+（MoE 11.084 + KDA 10.434 + DSA 6.224 + mHC 3.693 + 其他 2.061 + dense 0.527 = 34.02）。
 
-| | b=1 | b=16 |
+| | ms/step | 判断 |
 |---|---|---|
-| AOT `causal_conv1d_update` | 689 µs | 550 µs |
-| 纯 torch 回退（现状，9 个 kernel） | 270 µs | 264 µs |
-| **varlen `causal_conv1d` run_mode=1** | **60 µs** | **61 µs** |
+| **DSA 的簿记** | **3.444** | 每层 96 个 kernel，而 `SparseFlashAttention` 本身只 29.8 µs/层。**按目标分工归 glm53_graph_perf**（P6.7 / P6.10 / P6.11） |
+| **`HcPre`** | **2.926** | 30.5 µs 搬 1.5 MiB = 地板的 23×。**已证明不是 sinkhorn**（§7.5）—— 是算子自身的固定开销，**本线改不动，该问厂商** |
+| **MoE 的路由簿记** | **2.171** | 每层 14 个 kernel、地板是 0。**最值得下一个做**：纯仓库侧、不碰数值 |
+| **shared expert 两个量化 GEMM** | **1.666** | 对地板 0.85 → 约 0.8 可动。搬 8–16 MB 属固定成本主导区 |
+| KDA 的簿记 | **0.199** | §6.5 之后基本清空（曾是 3.383）—— 那 3.2 ms 几乎全是被拆开的卷积 |
 
-GLM 形状下全部 PASS（双参考地板内）、state 回写逐位精确、`cache_indices` 带 `-1` 时**正确跳过**
-（保留槽未被写 —— 即**它没有 §6.2 修的那个 bug**）。
+⚠ **加总校验这个动作要保留。** 另一条线的 P6.7 就是同一笔账从「函数」和「阶段」两个角度
+各量过一次，在待办里变成两条独立条目。**合并的判据是数字对得上，不是名字像。**
 
-### 精度门：已通过
+### 8.3 优化空间的形状没变
 
-conv 权重 fp32 → bf16 是硬要求（算子要求 weight/x/state 三者同 dtype ∈ {bf16, fp16}，
-fp32 是**干净的 host 侧拒绝**，不是静默算错）。
-**5 个用例 × 3 层，30/30 张量在预算内，最差 0.33×，无序列累积**（见 §7.1 末）。
+| | ms/step | 占比 | 能不能动 |
+|---|---|---|---|
+| 带宽受限（≥16 MB） | ~17 | ~50% | ❌ 已贴墙（MoE gmm 0.99× 地板、lm_head 0.91×） |
+| **launch 主导（<16 MB）** | ~12 | **~35%** | ✅ **空间在这里，杠杆是减 kernel 个数不是让 kernel 更快** |
+| compute / 固定成本 | ~4 | ~12% | 部分（`HcPre` 在其中） |
 
-### 要改什么（7 处消费点）
-
-1. `memory_pool_npu.py:_init_npu_conv_state` —— KDA 分支翻成 window-major
-2. `_causal_conv1d_decode` —— 改调 varlen 算子；weight 要 `[width, dim]` 连续（照 `_get_conv_weights_t`）
-3. `_causal_conv1d_extend` —— 同样吃这个布局
-4. `ascend_kda_backend.py:314` 的 mask-track 散写（现在带一个 `.transpose(-1,-2)`）
-5. `glm5_next.py:467` conv 权重 `params_dtype` → bf16
-6. **`SGLANG_MAMBA_CONV_DTYPE` 要从 `float32` 改回 `bfloat16`** —— §6.2 加那个 float32 是为了匹配
-   fp32 权重；权重变 bf16 后它会**重新打开**它本来是来关掉的那个不匹配
-7. speculative 快照路径（`ascend_kda_backend.py:700-780`）
-
-### 三个必须带着走的约束（实测）
-
-- `conv_state_indices` 传 **int64 被接受但静默算错**（相对误差 0.75）。**必须 int32**
-- **padding lane 的输出是垃圾不是零**，调用方必须丢弃
-- `pad_slot_id` 参数**根本不被查**，跳过硬编码在「下标为负」上
-
-### ⚠ 一条验不了的
-
-**第 7 项（speculative / MTP 快照路径）本部署无法验证** —— 不是"没时间"，是**这个部署不跑 MTP**，
-没有能触发那条路径的负载。**能验的条件**：起一个带 MTP / spec decode 的配置，
-或构造一个直接驱动快照路径的单层 harness。**已请 glm53_graph_perf 挂进 PLAN P3.4 的 MTP 一节** ——
-写在 commit 里会被 `git log` 埋掉，而下一个人是从 PLAN/RESUME 进来的。
-
-### 其余（更小，都还没做）
-
-在构型 E（36.802 ms）上重新归类，**并做了加总校验**（下表之和 13.483 ms = 整步的 36.6%，
-未超过 100%，说明没有重复计数；层族分解也配平：KDA 13.102 + MoE 11.040 + DSA 6.140 +
-mHC 3.789 + 其他 2.203 + dense 0.528 = 36.80）：
-
-| | ms/step | 说明 |
-|---|---|---|
-| **KDA 的簿记** | **3.383** | 大部分是本节的 conv 池翻面要拿的 |
-| **DSA 的簿记** | **3.378** | 每层 96 个 kernel，而 `SparseFlashAttention` 本身只 29.8 µs/层。**已按目标分工归 glm53_graph_perf** |
-| **`HcPre`** | **2.957** | 地板的 23×，**已证明不是 sinkhorn**（§7.5），该去问厂商 |
-| **MoE 的路由簿记** | **2.150** | 每层 14 个 kernel、地板是 0 |
-| shared expert 两个量化 GEMM | 1.615 | 对地板 0.85 → 约 0.8 可动；搬 8–16 MB 属固定成本主导 |
-
-⚠ **加总校验这个动作本身值得保留。** 另一条线的 P6.7 就是同一笔账从「函数」和「阶段」两个角度
-各量过一次，在待办里变成了两条独立条目（清单记 6.3 ms/单层，实测改前 6.257、改后 0.393）。
-**合并的判据是数字对得上，不是名字像。**
-
----
+**五条优化全部在减 kernel 个数（−868 个），没有一条是让某个 kernel 算得更快。**
 
 ## 对外页面（别新建，要更新那一个）
 

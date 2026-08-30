@@ -21,7 +21,6 @@ TOTAL              42.823 100.0%          3578       12.0
     1128.8 us/step  n=   34     33.2 us  fused_sigmoid_gating_del AI_VECTOR_ N/A
      783.0 us/step  n=   68     11.5 us  MatMulV2                 AI_CORE    "1,4096;128,4096"
      522.3 us/step  n=   34     15.4 us  Slice                    AI_VECTOR_ "24576,4;2;2"
-     507.4 us/step  n=   34     14.9 us  ReduceSum                MIX_AIV    "1,24576,4;1"
 
 --- MoE ---
     4516.5 us/step  n=   42    107.5 us  GroupedMatmul            MIX_AIC    "8,4096;16,4096,4096;;16,4096;;;;16;8"
@@ -29,7 +28,6 @@ TOTAL              42.823 100.0%          3578       12.0
      954.5 us/step  n=   42     22.7 us  QuantBatchMatmulV3       MIX_AIC    "1,4096;128,256,16,32;4096;1"
      680.8 us/step  n=   42     16.2 us  QuantBatchMatmulV3       MIX_AIC    "1,2048;128,128,16,32;4096;1"
      585.3 us/step  n=   42     13.9 us  MoeInitRoutingV3         MIX_AIV    "1,4096;1,8"
-     567.9 us/step  n=   42     13.5 us  ConcatD                  AI_VECTOR_ "1,2048;1,2048"
 
 --- DSA ---
      717.2 us/step  n=   11     65.2 us  QuantBatchMatmulV3       MIX_AIC    "1,16384;128,1024,16,32;4096;1"
@@ -37,7 +35,6 @@ TOTAL              42.823 100.0%          3578       12.0
      388.3 us/step  n=   11     35.3 us  batch_matmul_transpose_0 AI_CORE    N/A
      328.0 us/step  n=   11     29.8 us  SparseFlashAttention     MIX_AIC    "1,64,512;19403,64,1,512;19403,64,1,512;1,1,2051;1,5
      296.6 us/step  n=   11     27.0 us  QuantBatchMatmulV3       MIX_AIC    "1,1536;512,96,16,32;16384;1"
-     286.6 us/step  n=   11     26.1 us  BatchMatMulV2            AI_CORE    "64,1,256;64,512,256"
 
 --- mHC ---
     2995.1 us/step  n=   90     33.3 us  HcPre                    MIX_AIC    "1,1,4,4096;24,16384;3;24"
@@ -49,7 +46,6 @@ TOTAL              42.823 100.0%          3578       12.0
      181.8 us/step  n=   56      3.2 us  DynamicQuant             AI_VECTOR_ "1,4096"
      123.6 us/step  n=   48      2.6 us  IndexCheck               AI_VECTOR_ "1;1"
      119.2 us/step  n=   47      2.5 us  IndexCheck               AI_VECTOR_ "1;1"
-     114.5 us/step  n=   79      1.4 us  Cast                     AI_VECTOR_ "1"
 
 --- head ---
      930.1 us/step  n=    1    930.1 us  MatMulV2                 AI_CORE    "1,4096;154880,4096"
@@ -60,7 +56,6 @@ TOTAL              42.823 100.0%          3578       12.0
       43.2 us/step  n=    3     14.4 us  ConcatD                  AI_VECTOR_ "1,12288;1,12288"
       38.1 us/step  n=   12      3.2 us  IndexCheck               AI_VECTOR_ "2;1;1"
       36.7 us/step  n=   12      3.0 us  Sub                      AI_VECTOR_ "1;1"
-      32.4 us/step  n=   12      2.7 us  Equal                    AI_VECTOR_ "1;"
 
 --- mHC/per-layer ---
       88.8 us/step  n=   45      2.0 us  FloorMod                 AI_VECTOR_ "1;1"
@@ -73,7 +68,6 @@ TOTAL              42.823 100.0%          3578       12.0
       15.8 us/step  n=    1     15.8 us  ReduceMean               MIX_AIV    "1,4,4096;1"
       10.3 us/step  n=    1      9.8 us  Index                    AI_VECTOR_ "17,32772;2;1;1;1"
        9.7 us/step  n=    1      9.3 us  IndexPutV2               AI_VECTOR_ "17,32772;1;2;2;1;1"
-       9.1 us/step  n=    1      9.1 us  StridedSlice             AI_VECTOR_ "17,32772;2;2;2"
 
 ### bs1_zerorope
 === decode step: 39.741 ms of device time, 3556 kernel launches ===
@@ -98,7 +92,6 @@ TOTAL              39.741 100.0%          3556       11.2
     1098.4 us/step  n=   34     32.3 us  fused_sigmoid_gating_del AI_VECTOR_ N/A
      763.9 us/step  n=   68     11.2 us  MatMulV2                 AI_CORE    "1,4096;128,4096"
      586.8 us/step  n=   34     17.3 us  Slice                    AI_VECTOR_ "24576,4;2;2"
-     503.6 us/step  n=   34     14.8 us  ReduceSum                MIX_AIV    "1,24576,4;1"
 
 --- MoE ---
     4493.5 us/step  n=   42    107.0 us  GroupedMatmul            MIX_AIC    "8,4096;16,4096,4096;;16,4096;;;;16;8"
@@ -106,7 +99,6 @@ TOTAL              39.741 100.0%          3556       11.2
      971.8 us/step  n=   42     23.1 us  QuantBatchMatmulV3       MIX_AIC    "1,4096;128,256,16,32;4096;1"
      677.0 us/step  n=   42     16.1 us  QuantBatchMatmulV3       MIX_AIC    "1,2048;128,128,16,32;4096;1"
      583.8 us/step  n=   42     13.9 us  MoeInitRoutingV3         MIX_AIV    "1,4096;1,8"
-     576.3 us/step  n=   42     13.7 us  ConcatD                  AI_VECTOR_ "1,2048;1,2048"
 
 --- DSA ---
      722.2 us/step  n=   11     65.7 us  QuantBatchMatmulV3       MIX_AIC    "1,16384;128,1024,16,32;4096;1"
@@ -114,7 +106,6 @@ TOTAL              39.741 100.0%          3556       11.2
      303.7 us/step  n=   11     27.6 us  QuantBatchMatmulV3       MIX_AIC    "1,1536;512,96,16,32;16384;1"
      280.2 us/step  n=   11     25.5 us  BatchMatMulV2            AI_CORE    "64,1,256;64,512,256"
      247.1 us/step  n=   22     11.2 us  MatMulV2                 AI_CORE    "1,4096;128,4096"
-     234.9 us/step  n=   11     21.4 us  batch_matmul_transpose_0 AI_CORE    N/A
 
 --- mHC ---
     2741.3 us/step  n=   90     30.5 us  HcPre                    MIX_AIC    "1,1,4,4096;24,16384;3;24"
@@ -126,7 +117,6 @@ TOTAL              39.741 100.0%          3556       11.2
      174.3 us/step  n=   56      3.1 us  DynamicQuant             AI_VECTOR_ "1,4096"
      124.0 us/step  n=   48      2.6 us  IndexCheck               AI_VECTOR_ "1;1"
      120.2 us/step  n=   47      2.6 us  IndexCheck               AI_VECTOR_ "1;1"
-     116.2 us/step  n=   79      1.5 us  Cast                     AI_VECTOR_ "1"
 
 --- head ---
      937.1 us/step  n=    1    937.1 us  MatMulV2                 AI_CORE    "1,4096;154880,4096"
@@ -137,7 +127,6 @@ TOTAL              39.741 100.0%          3556       11.2
       43.9 us/step  n=    3     14.6 us  ConcatD                  AI_VECTOR_ "1,12288;1,12288"
       37.7 us/step  n=   12      3.1 us  IndexCheck               AI_VECTOR_ "2;1;1"
       36.6 us/step  n=   12      3.0 us  Sub                      AI_VECTOR_ "1;1"
-      34.3 us/step  n=   12      2.8 us  Equal                    AI_VECTOR_ "1;"
 
 --- mHC/per-layer ---
       87.7 us/step  n=   45      1.9 us  FloorMod                 AI_VECTOR_ "1;1"
@@ -150,7 +139,6 @@ TOTAL              39.741 100.0%          3556       11.2
       15.4 us/step  n=    1     15.4 us  ReduceMean               MIX_AIV    "1,4,4096;1"
       11.9 us/step  n=    1     11.3 us  Index                    AI_VECTOR_ "17,32772;2;1;1;1"
       11.6 us/step  n=    1     11.0 us  IndexPutV2               AI_VECTOR_ "17,32772;1;2;2;1;1"
-       9.7 us/step  n=    1      9.7 us  StridedSlice             AI_VECTOR_ "17,32772;2;2;2"
 
 ### bs1_convfp32clamp
 === decode step: 38.727 ms of device time, 3352 kernel launches ===
@@ -175,7 +163,6 @@ TOTAL              38.727 100.0%          3352       11.6
     1149.0 us/step  n=   34     33.8 us  fused_sigmoid_gating_del AI_VECTOR_ N/A
      775.6 us/step  n=   68     11.4 us  MatMulV2                 AI_CORE    "1,4096;128,4096"
      525.9 us/step  n=   34     15.5 us  Slice                    AI_VECTOR_ "24576,4;2;2"
-     477.3 us/step  n=   68      7.0 us  MatMulV2                 AI_CORE    "1,128;8192,128"
 
 --- MoE ---
     4471.0 us/step  n=   42    106.5 us  GroupedMatmul            MIX_AIC    "8,4096;16,4096,4096;;16,4096;;;;16;8"
@@ -183,7 +170,6 @@ TOTAL              38.727 100.0%          3352       11.6
      943.8 us/step  n=   42     22.5 us  QuantBatchMatmulV3       MIX_AIC    "1,4096;128,256,16,32;4096;1"
      676.6 us/step  n=   42     16.1 us  QuantBatchMatmulV3       MIX_AIC    "1,2048;128,128,16,32;4096;1"
      632.3 us/step  n=   42     15.1 us  MoeInitRoutingV3         MIX_AIV    "1,4096;1,8"
-     508.4 us/step  n=   42     12.1 us  ConcatD                  AI_VECTOR_ "1,2048;1,2048"
 
 --- DSA ---
      727.5 us/step  n=   11     66.1 us  QuantBatchMatmulV3       MIX_AIC    "1,16384;128,1024,16,32;4096;1"
@@ -191,7 +177,6 @@ TOTAL              38.727 100.0%          3352       11.6
      342.1 us/step  n=   11     31.1 us  SparseFlashAttention     MIX_AIC    "1,64,512;19301,64,1,512;19301,64,1,512;1,1,2051;1,5
      300.0 us/step  n=   11     27.3 us  QuantBatchMatmulV3       MIX_AIC    "1,1536;512,96,16,32;16384;1"
      284.5 us/step  n=   11     25.9 us  BatchMatMulV2            AI_CORE    "64,1,256;64,512,256"
-     250.9 us/step  n=   22     11.4 us  MatMulV2                 AI_CORE    "1,4096;128,4096"
 
 --- mHC ---
     2765.8 us/step  n=   90     30.7 us  HcPre                    MIX_AIC    "1,1,4,4096;24,16384;3;24"
@@ -203,7 +188,6 @@ TOTAL              38.727 100.0%          3352       11.6
      120.9 us/step  n=   48      2.5 us  IndexCheck               AI_VECTOR_ "1;1"
      117.4 us/step  n=   47      2.5 us  IndexCheck               AI_VECTOR_ "1;1"
       88.8 us/step  n=   53      1.7 us  Cast                     AI_VECTOR_ "1,4096"
-      35.6 us/step  n=   24      1.5 us  Fill                     AI_VECTOR_ "1;"
 
 --- head ---
      931.7 us/step  n=    1    931.7 us  MatMulV2                 AI_CORE    "1,4096;154880,4096"
@@ -214,7 +198,6 @@ TOTAL              38.727 100.0%          3352       11.6
       39.7 us/step  n=    3     13.2 us  ConcatD                  AI_VECTOR_ "1,12288;1,12288"
       38.5 us/step  n=   12      3.2 us  IndexCheck               AI_VECTOR_ "2;1;1"
       35.5 us/step  n=   12      2.9 us  Sub                      AI_VECTOR_ "1;1"
-      33.8 us/step  n=   12      2.8 us  Equal                    AI_VECTOR_ "1;"
 
 --- mHC/per-layer ---
       78.8 us/step  n=   45      1.8 us  FloorMod                 AI_VECTOR_ "1;1"
@@ -228,7 +211,6 @@ TOTAL              38.727 100.0%          3352       11.6
       16.1 us/step  n=    1     16.1 us  ReduceMean               MIX_AIV    "1,4,4096;1"
       11.4 us/step  n=    1     10.9 us  IndexPutV2               AI_VECTOR_ "17,32772;1;2;2;1;1"
       11.1 us/step  n=    1     10.6 us  Index                    AI_VECTOR_ "17,32772;2;1;1;1"
-      10.1 us/step  n=    1     10.1 us  StridedSlice             AI_VECTOR_ "17,32772;2;2;2"
 
 ### bs1_moebook
 === decode step: 37.679 ms of device time, 3220 kernel launches ===
@@ -253,7 +235,6 @@ TOTAL              37.679 100.0%          3220       11.7
     1146.3 us/step  n=   34     33.7 us  fused_sigmoid_gating_del AI_VECTOR_ N/A
      776.8 us/step  n=   68     11.4 us  MatMulV2                 AI_CORE    "1,4096;128,4096"
      527.6 us/step  n=   34     15.5 us  Slice                    AI_VECTOR_ "24576,4;2;2"
-     485.8 us/step  n=   34     14.3 us  ReduceSum                MIX_AIV    "1,24576,4;1"
 
 --- MoE ---
     4457.8 us/step  n=   42    106.1 us  GroupedMatmul            MIX_AIC    "8,4096;16,4096,4096;;16,4096;;;;16;8"
@@ -261,7 +242,6 @@ TOTAL              37.679 100.0%          3220       11.7
      953.6 us/step  n=   42     22.7 us  QuantBatchMatmulV3       MIX_AIC    "1,4096;128,256,16,32;4096;1"
      682.2 us/step  n=   42     16.2 us  QuantBatchMatmulV3       MIX_AIC    "1,2048;128,128,16,32;4096;1"
      636.0 us/step  n=   42     15.1 us  MoeInitRoutingV3         MIX_AIV    "1,4096;1,8"
-     340.3 us/step  n=   42      8.1 us  MatMulV2                 AI_CORE    "1,4096;16,4096"
 
 --- DSA ---
      712.1 us/step  n=   11     64.7 us  QuantBatchMatmulV3       MIX_AIC    "1,16384;128,1024,16,32;4096;1"
@@ -269,7 +249,6 @@ TOTAL              37.679 100.0%          3220       11.7
      339.4 us/step  n=   11     30.9 us  SparseFlashAttention     MIX_AIC    "1,64,512;19301,64,1,512;19301,64,1,512;1,1,2051;1,5
      307.0 us/step  n=   11     27.9 us  QuantBatchMatmulV3       MIX_AIC    "1,1536;512,96,16,32;16384;1"
      286.8 us/step  n=   11     26.1 us  BatchMatMulV2            AI_CORE    "64,1,256;64,512,256"
-     251.3 us/step  n=   22     11.4 us  MatMulV2                 AI_CORE    "1,4096;128,4096"
 
 --- mHC ---
     2751.1 us/step  n=   90     30.6 us  HcPre                    MIX_AIC    "1,1,4,4096;24,16384;3;24"
@@ -281,7 +260,6 @@ TOTAL              37.679 100.0%          3220       11.7
      120.7 us/step  n=   48      2.5 us  IndexCheck               AI_VECTOR_ "1;1"
      117.8 us/step  n=   47      2.5 us  IndexCheck               AI_VECTOR_ "1;1"
       94.4 us/step  n=   53      1.8 us  Cast                     AI_VECTOR_ "1,4096"
-      36.4 us/step  n=   24      1.5 us  Fill                     AI_VECTOR_ "1;"
 
 --- head ---
      927.6 us/step  n=    1    927.6 us  MatMulV2                 AI_CORE    "1,4096;154880,4096"
@@ -292,7 +270,6 @@ TOTAL              37.679 100.0%          3220       11.7
       38.8 us/step  n=   12      3.2 us  IndexCheck               AI_VECTOR_ "2;1;1"
       33.6 us/step  n=   12      2.8 us  Equal                    AI_VECTOR_ "1;"
       32.5 us/step  n=   12      2.7 us  Sub                      AI_VECTOR_ "1;1"
-      20.4 us/step  n=   12      1.7 us  Fill                     AI_VECTOR_ "2;"
 
 --- mHC/per-layer ---
       87.0 us/step  n=   45      1.9 us  FloorMod                 AI_VECTOR_ "1;1"
@@ -306,5 +283,146 @@ TOTAL              37.679 100.0%          3220       11.7
       16.1 us/step  n=    1     16.1 us  ReduceMean               MIX_AIV    "1,4,4096;1"
       13.0 us/step  n=    1     12.4 us  IndexPutV2               AI_VECTOR_ "17,32772;1;2;2;1;1"
       10.3 us/step  n=    1      9.8 us  Index                    AI_VECTOR_ "17,32772;2;1;1;1"
-       9.7 us/step  n=    1      9.7 us  StridedSlice             AI_VECTOR_ "17,32772;2;2;2"
+
+### bs1_fuse
+=== decode step: 36.802 ms of device time, 3084 kernel launches ===
+
+family            ms/step      %  kernels/step  us/kernel
+---------------------------------------------------------
+KDA                13.919  37.8%           646       21.5
+MoE                11.040  30.0%           672       16.4
+DSA                 6.170  16.8%          1056        5.8
+mHC                 3.572   9.7%           180       19.8
+unclassified        0.939   2.6%           332        2.8
+head                0.933   2.5%             1      932.9
+dense FFN           0.570   1.5%            66        8.6
+mHC/per-layer       0.290   0.8%           180        1.6
+head/global         0.188   0.5%            18       10.3
+---------------------------------------------------------
+TOTAL              36.802 100.0%          3152       11.7
+
+--- KDA ---
+    6010.2 us/step  n=   34    176.8 us  MatMulV2                 AI_CORE    "1,4096;24896,4096"
+    2039.4 us/step  n=   34     60.0 us  MatMulV2                 AI_CORE    "1,8192;4096,8192"
+    1154.9 us/step  n=   34     34.0 us  fused_sigmoid_gating_del AI_VECTOR_ N/A
+     817.1 us/step  n=   68     12.0 us  MatMulV2                 AI_CORE    "1,4096;128,4096"
+     587.6 us/step  n=   34     17.3 us  Slice                    AI_VECTOR_ "24576,4;2;2"
+
+--- MoE ---
+    4468.7 us/step  n=   42    106.4 us  GroupedMatmul            MIX_AIC    "8,4096;16,4096,4096;;16,4096;;;;16;8"
+    2459.8 us/step  n=   42     58.6 us  GroupedMatmul            MIX_AIC    "8,2048;16,2048,4096;;16,4096;;;;16;8"
+     948.6 us/step  n=   42     22.6 us  QuantBatchMatmulV3       MIX_AIC    "1,4096;128,256,16,32;4096;1"
+     666.1 us/step  n=   42     15.9 us  QuantBatchMatmulV3       MIX_AIC    "1,2048;128,128,16,32;4096;1"
+     576.8 us/step  n=   42     13.7 us  MoeInitRoutingV3         MIX_AIV    "1,4096;1,8"
+
+--- DSA ---
+     718.1 us/step  n=   11     65.3 us  QuantBatchMatmulV3       MIX_AIC    "1,16384;128,1024,16,32;4096;1"
+     382.5 us/step  n=   66      5.8 us  Range                    AI_VECTOR_ ";;"
+     333.5 us/step  n=   11     30.3 us  SparseFlashAttention     MIX_AIC    "1,64,512;19325,64,1,512;19325,64,1,512;1,1,2051;1,5
+     293.3 us/step  n=   11     26.7 us  BatchMatMulV2            AI_CORE    "64,1,256;64,512,256"
+     291.8 us/step  n=   11     26.5 us  QuantBatchMatmulV3       MIX_AIC    "1,1536;512,96,16,32;16384;1"
+
+--- mHC ---
+    2957.4 us/step  n=   90     32.9 us  HcPre                    MIX_AIC    "1,1,4,4096;24,16384;3;24"
+     614.4 us/step  n=   90      6.8 us  HcPost                   AI_VECTOR_ "1,4096;1,4,4096;1,4;1,4,4"
+
+--- unclassified ---
+     346.5 us/step  n=   91      3.8 us  RmsNorm                  AI_VECTOR_ "1,4096;4096"
+     172.1 us/step  n=   56      3.1 us  DynamicQuant             AI_VECTOR_ "1,4096"
+     120.8 us/step  n=   48      2.5 us  IndexCheck               AI_VECTOR_ "1;1"
+     118.4 us/step  n=   47      2.5 us  IndexCheck               AI_VECTOR_ "1;1"
+      91.7 us/step  n=   53      1.7 us  Cast                     AI_VECTOR_ "1,4096"
+
+--- head ---
+     932.9 us/step  n=    1    932.9 us  MatMulV2                 AI_CORE    "1,4096;154880,4096"
+
+--- dense FFN ---
+     238.0 us/step  n=    3     79.3 us  QuantBatchMatmulV3       MIX_AIC    "1,4096;768,256,16,32;24576;1"
+     149.3 us/step  n=    3     49.8 us  QuantBatchMatmulV3       MIX_AIC    "1,12288;128,768,16,32;4096;1"
+      42.0 us/step  n=   12      3.5 us  IndexCheck               AI_VECTOR_ "2;1;1"
+      35.3 us/step  n=   12      2.9 us  Equal                    AI_VECTOR_ "1;"
+      32.9 us/step  n=   12      2.7 us  Sub                      AI_VECTOR_ "1;1"
+
+--- mHC/per-layer ---
+      89.5 us/step  n=   45      2.0 us  FloorMod                 AI_VECTOR_ "1;1"
+      72.2 us/step  n=   45      1.6 us  Cast                     AI_VECTOR_ "1"
+      65.6 us/step  n=   45      1.5 us  BroadcastTo              AI_VECTOR_ ";1"
+      62.3 us/step  n=   45      1.4 us  Cast                     AI_VECTOR_ "1,1,1"
+
+--- head/global ---
+      55.3 us/step  n=    1     52.7 us  Cumsum                   AI_CPU     "1;1"
+      21.7 us/step  n=    1     21.7 us  ArgMaxV2                 AI_VECTOR_ "1,154880;"
+      15.3 us/step  n=    1     15.3 us  ReduceMean               MIX_AIV    "1,4,4096;1"
+      11.1 us/step  n=    1     10.6 us  IndexPutV2               AI_VECTOR_ "17,32772;1;2;2;1;1"
+      11.0 us/step  n=    1     10.5 us  IndexCheck               AI_VECTOR_ "2;1;1"
+
+### bs1_convflip
+=== decode step: 34.023 ms of device time, 2710 kernel launches ===
+
+family            ms/step      %  kernels/step  us/kernel
+---------------------------------------------------------
+KDA                11.252  33.1%           340       33.1
+MoE                11.084  32.6%           672       16.5
+DSA                 6.253  18.4%          1067        5.9
+mHC                 3.547  10.4%           180       19.7
+head                0.927   2.7%             1      926.9
+unclassified        0.888   2.6%           341        2.6
+dense FFN           0.565   1.7%            66        8.5
+head/global         0.179   0.5%            21        8.7
+mHC/per-layer       0.146   0.4%            90        1.6
+---------------------------------------------------------
+TOTAL              34.023 100.0%          2778       12.2
+
+--- KDA ---
+    5911.7 us/step  n=   34    173.9 us  MatMulV2                 AI_CORE    "1,4096;24896,4096"
+    2027.6 us/step  n=   34     59.6 us  MatMulV2                 AI_CORE    "1,8192;4096,8192"
+    1218.1 us/step  n=   34     35.8 us  fused_sigmoid_gating_del AI_VECTOR_ N/A
+     818.1 us/step  n=   68     12.0 us  MatMulV2                 AI_CORE    "1,4096;128,4096"
+     544.6 us/step  n=   34     16.0 us  causal_conv1d_4          MIX_AIV    N/A
+
+--- MoE ---
+    4462.8 us/step  n=   42    106.3 us  GroupedMatmul            MIX_AIC    "8,4096;16,4096,4096;;16,4096;;;;16;8"
+    2449.4 us/step  n=   42     58.3 us  GroupedMatmul            MIX_AIC    "8,2048;16,2048,4096;;16,4096;;;;16;8"
+     980.1 us/step  n=   42     23.3 us  QuantBatchMatmulV3       MIX_AIC    "1,4096;128,256,16,32;4096;1"
+     686.1 us/step  n=   42     16.3 us  QuantBatchMatmulV3       MIX_AIC    "1,2048;128,128,16,32;4096;1"
+     571.9 us/step  n=   42     13.6 us  MoeInitRoutingV3         MIX_AIV    "1,4096;1,8"
+
+--- DSA ---
+     700.3 us/step  n=   11     63.7 us  QuantBatchMatmulV3       MIX_AIC    "1,16384;128,1024,16,32;4096;1"
+     441.5 us/step  n=   66      6.7 us  Range                    AI_VECTOR_ ";;"
+     342.8 us/step  n=   11     31.2 us  SparseFlashAttention     MIX_AIC    "1,64,512;19429,64,1,512;19429,64,1,512;1,1,2051;1,5
+     304.8 us/step  n=   11     27.7 us  QuantBatchMatmulV3       MIX_AIC    "1,1536;512,96,16,32;16384;1"
+     297.0 us/step  n=   11     27.0 us  BatchMatMulV2            AI_CORE    "64,1,256;64,512,256"
+
+--- mHC ---
+    2925.5 us/step  n=   90     32.5 us  HcPre                    MIX_AIC    "1,1,4,4096;24,16384;3;24"
+     621.4 us/step  n=   90      6.9 us  HcPost                   AI_VECTOR_ "1,4096;1,4,4096;1,4;1,4,4"
+
+--- head ---
+     926.9 us/step  n=    1    926.9 us  MatMulV2                 AI_CORE    "1,4096;154880,4096"
+
+--- unclassified ---
+     349.0 us/step  n=   91      3.8 us  RmsNorm                  AI_VECTOR_ "1,4096;4096"
+     173.0 us/step  n=   56      3.1 us  DynamicQuant             AI_VECTOR_ "1,4096"
+     111.6 us/step  n=   79      1.4 us  Cast                     AI_VECTOR_ "1"
+     102.5 us/step  n=   53      1.9 us  Cast                     AI_VECTOR_ "1,4096"
+      38.2 us/step  n=   13      2.9 us  IndexCheck               AI_VECTOR_ "1;1"
+
+--- dense FFN ---
+     240.6 us/step  n=    3     80.2 us  QuantBatchMatmulV3       MIX_AIC    "1,4096;768,256,16,32;24576;1"
+     149.3 us/step  n=    3     49.8 us  QuantBatchMatmulV3       MIX_AIC    "1,12288;128,768,16,32;4096;1"
+      37.8 us/step  n=   12      3.1 us  IndexCheck               AI_VECTOR_ "2;1;1"
+      35.7 us/step  n=   12      3.0 us  Sub                      AI_VECTOR_ "1;1"
+      30.3 us/step  n=   12      2.5 us  Equal                    AI_VECTOR_ "1;"
+
+--- head/global ---
+      52.9 us/step  n=    1     50.4 us  Cumsum                   AI_CPU     "1;1"
+      21.7 us/step  n=    1     21.7 us  ArgMaxV2                 AI_VECTOR_ "1,154880;"
+      15.2 us/step  n=    1     15.2 us  ReduceMean               MIX_AIV    "1,4,4096;1"
+       9.9 us/step  n=    1      9.9 us  StridedSlice             AI_VECTOR_ "17,32772;2;2;2"
+       8.4 us/step  n=    1      8.4 us  GatherV2                 AI_VECTOR_ "154880,4096;1;1"
+
+--- mHC/per-layer ---
+      78.9 us/step  n=   45      1.8 us  FloorMod                 AI_VECTOR_ "1;1"
+      67.6 us/step  n=   45      1.5 us  BroadcastTo              AI_VECTOR_ ";1"
 
