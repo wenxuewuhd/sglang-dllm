@@ -632,11 +632,29 @@ PLAN 里「overlap 下 `seq_lens_cpu` 领先设备张量一步」那个担忧**�
         **回归 `layer_check/check_extend_rows.py`：3006 个用例逐元素相等**
         （含零长度请求、部署形状、全空），而且测的是**从模块里抽出来的仓库源文本**，不是抄件。
         ⚠ **只证明了算术等价，没证明它在设备上可捕获或更快** —— 那需要机器。
-  - [ ] **`visible_pool_runs` 的 `nonzero()`** —— 这才是硬骨头。它的**输出形状是动态的**
-        （run 的个数随数据变），而捕获要求静态形状；图捕获 README 实测 `nonzero` 被拒。
-        要么补齐到最坏情况（每行一个 run）再带一个计数，但下游
-        `npu_fused_infer_attention_score` 的 per-run `actual_seq_lengths` 怎么接受填充
-        需要设计。**先别动，需要一次带机器的设计验证。**
+  - [x] **`visible_pool_runs` 的 `nonzero()` —— 已改成静态形状**（2026-08-30）。
+        原先它的输出长度就是 run 个数，随数据变，捕获直接拒。
+
+        **关键的未知先上机问掉了**（`probe/p6_a1_padded_runs.py`）：消费者是
+        `npu_lightning_indexer`，`actual_seq_lengths_query` 是**前缀和** ——
+        补齐前缀和 = 重复末值 = 多出来的 run **跨零个查询行**。
+        算子认不认这种空 run，文档没写、源码读不出来，**只能问**。
+        答案是干脆的：把 128 个 run 的分段补上 1 / 8 / 128 个空 run，
+        输出**三次都逐位相同**。
+
+        实现：不再用 `nonzero` 压缩，而是把每个边界 **scatter 到它的名次所指的槽**，
+        非边界送到末尾的 scratch 槽再切掉；空槽填 `n`，于是它「起点就是终点」——
+        正好是空 run 该有的样子。上界由 `max_visible_pool_runs()` 给：
+        一个请求内 key 数每行加一，所以 `pool_lens = key//kpool` 每 `kpool` 行才变一次，
+        每请求最多 `ceil(q_len/kpool)+1` 个 run，合计 `ceil(n_rows/kpool)+batch`。
+        回归 `layer_check/check_pool_runs.py`：**2006 个配置**，补齐版在真实 run 上与
+        精确版逐元素相同、填充部分确实是空 run、上界从不被突破（余量 1..13）。
+        ⚠ **只验了分段本身（CPU）与算子对空 run 的容忍（单卡）**，
+        整条 prefill 捕获还没试过 —— 它还缺下面两项。
+  - [ ] **prefill 进图还差两步**：① `_kpool_compress_write_extend_npu` 仍是 host 侧循环
+        （每请求形状不同的散写），同样会被烘进图；
+        ② 要在声明式 registry（`arg_groups/overrides.py` 的 `_inkling_overrides` 那套）
+        里给 GLM 注册 full prefill capture。**A1 做完不等于 prefill 能进图。**
   - [ ] `_kpool_compress_write_extend_npu` 仍是 host 侧循环（每请求形状不同的散写），难度更高
 
 捕获期间 `.item()`/`.cpu()` 会抛 **107027**（已实测）。

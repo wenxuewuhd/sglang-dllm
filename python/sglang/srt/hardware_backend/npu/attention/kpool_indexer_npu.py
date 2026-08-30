@@ -90,7 +90,7 @@ def compress_pool_bf16(
 
 
 def visible_pool_runs(
-    pool_lens: torch.Tensor, req_index: torch.Tensor
+    pool_lens: torch.Tensor, req_index: torch.Tensor, max_runs: int | None = None
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Segment query rows into runs that share one visible-pool count.
 
@@ -105,31 +105,69 @@ def visible_pool_runs(
 
     Returns ``(cu_seqlens_q, key_lens, run_req_index)``: the TND query prefix sum,
     the visible-pool count per run, and which request each run belongs to.
+
+    ``max_runs`` pads the three outputs to a fixed length so their shapes stop
+    depending on the data, which is what a graph capture needs. Padding a prefix sum
+    means repeating its final value, so the added runs span zero query rows.
+    ``npu_lightning_indexer`` treats those as a no-op: measured on device, padding a
+    128-run segmentation by 1, 8 and 128 empty runs each gives bit-identical output
+    (``probe/p6_a1_padded_runs.py``). Left as ``None``, the output is exactly as long
+    as there are runs and the shape is dynamic -- fine for eager, not capturable.
     """
     # Compare the two run keys directly rather than packing them into one integer.
     # The packed form needed `int(pool_lens.max())`, which is a device-to-host wait,
     # and it fed `torch.unique_consecutive`, which on Ascend has no AI Core
     # implementation and falls back to `aclnnUniqueConsecutive` on the AI CPU
-    # (measured: 112 us for 8192 rows, against ~13 us for the AI Core `nonzero` this
-    # uses instead).  `counts.cumsum(0)` was a second AI CPU kernel
-    # (`aclnnCumsum_CumsumAiCpu`, 42 us) and is not needed at all: the run ends are
-    # just the next run's start.
+    # (measured: 112 us for 8192 rows).
     n = int(pool_lens.shape[0])
     device = pool_lens.device
     zero = torch.zeros(1, dtype=torch.int64, device=device)
-    if n <= 1:
-        starts = zero[:n]
-    else:
-        changed = (req_index[1:] != req_index[:-1]) | (pool_lens[1:] != pool_lens[:-1])
+    if n == 0:
+        width = max_runs or 0
+        empty = torch.zeros(width, dtype=torch.int32, device=device)
+        return empty, empty.clone(), empty.to(torch.int64)
+    # n == 1 needs no special case: `changed` is empty, so the nonzero branch appends
+    # nothing and the scatter branch writes nothing, both leaving starts = [0, ...].
+    changed = (req_index[1:] != req_index[:-1]) | (pool_lens[1:] != pool_lens[:-1])
+    if max_runs is None:
+        # nonzero's output length is the run count, so this branch cannot be captured.
         starts = torch.cat([zero, changed.nonzero().flatten() + 1])
+    else:
+        # Scatter each change position into the slot its rank names, instead of
+        # compacting with nonzero. cumsum gives the first change rank 1, so slot 0
+        # is never a target and keeps its 0. Rows that are not a boundary are sent
+        # to a scratch slot past the end and dropped with the slice.
+        rank = changed.cumsum(0)
+        pos = torch.arange(1, n, device=device, dtype=torch.int64)
+        slot = torch.where(changed, rank, torch.full_like(rank, max_runs))
+        # Unused slots hold n, which makes them start where the sequence ends: an
+        # empty run, which is exactly what the padding has to look like.
+        starts = torch.full((max_runs + 1,), n, dtype=torch.int64, device=device)
+        starts[0] = 0
+        starts.scatter_(0, slot, pos)
+        starts = starts[:max_runs]
     ends = torch.cat(
         [starts[1:], torch.full((1,), n, dtype=torch.int64, device=device)]
     )
+    # A padded slot holds n, which is one past the last row; clamp so the gather is
+    # in range. The value it picks up is irrelevant -- the run spans no rows.
+    gather = starts.clamp(max=max(n - 1, 0))
     return (
         ends.to(torch.int32),
-        pool_lens[starts].to(torch.int32),
-        req_index[starts].to(torch.int64),
+        pool_lens[gather].to(torch.int32),
+        req_index[gather].to(torch.int64),
     )
+
+
+def max_visible_pool_runs(n_rows: int, batch: int, kpool: int) -> int:
+    """A static upper bound on the run count, for `visible_pool_runs(max_runs=...)`.
+
+    Within one request the row's key count rises by exactly one per row, so
+    ``pool_lens = key_count // kpool`` changes once every ``kpool`` rows and the
+    request contributes at most ``ceil(q_len / kpool) + 1`` runs. Summed over the
+    batch that is at most ``ceil(n_rows / kpool) + batch``; the extra 1 is slack.
+    """
+    return -(-n_rows // kpool) + batch + 1
 
 
 def select_pools(
