@@ -32,10 +32,15 @@ KDA, DSA, MOE, DENSE, ALL_LAYERS = 34, 11, 42, 3, 45
 
 # (kernel Type, exact Input Shapes) -> family.  Only for groups whose call count
 # alone is ambiguous, or that are split across two families.
+# Sentinel for the one family in a split that takes whatever is left over.
+REST = "rest"
+
 SHAPE_RULES = {
-    # 90/step = 68 KDA (f_a, g_a) + 22 DSA (indexer wk, kpool compress gate).
-    # Same shape, same cost, so the split is by count.
-    ("MatMulV2", '"1,4096;128,4096"'): ("split", {"KDA": 68, "DSA": 22}),
+    # Was 90/step = 68 KDA (f_a, g_a) + 22 DSA (indexer wk, kpool compress gate);
+    # same shape, same cost, so the split is by count.  The KDA 68 disappeared
+    # when the small projections were fused (3c671fa401), so KDA takes the
+    # remainder rather than a hard-coded count -- see the assertion in split_of().
+    ("MatMulV2", '"1,4096;128,4096"'): ("split", {"DSA": 22, "KDA": REST}),
     ("MatMulV2", '"1,4096;154880,4096"'): ("head", None),
     ("HcPre", None): ("mHC", None),
     ("HcPost", None): ("mHC", None),
@@ -50,6 +55,33 @@ COUNT_TO_FAMILY = [
     (ALL_LAYERS, "mHC/per-layer"),
     (DENSE, "dense FFN"),
 ]
+
+
+def split_of(split: dict, per_step: float, ktype: str, shapes: str):
+    """Resolve a split rule against the count that actually ran this profile.
+
+    A rule that hard-codes every count silently fabricates work once an
+    optimization removes one side of the split: the shares are ``us * k /
+    per_step``, so a rule summing to 90 applied to a group that now runs 22
+    times invents 3x the time it saw.  One family may be declared REST and
+    absorbs the remainder; anything else must add up, or we refuse to guess.
+    """
+    fixed = {f: k for f, k in split.items() if k != REST}
+    rest = [f for f, k in split.items() if k == REST]
+    assert len(rest) <= 1, f"at most one REST family: {split}"
+    n = round(per_step)
+    left = n - sum(fixed.values())
+    if left < 0 or (not rest and left != 0):
+        raise SystemExit(
+            f"attribution rule for {ktype} {shapes} declares "
+            f"{sum(fixed.values())}{'+rest' if rest else ''} calls/step but "
+            f"{n} ran.  The model changed under the rule -- fix SHAPE_RULES "
+            f"rather than let it scale a stale count into invented time."
+        )
+    out = [(f, k) for f, k in fixed.items()]
+    if rest and left:
+        out.append((rest[0], left))
+    return out
 
 
 def family_of(ktype: str, shapes: str, per_step: float):
@@ -99,7 +131,7 @@ def main() -> None:
         total += us
         fam, split = family_of(ktype, shapes, per_step)
         if fam == "split":
-            for f, k in split.items():
+            for f, k in split_of(split, per_step, ktype, shapes):
                 share = us * k / per_step
                 fam_us[f] += share
                 fam_calls[f] += k
