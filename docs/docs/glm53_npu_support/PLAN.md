@@ -801,6 +801,27 @@ PLAN 里「overlap 下 `seq_lens_cpu` 领先设备张量一步」那个担忧**�
         Ascend 的 `init_forward_metadata_out_graph` 却假设静态 buffer 已经按 decode 的
         bs 预分配好了，于是读一个空 dict。
 
+        **决定：记账，暂不做**（用户 2026-08-30）。理由不是"太难"，是**深度未知而收益未量化**：
+
+        - **只知道第 1 个阻塞，不知道一共有几个。** 捕获停在第一个 KeyError，
+          后面还有多少层没接上的线只能一次崩溃一次地发现。这个项目里同类的
+          「接线缺口」有先例 —— 整网拉通时连撞三个，**每修一个才露出下一个**
+        - **在共享文件里，而我们刚决定不跑 DSv4 回归** —— 等于在共享的捕获路径上动手
+          却主动放弃了安全网。而捕获路径的错误特别阴：**值被烘进图里不报错、不崩、
+          数字看着也正常**
+        - **收益从没量化过。** 「prefill 是收益上界最大的一项」的依据只是
+          「GSM8K 一轮有 875 个 prefill 批」，**没有人量出 prefill 占真实负载一步的百分之几** ——
+          想量的那次服务级 profiling 把 16 个 rank 全段错误打挂了
+
+        **什么条件下值得重启这件事**（按顺序，前两步不占卡或只占一次）：
+        1. **先把收益量出来** —— 在一个真实负载下拆出 prefill 与 decode 各占多少。
+           不需要 profiler：`--max-running-requests 1` 跑固定负载，
+           对比 `--chunked-prefill-size` 大小不同的两档，或者直接用调度器日志的
+           per-batch 计时求和（`glm53_int8_1card` 的 `tools/attribute_kernels.py`
+           在低并发下是活的，可以借）
+        2. 收益够大再动手，**并且先补 DSv4 的回归安全网**
+        3. 动手时按「一次崩溃一次」的节奏走，每接上一层就记一层，别攒着
+
         **所以这是后端工作，不是配置工作**：要给 `AscendAttnBackend` 加一条 prefill 分支，
         直接从 `forward_batch` 建 metadata（而不是从 decode 的预分配 buffer 取），
         或者把 buffer 也按 prefill 形状分配。⚠ **在共享文件 `ascend_backend.py` 里**，

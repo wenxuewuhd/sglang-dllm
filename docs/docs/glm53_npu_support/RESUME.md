@@ -138,9 +138,12 @@ prefill 运行器走的是另一条路（只调 `init_forward_metadata_out_graph
 2. [ ] `_kpool_compress_write_extend_npu` 仍是 host 侧循环（每请求形状不同的散写）——
        **比前两个难一档**：写的是 KV 索引缓存，改错是静默数据损坏而不是报错，
        核心部分离线验不了
-3. [ ] **给 `AscendAttnBackend` 加 prefill 侧的图 metadata 契约** —— 这才是真正的阻塞
+3. [ ] ~~给 `AscendAttnBackend` 加 prefill 侧的图 metadata 契约~~ ——
+       **记账，暂不做**（用户 2026-08-30）。深度未知（只知道第 1 个阻塞）、
+       收益未量化、且在共享文件里而 DSv4 回归又不跑。
+       **重启条件写在 PLAN P3.4：先把 prefill 占真实负载一步的比例量出来。**
 
-**并行可做**：图下重做 P6 排序。已有的两个指向 ——
+**prefill 进图既然记账了，主线就换成已经量化过的那批。** 已有的两个指向 ——
 ① **长上下文 64 并发就拐**（1044 → 1130 只涨 8%，而 KV 用量才 0.04、mamba 满 1.00），
 指向 kpool 的 device 时间（P6.7 / P6.10 / P6.11），**图吃不掉**；
 ② P6.9 `TASK_QUEUE_ENABLE=2` 在 eager 下测得 1.74×，**图下可能已被吃掉，要重测**。
