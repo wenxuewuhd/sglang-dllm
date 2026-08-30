@@ -90,9 +90,9 @@ def load_layer_weights(model_dir: Path, layer: int) -> Dict[str, torch.Tensor]:
 
 
 
-#: dtype for the KDA conv weights. Production pins fp32 (glm5_next.py
-#: params_dtype); `--conv-weight-dtype bfloat16` is what the AOT conv op needs.
-_CONV_WEIGHT_DTYPE = torch.float32
+#: dtype for the KDA conv weights. Production pins bf16 (glm5_next.py
+#: params_dtype), which is what the AOT conv op needs; it rejects fp32.
+_CONV_WEIGHT_DTYPE = torch.bfloat16
 
 
 class ShardedKDAWeights:
@@ -470,7 +470,9 @@ class RankRunner:
 
     def states(self):
         cache = self.runner.req_to_token_pool.mamba2_layer_cache(0)
-        conv = cache.conv[0][self.golden_slot].float().cpu()
+        # The pool slot is [window, channels]; `reassemble_states` and the
+        # reference both want [channels, window].
+        conv = cache.conv[0][self.golden_slot].transpose(-1, -2).float().cpu()
         ssm = cache.temporal[self.golden_slot].float().cpu()
         return conv, ssm
 
@@ -483,8 +485,6 @@ _ACTIVE_TIMER = None
 #: Every operator the Ascend KDA chain calls, as (module, attribute). Wrapping
 #: them turns the chain into `timing.Timer` phases without a host sync.
 _OP_SITES = (
-    "causal_conv1d_fn_npu",
-    "causal_conv1d_update_npu",
     "fused_kda_gate_npu",
     "l2norm_fwd",
     "chunk_local_cumsum",
@@ -503,6 +503,10 @@ def install_op_phases():
 
     targets = [(ak, n) for n in _OP_SITES]
     targets.append((kda_triton, "fused_sigmoid_gating_delta_rule_update"))
+    # The conv is reached as `torch.ops.npu.causal_conv1d`, resolved on the
+    # namespace at every call, so patching the namespace both times it and
+    # proves which operator the backend actually ran.
+    targets.append((torch.ops.npu, "causal_conv1d"))
 
     saved = []
     for owner, name in targets:
@@ -713,7 +717,7 @@ def run_bench(args, *, weights_full, meta) -> int:
                 "pays those once per forward for all 34 KDA layers, not per layer",
                 "the operator phases are nested inside 'kda backend', so the "
                 "sum-of-phases line double-counts them; each operator line is one "
-                "call, and causal_conv1d_fn_npu / l2norm_fwd run more than once",
+                "call, and causal_conv1d / l2norm_fwd run more than once",
                 f"host load average when measured: {load[0]:.1f} (1 min)",
             ),
         )
@@ -761,9 +765,9 @@ def main() -> int:
     ap.add_argument(
         "--conv-weight-dtype",
         choices=["float32", "bfloat16", "float16"],
-        default="float32",
-        help="dtype for the KDA conv weights. Production pins float32; the AOT "
-        "torch.ops.npu.causal_conv1d rejects it and needs bfloat16.",
+        default="bfloat16",
+        help="dtype for the KDA conv weights. Production pins bfloat16, which "
+        "is what the AOT torch.ops.npu.causal_conv1d needs; it rejects float32.",
     )
     args = ap.parse_args()
 
@@ -893,8 +897,9 @@ def reassemble_states(conv_parts, ssm_parts, num_heads, head_dim, tp):
 
     conv per rank is [q|k|v] over that rank's heads, so the full conv state is
     the three sub-blocks each concatenated over ranks -- not the ranks
-    concatenated whole.  The NPU pool keeps [channels, window]; the reference
-    stores the same, so no transpose.  The temporal state is [H, V, K] on NPU
+    concatenated whole.  `RankRunner.states` has already turned the pool's
+    [window, channels] slot into the [channels, window] the reference stores.
+    The temporal state is [H, V, K] on NPU
     (`chunk_gated_delta_rule_fwd_h_npu` writes it transposed) against the
     reference's [H, K, V].
     """

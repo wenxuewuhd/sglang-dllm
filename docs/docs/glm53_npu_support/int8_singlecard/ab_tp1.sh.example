@@ -41,6 +41,27 @@ echo "die $DIE free: $(die_used) MiB used"
 
 nohup bash $RUN/launch_glm_w8a8_tp1.sh > $LOG 2>&1 &
 echo "log $LOG"
+
+# Fail fast on a collision instead of OOMing thirty seconds later. The idle check
+# above is a snapshot: a third user on this box runs 16-die DSv4 training, and one
+# of those starts landed inside our weight load on 2026-08-30 -- the die was at
+# 3135 MiB when we looked and at 55 GB by the time the MoE reached create_weights.
+# `Load weight begin. avail mem=` is the first number printed after the device is
+# really ours, so it is the earliest point a collision is visible. A healthy start
+# on this configuration reports ~60.8 GB.
+for i in $(seq 1 120); do
+    grep -q "Load weight begin" $LOG && break
+    grep -qE "Traceback|out of memory" $LOG && break
+    sleep 5
+done
+AVAIL=$(grep -oP 'Load weight begin\. avail mem=\K[0-9.]+' $LOG | head -1)
+if [ -n "$AVAIL" ] && [ "$(echo "$AVAIL < 58" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
+    echo "ABORT: only ${AVAIL} GB free at load time (expect ~60.8) -- someone else took the die."
+    echo "       This is a collision, not a regression in whatever you were testing."
+    npu-smi info -t proc-mem -i $DIE -c 0 2>/dev/null | head -5
+    pkill -f -- "[-]-port ${PORT}" 2>/dev/null
+    exit 2
+fi
 for i in $(seq 1 240); do
     grep -q "server is fired up" $LOG && break
     grep -qE "Traceback|out of memory" $LOG && { echo "FAILED:"; tail -25 $LOG; exit 1; }
