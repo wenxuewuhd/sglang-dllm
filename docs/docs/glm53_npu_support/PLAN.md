@@ -644,8 +644,29 @@ prefill 按调度器自己的每批计时：BF16 4849 tok/s、INT8 4906 tok/s，
 
 **`glm53_int8_1card` 在单卡上实测推翻了它**：图模式下这些 kernel 合计
 **382 µs/step（0.9%）、每个 2.8 µs**，不是 3.5 ms —— 图把 launch 开销吃掉了。
-⚠ 被推翻的是**机制**，不是「TP16 bs=1 上 INT8 比 BF16 慢 3.5 ms」这个**观测**；
-那个观测的成因目前**未知**，要追就在 TP16 上按同样口径采一次 bs=1 的 profile 两边相减。
+⚠ 被推翻的是**机制**，不是「TP16 bs=1 上 INT8 比 BF16 慢 3.5 ms」这个**观测**。
+
+**2026-08-30 有了一个候选机制，而且是源码确认的**（由 `glm53_int8_1card` 发现）：
+`glm5_next.py:366` 的
+```python
+self.do_fuse_qkvbfg = quant_config is None and head_shard_size == self.tp_size
+```
+**这个条件问错了问题** —— 它问「有没有 quant_config」，该问「这几层是不是被量化了」。
+本线核实：KDA 的 `q/k/v/b/f_a/g_a/f_b/g_b_proj` **每一个都在 W8A8 的 ignore 列表里**
+（抽查 5 个 KDA 层全部 5/5），**连融合模块名 `fused_qkvbfg_a_proj` 自己也在** ——
+厂商显然预期过这条路在量化下被走。
+
+**后果：BF16 走融合路径（`quant_config is None`），INT8 不走。**
+所以 INT8 相对 BF16 白白多出每个 KDA 层 4 个小矩阵乘。
+对方在 TP1 bs=1 实测这笔是 **约 1.68 ms/step、每步 170 次启动**，全部 launch 主导
+（没有一个搬超过 2 MiB）。
+
+⚠ **机制是源码确认的，量级在 TP16 上未测**。可证伪的判据（对方给的）：
+在 TP16 上分别用 BF16 和 INT8 采一份 bs=1 profile，数 `MatMulV2 [1,4096;128,4096]`
+这一组 —— **BF16 应当没有，INT8 应当有 68/step**。
+⚠ 本线的服务级 profiling 在 16 rank 上会段错误，所以这个判据要么等一个能用的采法，
+要么改成 A/B 墙钟（对方修好之后，INT8 打不打这个补丁各测一次）。
+**修在 `glm5_next.py`，由 `glm53_int8_1card` 那条线做**，本线不重复。
 
 **教训**：一个数量级对得上的算术不构成机制证据。当时那句「量级对得上」正是让它
 读起来像结论的东西。
