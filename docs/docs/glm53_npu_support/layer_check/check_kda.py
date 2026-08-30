@@ -223,11 +223,14 @@ def build_backend(*, tp: int, batch: int, max_context_len: int, num_heads: int,
         head_dim=head_dim,
         conv_kernel_size=conv_kernel,
     )
-    cache_params = KimiLinearCacheParams(
-        shape=shape,
-        layers=[0],
-        dtype=Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32),
-    )
+    # Resolve the state dtypes the way production does: glm5_next.py builds
+    # KimiLinearCacheParams without a dtype, so the default_factory runs
+    # mamba2_state_dtype(), which is the only reader of SGLANG_MAMBA_CONV_DTYPE.
+    # Pinning conv=bfloat16 here made this harness immune to that variable -- and
+    # SGLANG_MAMBA_CONV_DTYPE is exactly what decides whether
+    # _causal_conv1d_decode takes its fast path or its dtype-mismatch detour, so
+    # the tool silently could not test the one thing it was reached for.
+    cache_params = KimiLinearCacheParams(shape=shape, layers=[0])
 
     runner = ModelRunner.__new__(ModelRunner)
     runner.device = DEV
