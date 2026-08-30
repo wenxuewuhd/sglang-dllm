@@ -531,8 +531,24 @@ class KPoolNPUIndexerMixin:
 
         n_draft = max_speculative_num_draft_tokens()
         n_rows = key.shape[0]
-        batch = n_rows // n_draft
-        assert batch * n_draft == n_rows, (n_rows, n_draft)
+        # `batch` comes from the batch, not from dividing the row count by
+        # `n_draft`. Draft-extend lays out `num_draft_tokens + num_front_tokens`
+        # rows per request (`eagle_worker_common.prepare_for_draft_extend`:
+        # `extend_num_tokens = bs * num_window_tokens`), so the division answers
+        # `bs` only while the window is not widened -- and for an even `bs` the
+        # divisibility check still passes on the wrong answer. Everything below
+        # indexes `block_tables` with `arange(batch)`, so an over-large `batch`
+        # reads past its end: measured as an AI Core `MTE accesses an invalid GM
+        # address` at concurrency 128, silent at batch 1.
+        batch = int(forward_batch.batch_size)
+        assert n_rows % batch == 0, (n_rows, batch)
+        rows_per_req = n_rows // batch
+        assert rows_per_req == n_draft, (
+            f"this writer assumes {n_draft} rows per request, got {rows_per_req} "
+            f"({n_rows} rows over {batch} requests) -- a widened draft-extend "
+            f"window needs the ring writes and write_start to account for the "
+            f"front tokens"
+        )
 
         seq_lens = forward_batch.seq_lens[:batch].long()
         if forward_batch.forward_mode.is_target_verify():

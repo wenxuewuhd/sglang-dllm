@@ -1368,6 +1368,71 @@ TP1 是全部 32）。**主导项恰好不是被 TP 切得最干净的那部分�
 - [ ] **1M 的性能优化**。二次项占 43% 是可攻击的，但先量清楚 prefill 在真实负载里的占比
       （与 P3.4 的重启条件同理）。
 
+### P8 · MTP / 投机解码 ☐（bring-up 通了，**并发 >= 32 有未解决的越界**）
+
+**跑起来了，但只在并发 <= 16。** 完整判据见下；这一节最重要的是那个未解决的 bug。
+
+#### 已经通的
+
+| | |
+|---|---|
+| draft 模型 | `Glm5NextForConditionalGenerationNextN`，**1.27 GB/die**，走 compressed-tensors 量化 |
+| 池 | target + draft 两个 KV 池都建起来 |
+| 图捕获 | decode / TARGET_VERIFY / draft-extend **三种全过** |
+| 投机确实在发生 | 接受长度 **1.71–2.00**（`num_draft_tokens=2`，两条打满 2.000）|
+| 长提示召回 | MTP 开着，32576 token 五深度 **5/5** |
+
+W8A8 checkpoint 的 layer 45 **是量化的**（871 个 scale），`quantization_config.ignore`
+只列了本就不量化的 norm/gate、没有通配符，所以 `_resolve_nextn_quant_config` 走量化路径是对的。
+
+#### ⛔ 未解决：并发 >= 32 时 AI Core 越界
+
+```
+errorStr: MTE accesses an invalid GM address or the cross-device memory access times out
+```
+
+- 并发 1/2/4/8/16 全过，**32 崩**。异步错误，宿主端在
+  `prepare_for_draft_extend -> ForwardBatch.init_new` 处撞到它撞上的下一个 copy
+- **已排除三个嫌疑**：① draft-extend 的行布局（`prepare_for_draft_extend` 的
+  `extend_num_tokens = bs * (num_draft_tokens + num_front_tokens)` 可能不等于
+  `bs * num_draft_tokens`）—— 加了响亮断言，**没触发**；
+  ② `kpool_spec_update_index_cache` 里的每个索引 —— 逐个算过边界；
+  ③ `verify_intermediate_state_indices[:batch_size]` —— 按
+  `max(get_eager_max_batch_size, pool_size)` 分配，128 够用
+- **下一步**：按 `debug-cuda-crash` 的方法学开 kernel API 日志逐个 kernel 定位。
+  最高嫌疑仍是 `ascend_kda_backend.py` 里那两处标着 `UNVERIFIED` 的快照路径
+  （:505 与 :662），它们**只有投机解码能到达**，而单卡线明确警告过其中一条的
+  contiguous 约束**只在 bs >= 2 才暴露**
+
+#### 性能：bs=1 下净加速为零，而且要吃掉一半 KV 池
+
+| | 每步 | 每步产出 | 每 token |
+|---|---|---|---|
+| 无 MTP | 23.3 ms | 1 | **22.3 ms**（三次重复一致）|
+| MTP | 43.2 ms | 1.97 | **21.9 ms** |
+
+**verify 步是 decode 步的 1.86x，只换来 1.95 个 token —— 打平。**
+一个 verify 周期要跑 draft-extend + draft decode + target verify **三次前向**，
+而 draft 虽然只有一层，**每次前向的固定开销（launch、HCCL、图重放）不按层数缩放**。
+
+⚠ **容量代价更值得看**：`mrr=128` 下投机的中间缓冲吃掉 **4.57 GB/die**
+（`intermediate_ssm_state_cache` 4.41 + conv window 0.16），它随
+`max_running_requests x num_draft_tokens` 线性增长，且在 KV 池定容**之后**从同一份预算里扣：
+
+| | 无 MTP | MTP |
+|---|---|---|
+| KV 池（mrr=128, mem-frac 0.85）| 938,176 token | **418,496 token** |
+
+**MTP 把 KV 池砍掉 55%**，而 KV 池决定能同时装多少长请求。
+=> **在把那个 OOB 修掉、并证明高并发下有实际吞吐收益之前，不建议开 MTP。**
+
+#### ⚠ 判据上的一个坑（花了这一轮很多时间才想明白）
+
+「贪心下 MTP 必须与非 MTP 输出逐位相同」**在这台机器上不是合法判据** ——
+基线自己跨 batch 宽度就不可复现（见 RESUME「精度是怎么判的」一节）。
+能用的是：**GSM8K 统计** + **接受长度**（后者不需要参考：verify 算错就配不上
+target 的 argmax，接受长度会塌向 1.0，**算错的 verify 产不出「每个 draft 都被接受」**）。
+
 ---
 
 ## 4. 待决与已知缺陷
