@@ -966,6 +966,25 @@ prefill 与 decode 分开量：先跑 `max_new_tokens=1` 拿 prefill 墙钟，�
       **所以 GDN 用得上、KDA 用不上**。把 KDA 池翻面可能一次解决 decode（4.04 ms/step）
       和 prefill 两侧。⚠ 约束：该算子要求 weight/state 是 bf16，而 GLM 的 conv 权重是 fp32，
       **有真实的精度问题要验**。
+      ⚠⚠ **这个函数还有一个已知的正确性缺陷，不只是慢**（2026-08-30，
+      `glm53_int8_1card` 实测）：`causal_conv1d_fn_npu` 在**一个 extend 批里混合
+      `has_initial_state`** 时会**写坏 conv state**（输出是对的，只有 state 回写坏）。
+
+      | 批内 `has_initial_state` | state err（`\|state\|` ≈ 4.2）|
+      |---|---|
+      | 全 True / 全 False | **0** |
+      | `F,T,F,T` / `T,F,T,F` | **5.84 / 5.98** |
+
+      触发条件是**一个 extend 批里同时有 prefix-cache 命中和冷请求**，生产上完全可达。
+      ⚠ **`check_kda` 抓不到**（基线 6/6 全绿）—— 它只比对 golden 那个槽位。
+
+      **本线记录在案的所有精度数字都不受影响，但那是碰巧**：我们全部 8 个启动脚本都带
+      `--disable-radix-cache`（服务端 `disable_radix_cache=True` 已核实），
+      没有 prefix-cache 命中，于是 `has_initial_state` 每批一致为 False，
+      触发形状从未出现。**那个 flag 在那儿是为了让测量可复现，不是为了躲这个 bug。**
+      ⛔ **所以：在这条修好之前，不要打开 radix cache 去跑精度评测** ——
+      而"上生产先把 prefix cache 打开"恰恰是最自然的下一步动作。
+
       原 prefill 侧的量化：Ascend 的 extend 把深度卷积拆成 **3 次调用**，
       而共享 CUDA 路径对整个 qkv 宽度只做 **1 次打包调用**。实测 **6.5 ms / 单层 14.3 ms = 45%**，
       而且这 3 次调用**各带 3 次 host 等待**（prefill 全部 9 次 host 往返都在这里）。原条目： —— `causal_conv1d_fn_npu` 内部退回 `F.conv1d`（`sgl_kernel_npu` 上游的实现选择）；
