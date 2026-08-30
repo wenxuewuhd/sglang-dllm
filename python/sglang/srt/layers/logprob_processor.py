@@ -525,7 +525,12 @@ class InputLogprobProcessor:
         split_len_token_ids = 0
 
         fused_kernel, fused_max_k = None, 0
-        if self.enable_fast_input_logprobs and pruned_states.is_cuda:
+        # `device.type`, not `.is_cuda`: `torch_npu.contrib.transfer_to_npu`
+        # (imported by hardware_backend/npu/utils.py) makes `.is_cuda` True for
+        # NPU tensors, so this CUDA-only gate admitted NPU and reached a Triton
+        # kernel whose compile SIGSEGVs `bishengir-compile` -- every rank dies,
+        # from a request that merely asked for top_logprobs_num.
+        if self.enable_fast_input_logprobs and pruned_states.device.type == "cuda":
             from sglang.srt.layers.logsumexp import (
                 FUSED_TOPK_MAX_K,
                 row_logsumexp_topk,
