@@ -226,10 +226,27 @@ transfer_to_npu mocks it True」—— **别名早就被知道，补的是撞上
 **任何客户端传一个合法的 `top_logprobs_num` 就能打掉服务**。已修（改判 `device.type`），
 验过 k=1/5/8/20 全部正常返回。
 
+⚠ **补丁打的是属性本身，所以「import 之前拿到的张量是安全的」这个直觉不成立**
+（`glm53_int8_1card` 实测）：import 前建的张量 `t0.is_cuda` 是 False，
+执行那行 import 之后**同一个 t0 也变成 True**。
+
 ⚠ **`srt/` 下还有 88 处张量级 `.is_cuda` 门没查。** 每一处背后的 CUDA 快路径
 在 NPU 上都是**静默启用**的。这一处靠打死进程暴露了自己；
 **其余的更可能是「安静地算错」，那才是这类问题的常见形态。**
+**已扫过的（`glm53_int8_1card` 做的，MoE / KDA / DSA / 量化调用链）**：4 处，
+**本构型下全部不可达**，但那是构型的性质不是代码的性质 ——
+`kpool_fp8_index.py:607`（只被 CUDA 版 indexer 调，NPU 走自己那份）、
+`expert_pack.py:36`（只被 ExpertPack / GGUF 加载器调，我们走 compressed-tensors）、
+`unquant.py:273/:310`（`is_cutedsl()` 排在 `x.is_cuda` 前面，短路）。
+**换量化格式或换 indexer，这几处立刻变活。**
+
+⚠ **一条值得记的巧合**：`expert_pack.py:36` 那处若变活，NPU 会滑进 CUDA 的
+`silu_and_mul_clamp` —— **正是单卡线花两轮证明「厂商算子根本不 clamp」的那条路**
+（见 §2.4 的 `npu_clipped_swiglu` 默认参数陷阱）。**两条独立的坑指向同一个函数。**
+
 => **新写代码不要用 `tensor.is_cuda` 判平台**，用 `device.type` 或 `sglang.is_cuda()`。
+=> **做性能归因之前先扫一遍你量的那条路**：如果某个「CUDA 专用」分支其实在跑，
+   你量到的 kernel 组成和你以为的不是一回事。
 
 
 ⚠ **`top_logprobs_num` 会打死整个服务**（2026-08-30 实测）。请求里带
