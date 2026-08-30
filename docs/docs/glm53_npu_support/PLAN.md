@@ -202,7 +202,7 @@ device 时间类的（AI_CPU 回退、int64 算术、标量瓶颈 kernel）才�
 | 项 | 为什么 |
 |---|---|
 | compressor 的 LayerNorm 变体 | **GLM 从不调 vendor `compressor`**（全仓两处引用均在 DSv4 路径）；其 index-K LayerNorm 是独立模块、压缩前施加、从未融合 |
-| K=4 causal conv1d | `sgl_kernel_npu` 的 Triton kernel `KERNEL_WIDTH` 1–6 全有，decode 已在用 |
+| K=4 causal conv1d | Triton kernel `KERNEL_WIDTH` 1–6 全有。⚠ **「decode 已在用」是错的，2026-08-30 源码核实并已改**：`causal_conv1d_update_npu` 只在 `cache_seqlens` 或 `num_accepted_tokens` 非 None 时才进 Triton，而我们的调用点（`ascend_kda_backend.py:393`）两个都不传 → 走 `torch_causal_conv1d_update_npu`。实测代价**每个 KDA 层 16 个 kernel、4.04 ms/step = 9.4%**（`Slice+Mul+ReduceSum+ConcatD` 就是被拆开的 depthwise conv）。**这条不该留在「已排除」里** —— 算子存在，但我们没用上，见 P6.2 |
 | mHC pre/post | 算子已存在且 DSv4 在用，已接线并验过 |
 | GLM 版 clipped SwiGLU | `npu_clipped_swiglu` 参数传对时逐位精确 |
 | bf16 输出的 `DequantSwigluClampQuant` | 同上，不需要 |
@@ -889,12 +889,28 @@ prefill 与 decode 分开量：先跑 `max_new_tokens=1` 拿 prefill 墙钟，�
       （26 µs 搬 1.5 MiB = 带宽地板的 20 倍）。**这个旋钮改数值不改性能，别动。**
       roofline：post 高于带宽下界 2.6×、pre 9.5×（去掉 sinkhorn 是 5×）——
       **prefill 下不是 host 开销主导**，和 DSA 的 100× 不是一回事
-- [ ] P6.2 **KDA prefill conv1d** —— **已量化**：Ascend 的 extend 把深度卷积拆成 **3 次调用**，
+- [ ] P6.2 **KDA 的 conv1d，prefill 与 decode 是同一个上游问题的两面**（2026-08-30，
+      根因由 `glm53_int8_1card` 找到；**该线正在做，本线不要重复**）。
+      **根因**：`memory_pool_npu.py:38-48` 把 KDA 的 conv 池建成 **channel-major**
+      `[17, 24576, 3]`，而 GDN 建成 **window-major**；wheel 里那个 AOT Ascend C 算子
+      `torch.ops.npu.causal_conv1d_update` 要的正是 window-major，
+      **所以 GDN 用得上、KDA 用不上**。把 KDA 池翻面可能一次解决 decode（4.04 ms/step）
+      和 prefill 两侧。⚠ 约束：该算子要求 weight/state 是 bf16，而 GLM 的 conv 权重是 fp32，
+      **有真实的精度问题要验**。
+      原 prefill 侧的量化：Ascend 的 extend 把深度卷积拆成 **3 次调用**，
       而共享 CUDA 路径对整个 qkv 宽度只做 **1 次打包调用**。实测 **6.5 ms / 单层 14.3 ms = 45%**，
       而且这 3 次调用**各带 3 次 host 等待**（prefill 全部 9 次 host 往返都在这里）。原条目： —— `causal_conv1d_fn_npu` 内部退回 `F.conv1d`（`sgl_kernel_npu` 上游的实现选择）；
       且 Ascend 后端拆成 3 次调用而共享后端只做 1 次
-- [ ] P6.3 **MoE SwiGLU clamp** —— 现在是 2×clamp + `cat` + `npu_swiglu` 四个 kernel，可换成一个 `npu_clipped_swiglu`
-- [ ] P6.4 DeepEP-normal 的 D2H 同步（`moe_runner/ascend.py:270-274`，prefill 每 forward 42 次）—— 修在第三方 wheel 里，先 profiling
+- [ ] P6.3 **SwiGLU clamp —— ⚠ 只对 shared expert 成立，别按字面读成 routed**
+      （2026-08-30 更正）。「2×clamp + `cat` + `npu_swiglu` 四个 kernel」按形状对应的是
+      **shared expert**（`deepseek_v2.py:463-471`）。**routed 那条早已不是这个形态** ——
+      它是 1× 向量界 clamp + `npu_dequant_swiglu_quant`，两个 kernel、没有 `cat`。
+      可换成一个 `npu_clipped_swiglu` 的是前者
+- [x] ~~P6.4 DeepEP-normal 的 D2H 同步~~ —— **对当前部署配方不成立，关闭**（2026-08-30）。
+      那 42 次 D2H 在 `pre_permute_deepep_normal_to_ascend` 里，而 `--moe-a2a-backend none`
+      走的是 `pre_permute_ascend_tp_to_ascend`（`moe_runner/ascend.py:249`）——
+      **对 GLM 是死代码**。与 §4 早先记的「DeepEP 那条 GLM 走不到」一致。
+      只有 DSv4 的 `--moe-a2a-backend deepep` 才命中
 - [ ] P6.5 NoPE 未融合的 split+RMSNorm（与 P3.3 同源，一起做）；顺带删掉那个看起来是死代码的 `q.clone()`
 - [ ] **P6.7 kpool indexer 的 expand+tail**（实测，单层单 4096-chunk 的最大单项）——
       `expand_pooled_groups_to_topk` 中间物化了 `[4096, 512, 4]` 的 int64（67 MB）再 reshape，
