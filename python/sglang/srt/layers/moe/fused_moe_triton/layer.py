@@ -462,6 +462,17 @@ class FusedMoE(torch.nn.Module):
                 and get_moe_runner_backend().is_flashinfer_trtllm_routed()
             )
         )
+        # Ascend deliberately stays out of this list. npu_moe_gating_top_k does
+        # take routed_scaling_factor and applies it after renormalisation (probed
+        # 2026-08-30: the returned weights scale by exactly 2.5 with the expert set
+        # unchanged, for renorm both on and off), so folding it in is arithmetically
+        # equivalent and removes the trailing `Muls [1, 4096]` -- measured 42 calls,
+        # 73.2 us/step, 42 kernels. It was tried and reverted: the whole-step device
+        # time moved -0.003 ms, i.e. the saving is entirely inside run-to-run noise,
+        # while the output stopped being bit-identical (2 of 3 greedy prompts diverged
+        # from token 0-1, which is what a sub-ulp change does once MoE routing flips
+        # amplify it). Certifying that against the accuracy floor costs far more than
+        # 0.19% of a step is worth.
 
         self.routing_method_type = routing_method_type
 

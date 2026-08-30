@@ -1328,6 +1328,23 @@ decode 之所以没像 prefill 那样二次，是因为它每步只选一次，�
 
 ## 4. 待决与已知缺陷
 
+- [ ] ⚠ **KDA conv 池改成 window-major 之后，两条路径本部署验证不了**（`int8_singlecard` 线，
+      2026-08-30，见 `int8_singlecard/REPORT.md` §8.1）。**这是「验不了」不是「没时间」** ——
+      这个部署没有能触发它们的负载。
+      | 路径 | 为什么验不了 | 什么条件下能验 |
+      |---|---|---|
+      | MTP / speculative 快照路径（`ascend_kda_backend.py` 约 700–780） | 不跑 MTP / spec decode。两处改动在代码里都标了 `UNVERIFIED` | 起带 MTP / spec decode 的配置；或构造直接驱动快照路径的单层 harness |
+      | mask-track 散写分支（`has_mamba_track_mask`） | `check_kda` 用 `enable_mamba_extra_buffer=False` 建池且从不设 `mamba_track_mask`，**这条分支从未执行过** | 让 harness 构造带 track mask 的池 |
+
+      ⚠ mask-track 那条**转而验了它依赖的不变量**（算子 state 回写与 `x[L-3:L]` 在
+      L=64/256/8192 下逐位相同，那正是散写要写的东西）。**构造不出那条路径时，
+      验它必须成立的性质比不验强，也比假装验过诚实** —— 但它不是端到端测试，别当端到端引用。
+
+      ⚠ 与 P3.4 的 MTP 待办相邻：那里已记着「接 spec decode 前必须先解决
+      `kpool_decode_update_index_cache` 每请求一行的假设」。**这两条要一起做** ——
+      同一个配置能同时验掉。
+
+
 - [x] ~~**P5 的磁盘**~~ —— FP8 源已删，W8A8 已转出，实际占 306.1 GiB（不是估的 333）。
       **现在余 23 GB**，没有再腾挪的余地了
 - [ ] **索引缓存改 bf16 后显存翻倍**：每槽 256 B（打包 fp8 是 128+4=132 B）。

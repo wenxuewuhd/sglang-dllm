@@ -25,6 +25,8 @@ ap.add_argument("--concurrency", default="1,2,4,8,16",
                 help="comma-separated; must not exceed --max-running-requests")
 ap.add_argument("--decode-tokens", type=int, default=128)
 ap.add_argument("--port", type=int, default=30003)
+ap.add_argument("--pools", default="short,long",
+                help="which prompt pools to time; A/B runs usually only need 'short'")
 args = ap.parse_args()
 CONCURRENCY = [int(x) for x in args.concurrency.split(",")]
 
@@ -34,6 +36,8 @@ pools = {
     "short (13 tok)": [d["ids"] for d in json.load(open(f"{G}/ref_server_eager_short_d100.json"))["data"]],
     "long (3256 tok)": [d["ids"] for d in json.load(open(f"{G}/ref_server_eager_long_d100.json"))["data"]],
 }
+pools = {k: v for k, v in pools.items()
+         if k.split()[0] in {p.strip() for p in args.pools.split(",")}}
 DEC = args.decode_tokens
 
 def run(ids, n_new):

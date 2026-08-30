@@ -89,6 +89,12 @@ def load_layer_weights(model_dir: Path, layer: int) -> Dict[str, torch.Tensor]:
     return out
 
 
+
+#: dtype for the KDA conv weights. Production pins bf16 (glm5_next.py
+#: params_dtype), which is what the AOT conv op needs; it rejects fp32.
+_CONV_WEIGHT_DTYPE = torch.bfloat16
+
+
 class ShardedKDAWeights:
     """One tensor-parallel rank's slice of a KDA layer, on device.
 
@@ -122,9 +128,19 @@ class ShardedKDAWeights:
         self.wo = bf(full["o_proj.weight"][:, ds])
         self.o_norm_weight = full["o_norm.weight"].to(DEV, torch.bfloat16).contiguous()
         # sglang keeps A_log / dt_bias / the conv weights in fp32 (params_dtype).
+        #
+        # The conv weight dtype is a knob rather than a constant because it is
+        # load-bearing twice over: it decides whether _causal_conv1d_decode can
+        # take its fast path (that branch compares it against the state dtype),
+        # and the AOT `torch.ops.npu.causal_conv1d` refuses fp32 outright. Pinning
+        # it here would leave this harness unable to test either -- the same way
+        # pinning conv=bfloat16 in cache_params once left it unable to test
+        # SGLANG_MAMBA_CONV_DTYPE. One hardcoded dtype in a checking tool is a
+        # bug; two is a pattern.
+        conv_w_dtype = _CONV_WEIGHT_DTYPE
         self.A_log = f32(full["A_log"][hs]).view(1, 1, self.num_heads, 1)
         self.dt_bias = f32(full["dt_bias"][ds])
-        self.conv_weights = f32(
+        self.conv_weights = (lambda t: t.to(DEV, conv_w_dtype).contiguous())(
             torch.cat(
                 [
                     full["q_conv1d.weight"].squeeze(1)[ds],
@@ -207,11 +223,14 @@ def build_backend(*, tp: int, batch: int, max_context_len: int, num_heads: int,
         head_dim=head_dim,
         conv_kernel_size=conv_kernel,
     )
-    cache_params = KimiLinearCacheParams(
-        shape=shape,
-        layers=[0],
-        dtype=Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32),
-    )
+    # Resolve the state dtypes the way production does: glm5_next.py builds
+    # KimiLinearCacheParams without a dtype, so the default_factory runs
+    # mamba2_state_dtype(), which is the only reader of SGLANG_MAMBA_CONV_DTYPE.
+    # Pinning conv=bfloat16 here made this harness immune to that variable -- and
+    # SGLANG_MAMBA_CONV_DTYPE is exactly what decides whether
+    # _causal_conv1d_decode takes its fast path or its dtype-mismatch detour, so
+    # the tool silently could not test the one thing it was reached for.
+    cache_params = KimiLinearCacheParams(shape=shape, layers=[0])
 
     runner = ModelRunner.__new__(ModelRunner)
     runner.device = DEV
@@ -468,7 +487,10 @@ class RankRunner:
         """
         cache = self.runner.req_to_token_pool.mamba2_layer_cache(0)
         pick = range(self.batch) if slot == -1 else [self.golden_slot if slot is None else slot]
-        conv = [cache.conv[0][i].float().cpu() for i in pick]
+        # A pool slot is [window, channels] since the conv pool went window-major
+        # (int8_singlecard 9a6dc618c7, to reach the AOT causal_conv1d); both
+        # `reassemble_states` and the reference want [channels, window].
+        conv = [cache.conv[0][i].transpose(-1, -2).float().cpu() for i in pick]
         ssm = [cache.temporal[i].float().cpu() for i in pick]
         return (conv, ssm) if slot == -1 else (conv[0], ssm[0])
 
@@ -634,8 +656,6 @@ _ACTIVE_TIMER = None
 #: Every operator the Ascend KDA chain calls, as (module, attribute). Wrapping
 #: them turns the chain into `timing.Timer` phases without a host sync.
 _OP_SITES = (
-    "causal_conv1d_fn_npu",
-    "causal_conv1d_update_npu",
     "fused_kda_gate_npu",
     "l2norm_fwd",
     "chunk_local_cumsum",
@@ -654,6 +674,10 @@ def install_op_phases():
 
     targets = [(ak, n) for n in _OP_SITES]
     targets.append((kda_triton, "fused_sigmoid_gating_delta_rule_update"))
+    # The conv is reached as `torch.ops.npu.causal_conv1d`, resolved on the
+    # namespace at every call, so patching the namespace both times it and
+    # proves which operator the backend actually ran.
+    targets.append((torch.ops.npu, "causal_conv1d"))
 
     saved = []
     for owner, name in targets:
@@ -864,7 +888,7 @@ def run_bench(args, *, weights_full, meta) -> int:
                 "pays those once per forward for all 34 KDA layers, not per layer",
                 "the operator phases are nested inside 'kda backend', so the "
                 "sum-of-phases line double-counts them; each operator line is one "
-                "call, and causal_conv1d_fn_npu / l2norm_fwd run more than once",
+                "call, and causal_conv1d / l2norm_fwd run more than once",
                 f"host load average when measured: {load[0]:.1f} (1 min)",
             ),
         )
@@ -919,7 +943,18 @@ def main() -> int:
         help="requests sharing the ragged prefill chunk (1 reproduces the "
         "single-sequence case)",
     )
+    ap.add_argument(
+        "--conv-weight-dtype",
+        choices=["float32", "bfloat16", "float16"],
+        default="bfloat16",
+        help="dtype for the KDA conv weights. Production pins bfloat16, which "
+        "is what the AOT torch.ops.npu.causal_conv1d needs; it rejects float32.",
+    )
     args = ap.parse_args()
+
+    global _CONV_WEIGHT_DTYPE
+    _CONV_WEIGHT_DTYPE = getattr(torch, args.conv_weight_dtype)
+    print(f"conv weight dtype: {_CONV_WEIGHT_DTYPE}")
 
     torch.set_grad_enabled(False)
     torch.npu.set_device(args.device)
@@ -1083,8 +1118,9 @@ def reassemble_states(conv_parts, ssm_parts, num_heads, head_dim, tp):
 
     conv per rank is [q|k|v] over that rank's heads, so the full conv state is
     the three sub-blocks each concatenated over ranks -- not the ranks
-    concatenated whole.  The NPU pool keeps [channels, window]; the reference
-    stores the same, so no transpose.  The temporal state is [H, V, K] on NPU
+    concatenated whole.  `RankRunner.states` has already turned the pool's
+    [window, channels] slot into the [channels, window] the reference stores.
+    The temporal state is [H, V, K] on NPU
     (`chunk_gated_delta_rule_fwd_h_npu` writes it transposed) against the
     reference's [H, K, V].
     """

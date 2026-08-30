@@ -1,0 +1,40 @@
+=== bs=1 decode step: 33.348 ms device time, 2570 kernel launches, floor 1.25 TB/s ===
+kernel                     n  us/step     %  cum%  us/call       MiB  floor us  x floor  bound
+----------------------------------------------------------------------------------------------
+MatMulV2                  34   5925.6 17.8% 17.8%    175.2     194.6     163.2    1.07x  bandwidth
+GroupedMatmul             42   4462.6 13.4% 31.2%    106.1     128.0     107.4    0.99x  bandwidth [8 of 16 experts, gate_up]
+HcPre                     90   2969.3  8.9% 40.1%     33.0       1.5       1.3        —  compute
+GroupedMatmul             42   2446.4  7.3% 47.4%     58.0      64.0      53.7    1.08x  bandwidth [8 of 16 experts, down]
+MatMulV2                  34   2029.3  6.1% 53.5%     58.6      64.0      53.7    1.09x  bandwidth
+fused_sigmoid_gating_del  34   1162.9  3.5% 57.0%     34.1       0.0       0.0        —  compute
+QuantBatchMatmulV3        42    979.7  2.9% 59.9%     23.3      16.0      13.4    1.73x  above floor
+MatMulV2                   1    926.6  2.8% 62.7%    926.4    1210.3    1015.3    0.91x  bandwidth
+QuantBatchMatmulV3        11    704.5  2.1% 64.8%     62.4      64.0      53.7    1.16x  bandwidth
+QuantBatchMatmulV3        42    698.5  2.1% 66.9%     16.4       8.0       6.7        —  launch
+HcPost                    90    621.2  1.9% 68.7%      6.5       0.1       0.1        —  launch
+MoeInitRoutingV3          42    593.6  1.8% 70.5%     14.5       0.0       0.0        —  launch
+causal_conv1d_4           34    574.5  1.7% 72.3%     17.0       0.0       0.0        —  launch
+BatchMatMulV2             34    386.2  1.2% 73.4%     11.4       4.0       3.4        —  launch
+SparseFlashAttention      11    354.6  1.1% 74.5%     32.0       4.0       3.4        —  compute [<=2048 selected tokens, k+v]
+RmsNorm                   91    350.5  1.1% 75.5%      3.5       0.0       0.0        —  launch
+MatMulV2                  42    333.9  1.0% 76.5%      7.9       0.3       0.2        —  launch
+QuantBatchMatmulV3        11    303.2  0.9% 77.4%     27.5      24.1      20.2    1.36x  bandwidth
+BatchMatMulV2             11    286.9  0.9% 78.3%     26.1      16.1      13.5    1.93x  above floor
+ClipByValueV2             42    277.8  0.8% 79.1%      6.5       0.1       0.1        —  launch
+MatMulV2                  22    258.9  0.8% 79.9%     11.7       1.0       0.8        —  launch
+DequantSwigluQuant        42    254.6  0.8% 80.7%      6.2       0.1       0.1        —  launch
+MoeFinalizeRoutingV2      42    246.8  0.7% 81.4%      6.0       0.1       0.1        —  launch
+Range                     36    245.8  0.7% 82.1%      7.8       0.0       0.0        —  launch
+QuantBatchMatmulV3         3    244.0  0.7% 82.9%     80.9      96.1      80.7    1.00x  bandwidth
+batch_matmul_transpose_0  11    229.2  0.7% 83.6%     20.6       0.0       0.0        —  launch
+MatMulV2                  11    224.2  0.7% 84.2%     20.4      12.0      10.1        —  launch
+LightningIndexer          11    218.0  0.7% 84.9%     19.3       0.5       0.4        —  launch [<=2048 selected tokens]
+QuantBatchMatmulV3        11    215.8  0.6% 85.5%     19.7       8.0       6.7        —  launch
+ReduceSum                 22    190.2  0.6% 86.1%      8.6       0.0       0.0        —  launch
+... 其余 108 组: 4632.9 us/step (13.9%)
+
+按限制因素汇总                                 ms/step      %  kernel/step
+  带宽受限（>=16 MB）                          17.363  52.1%          204
+  launch 主导（<16 MB）                      10.179  30.5%         2177
+  compute/固定成本主导（<16 MB，>27 us/call）      4.539  13.6%          136
+  高于地板（>=16 MB）                           1.267   3.8%           53

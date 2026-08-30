@@ -462,11 +462,42 @@ class DeepseekV2MLP(nn.Module):
         # hardware_backend/npu/moe/activation.py: swiglu_clamp_disabled().
         elif self.swiglu_limit is not None and not _swiglu_clamp_disabled():
             if _is_npu:
-                _g, _u = gate_up.chunk(2, dim=-1)
-                _lim = float(self.swiglu_limit)
-                gate_up = torch.cat(
-                    [_g.clamp(max=_lim), _u.clamp(min=-_lim, max=_lim)], dim=-1
+                # Fold the asymmetry into broadcast bound vectors and clamp the
+                # whole buffer once, instead of clamping the two halves (which
+                # are *strided* views) and concatenating them back. Same output,
+                # bit for bit -- the helper's own docstring records 186 -> 589
+                # GB/s for exactly this reason, and its bounds are lru_cached on
+                # (width, limit, dtype, device), a key the routed path already
+                # populates, so this costs no extra memory.
+                #
+                # Measured on one A3 die, bs=1, INT8, graph on: the cat alone was
+                # 567.9 us/step across the 42 shared experts, and it spent 13.5 us
+                # per call to move 8 KB -- 37 vector cores started to do nothing
+                # (aiv_vec_time 0.02 us). It was never about bandwidth.
+                # `torch_npu.npu_clipped_swiglu(alpha=1.0, limit=swiglu_limit,
+                # bias=0.0, interleaved=False)` replaces these two calls exactly --
+                # verified bit-identical at [1,4096] and [16,4096] with the input
+                # scaled 48x so the limit actually bites, against two controls with
+                # teeth (its own defaults are off by max|d|=156, and it differs from
+                # *not* clamping by 2.9e4). It is nonetheless not used here, because
+                # it is slower: measured 8.22 us/call against 4.27 for npu_swiglu
+                # plus 2.64 for this clamp, so folding 42 shared experts plus 3 dense
+                # layers into one kernel each costs +65.6 us/step while removing 45
+                # kernels. Whole-step effect was -0.026 ms, i.e. nothing.
+                #
+                # Worth keeping in mind before the next fusion: fewer kernels is a
+                # proxy for less fixed cost, and the proxy fails when the fused
+                # kernel is not doing equivalent work per launch.
+                #
+                # ⚠ Do not reach for the sibling `custom::npu_dequant_swiglu_clamp_quant`
+                # on the routed path by analogy -- it silently ignores clamp_limit
+                # (see the note in npu/moe/activation.py). Same family, both named
+                # clamp, one honours it and one does not.
+                from sglang.srt.hardware_backend.npu.moe.activation import (
+                    apply_swiglu_limit_,
                 )
+
+                apply_swiglu_limit_(gate_up, self.swiglu_limit)
                 x = self.act_fn(gate_up)
             else:
                 M, N = gate_up.shape
@@ -496,6 +527,8 @@ class MoEGate(nn.Module):
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size))
         )
+        self._weight_fp32_cache: Optional[torch.Tensor] = None
+        self._weight_fp32_key: Optional[tuple] = None
 
         if config.topk_method == "noaux_tc" and not is_hash_moe:
             correction_bias_dtype = torch.float32
@@ -520,6 +553,27 @@ class MoEGate(nn.Module):
         self.dsa_enable_prefill_cp = dsa_enable_prefill_cp
         self.mla_enable_prefill_cp = mla_enable_prefill_cp
 
+    def _weight_fp32(self) -> torch.Tensor:
+        """The router weight in fp32, converted once rather than every forward.
+
+        The branch that needs this casts both operands to fp32 on purpose (a bf16
+        router loses whole experts off the top-k, not just precision -- see the
+        measurement in forward). But the weight is loop-invariant, and re-casting
+        it per layer per step showed up in a kernel profile as its own line:
+        `Cast [16, 4096]`, 42 calls a step, 242 us, 40 vector cores started to
+        move 128 KB. With the model's real 288 experts that is 7 MB a layer, so
+        the cost grows rather than shrinks.
+
+        Keyed on the parameter's storage and version, so a weight update, a LoRA
+        swap or an EPLB rearrangement invalidates it instead of silently serving a
+        stale router. Both reads are plain Python -- no kernel, no D2H.
+        """
+        w = self.weight
+        key = (w.data_ptr(), w._version, w.dtype, w.shape)
+        if self._weight_fp32_key != key:
+            self._weight_fp32_cache = w.float()
+            self._weight_fp32_key = key
+        return self._weight_fp32_cache
     def forward(
         self,
         hidden_states,
@@ -576,7 +630,7 @@ class MoEGate(nn.Module):
                 # bf16-input noise floor. Costs +36us at decode bs=16 and
                 # +383us on an 8192 prefill chunk.
                 logits = F.linear(
-                    hidden_states.float(), self.weight.float(), None
+                    hidden_states.float(), self._weight_fp32(), None
                 )
             else:
                 # cuBLAS bf16 x bf16 -> fp32 GEMM (torch.mm's out_dtype kwarg is CUDA-only)
@@ -1193,7 +1247,9 @@ class DeepseekV2MoE(nn.Module):
             and not _use_aiter
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
         ):
-            # fused in biased_grouped_topk so we can skip here
+            # Platforms whose top-k does not fold routed_scaling_factor in apply it
+            # here. (The comment that used to sit on this line claimed the factor was
+            # already fused in biased_grouped_topk -- on the branch that applies it.)
             final_hidden_states *= self.routed_scaling_factor
 
         if (

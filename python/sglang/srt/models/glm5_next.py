@@ -320,6 +320,47 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
         )
 
 
+
+#: Every name that has to be unquantized for the fused path to work, for two
+#: different reasons that are easy to conflate:
+#:
+#:   the eight component projections -- if any of them were quantized, merging them
+#:   into one weight would merge two different schemes, so their being ignored is
+#:   what makes fusion *correct*;
+#:
+#:   the fused module names themselves -- `MergedColumnParallelRepeatedLinear` and
+#:   friends resolve their own scheme from their own prefix, so if the fused name
+#:   were not ignored the module would ask for int8 weights that the checkpoint does
+#:   not contain. This one is not obvious from reading the call site.
+_KDA_FUSED_PROJECTIONS = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "b_proj",
+    "f_a_proj",
+    "g_a_proj",
+    "f_b_proj",
+    "g_b_proj",
+    "fused_qkvbfg_a_proj",
+)
+
+
+def _kda_projections_unquantized(quant_config, prefix: str) -> bool:
+    """Whether `quant_config` demonstrably leaves every KDA projection unquantized.
+
+    Deliberately conservative in two ways. It only understands configs that expose a
+    plain `ignore` list (compressed-tensors), and it only accepts exact names -- a
+    regex entry makes this return False. Both failure directions land on today's
+    behaviour (no fusion), which is correct but slower, rather than on fusing a
+    layer whose weights are quantized.
+    """
+    ignore = getattr(quant_config, "ignore", None)
+    if not ignore:
+        return False
+    ignore = set(ignore)
+    return all(f"{prefix}.{name}" in ignore for name in _KDA_FUSED_PROJECTIONS)
+
+
 class Glm5NextLinearAttention(nn.Module):
     def __init__(
         self,
@@ -363,7 +404,26 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        self.do_fuse_qkvbfg = quant_config is None and head_shard_size == self.tp_size
+        # The fused path used to be gated on `quant_config is None`, which asks the
+        # wrong question. `MergedColumnParallelRepeatedLinear` takes a quant_config
+        # itself, and the loader carries all six shards of fused_qkvbfg_a_proj plus
+        # both of fused_fg_b_proj -- so what actually matters is whether *these*
+        # projections are quantized, not whether the model has a quant_config at all.
+        #
+        # In GLM-5.3's W8A8 checkpoint none of them are: q/k/v/b/f_a/g_a/f_b/g_b_proj
+        # are all in modules_to_not_convert, and the vendor even lists the fused
+        # module name itself, which reads as having anticipated this path.
+        #
+        # Measured cost of staying unfused (one A3 die, bs=1, INT8, graph on): four
+        # extra small matmuls per KDA layer, 170 launches a step --
+        #   [1,4096;128,4096] f_a+g_a  68/step  ~777 us
+        #   [1,128;8192,128]  f_b+g_b  68/step   482 us
+        #   [1,4096;64,4096]  b_proj   34/step   421 us
+        # all of them launch-bound, none moving more than 2 MiB.
+        self.do_fuse_qkvbfg = head_shard_size == self.tp_size and (
+            quant_config is None
+            or _kda_projections_unquantized(quant_config, prefix)
+        )
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,

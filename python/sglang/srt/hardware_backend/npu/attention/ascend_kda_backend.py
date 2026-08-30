@@ -13,10 +13,6 @@ from sgl_kernel_npu.fla.kda_prefill import (
 from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
 from sgl_kernel_npu.fla.solve_tril import solve_tril_npu
 from sgl_kernel_npu.fla.utils import prepare_chunk_indices
-from sgl_kernel_npu.mamba.causal_conv1d import (
-    causal_conv1d_fn_npu,
-    causal_conv1d_update_npu,
-)
 from sgl_kernel_npu.mamba.causal_conv1d_verify import (
     causal_conv1d_linear_verify_npu,
 )
@@ -202,11 +198,30 @@ class AscendKDAAttnBackend(KDAAttnBackend):
 
     def __init__(self, model_runner):
         super().__init__(model_runner)
-        # The NPU pool is allocated directly as [pool, channels, window].
-        self.conv_states_shape = (
-            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
-        )
         self.kernel_dispatcher.extend_kernel = _AscendKDAExtendKernel()
+
+    def _get_conv_weights_t(self, layer: RadixLinearAttention) -> torch.Tensor:
+        """Cache the [width, channels] bf16 transpose `causal_conv1d` requires.
+
+        The cast lives here rather than on the parameter itself. GLM pins the conv
+        weights to fp32 (glm5_next.py params_dtype) and two other readers depend on
+        that: the shared CUDA KDA backend refuses its K3 fusion unless the weights
+        are fp32 (kda_backend.py), and the MTP verify path below still hands the
+        parameter over untouched. Casting the cached transpose instead keeps this
+        change inside the Ascend backend -- CUDA sees nothing -- at no cost, since
+        this copy is made once per layer anyway.
+
+        `torch.ops.npu.causal_conv1d` rejects fp32 outright ("Only BF16 and FP16
+        are supported") and requires weight, activation and conv state to agree,
+        so bf16 here is what the operator dictates, not a precision choice we made.
+        Measured against the double reference: 24/24 tensors in budget across four
+        goldens, with decode out and the final ssm state improving in all four.
+        """
+        w = getattr(layer, "_conv_weights_t", None)
+        if w is None:
+            w = layer.conv_weights.transpose(0, 1).to(torch.bfloat16).contiguous()
+            layer._conv_weights_t = w
+        return w
 
     def forward_decode(
         self,
@@ -226,7 +241,11 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         qkv = self._causal_conv1d_decode(
-            mixed_qkv, layer, conv_states, cache_indices=cache_indices
+            mixed_qkv,
+            layer,
+            conv_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
         )
 
         if self.kernel_dispatcher.supports_packed_decode:
@@ -311,36 +330,31 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         has_initial_state = forward_batch.extend_prefix_lens > 0
 
         if self.forward_metadata.has_mamba_track_mask:
+            # `track_conv_indices` gathers window-length runs of raw [tokens,
+            # channels] input, so the rows land in the window-major pool as they
+            # come (the same as AscendGDNAttnBackend does).
             conv_states[self.forward_metadata.conv_states_mask_indices] = mixed_qkv[
                 self.forward_metadata.track_conv_indices
-            ].transpose(-1, -2)
+            ]
 
-        splits = [layer.q_dim, layer.k_dim, layer.v_dim]
-        q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
-        q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
-            splits, dim=0
-        )
-        q_conv_state, k_conv_state, v_conv_state = conv_states.split(splits, dim=-2)
-        if layer.bias is not None:
-            q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
-        else:
-            q_bias, k_bias, v_bias = None, None, None
-
-        conv_kwargs = dict(
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
+        # Depthwise conv is channel-independent, so one packed call over the
+        # full qkv width replaces three per-block calls.
+        qkv = torch.ops.npu.causal_conv1d(
+            # Contiguous for the same reason as the decode call: the fused
+            # projection hands qkv over as a last-dim prefix slice of one wide
+            # output. No-op when the projections are unfused.
+            mixed_qkv.contiguous(),
+            self._get_conv_weights_t(layer),
+            conv_states=conv_states,
+            bias=layer.bias,
             query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            cache_indices=cache_indices.to(torch.int32),
+            has_initial_state=has_initial_state,
+            activation_mode=1,
+            pad_slot_id=-1,
+            run_mode=0,
         )
-        q = self._causal_conv1d_extend(
-            q, q_conv_weight, q_bias, q_conv_state, **conv_kwargs
-        )
-        k = self._causal_conv1d_extend(
-            k, k_conv_weight, k_bias, k_conv_state, **conv_kwargs
-        )
-        v = self._causal_conv1d_extend(
-            v, v_conv_weight, v_bias, v_conv_state, **conv_kwargs
-        )
+        q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
@@ -382,119 +396,31 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         state: torch.Tensor,
         *,
         cache_indices: torch.Tensor,
-    ) -> torch.Tensor:
-        # The Ascend update kernel writes the new window back in the *weight*
-        # dtype. GLM-5.3 keeps the conv weights in FP32 and the persistent conv
-        # cache in BF16, so writing straight into the pool trips aclnnIndexPut
-        # ("expected DT_FLOAT but found DT_BFLOAT16"). Same compact FP32 working
-        # set as _causal_conv1d_extend; the window itself is copied, not
-        # computed, so the round trip is exact.
-        if state.dtype == layer.conv_weights.dtype:
-            return causal_conv1d_update_npu(
-                x,
-                state,
-                layer.conv_weights,
-                layer.bias,
-                activation="silu",
-                conv_state_indices=cache_indices,
-            )
-        # A padded cuda-graph replay carries PAD_SLOT_ID (-1) in the tail rows of
-        # cache_indices (hybrid_linear_attn_backend.py `_replay_metadata`, which
-        # the decode runner always reaches because it passes an explicit
-        # num_padding). The branch above is safe -- `causal_conv1d_update_npu`
-        # takes pad_slot_id and skips those rows itself -- but index_select /
-        # index_copy_ do not accept negative indices, and on Ascend they do not
-        # raise: they trap the AI core (507011 aivec error). Send the padded rows
-        # to mamba slot 0, which MambaSlotAllocator reserves for exactly this
-        # (mem_cache/allocator/mamba.py: free_slots = arange(1, size + 1), "Slot 0
-        # is reserved as a dummy write target for padded tokens"). Several padded
-        # rows then share slot 0, so the write order among them is undefined --
-        # which is fine, because nothing reads it.
-        # Out-of-place clamp: `.to(torch.int64)` is a no-op when cache_indices is
-        # already int64, and clamping in place would corrupt the backend's
-        # state_indices_list buffer.
-        rows = torch.clamp(cache_indices.to(torch.int64), min=0)
-        local_indices = torch.arange(
-            cache_indices.shape[0],
-            device=cache_indices.device,
-            dtype=cache_indices.dtype,
-        )
-        state_work = (
-            state.index_select(0, rows).to(layer.conv_weights.dtype).contiguous()
-        )
-        out = causal_conv1d_update_npu(
-            x,
-            state_work,
-            layer.conv_weights,
-            layer.bias,
-            activation="silu",
-            conv_state_indices=local_indices,
-        )
-        state.index_copy_(0, rows, state_work.to(state.dtype))
-        return out
-
-    def _causal_conv1d_extend(
-        self,
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        bias: Optional[torch.Tensor],
-        state: torch.Tensor,
-        *,
-        has_initial_state: torch.Tensor,
-        cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
     ) -> torch.Tensor:
-        # The Ascend varlen kernel pads in the weight dtype. K3 keeps its
-        # weights in FP32 and its persistent convolution cache in BF16, so use
-        # a compact FP32 working set for the active rows and cast it back.
-        local_indices = torch.arange(
-            cache_indices.shape[0],
-            device=cache_indices.device,
-            dtype=cache_indices.dtype,
-        )
-        state_work = state.index_select(0, cache_indices.to(torch.int64))
-        state_work = state_work.to(weight.dtype).contiguous()
-        # `causal_conv1d_fn_npu` takes the ragged 2-D layout [dim, cu_seq_len] and
-        # pads it to [batch, dim, max_T] with an `index_copy_` along dim 1, then
-        # un-pads the result with an `index_select` -- four full-width copies of the
-        # activation, plus the transposes `index_copy_(dim=1)` itself needs.  When the
-        # batch is a single sequence, cu_seq_len == max_T and both the pad and the
-        # un-pad are the identity, so all of it is pure overhead.  Handing the same
-        # data over as 3-D skips it: `prepare_data` returns early on `x.ndim == 3` and
-        # the function returns the convolution output unchanged.  `unsqueeze(0)` and
-        # `squeeze(0)` are views, so the fast path adds no copy of its own.
-        #
-        # Measured, tp16 per-card KDA prefill (4 heads x 128, chunk 8192, x is
-        # [512, 8192], one sequence): the repacking cost 2.29 ms per layer against
-        # 86 us for the convolution itself.
-        #
-        # Single-sequence only, and not merely as a heuristic: the 3-D path asserts
-        # `query_start_loc[-1] <= x.shape[-1]`, which any multi-sequence batch
-        # violates because cu_seq_len then exceeds one sequence's length.
-        # `seq_lens_cpu` is already on the host, so testing this costs no sync.
-        x_conv = x.to(weight.dtype)
-        single_sequence = (
-            seq_lens_cpu is not None
-            and len(seq_lens_cpu) == 1
-            and int(seq_lens_cpu[0]) == x_conv.shape[-1]
-        )
-        out = causal_conv1d_fn_npu(
-            x_conv.unsqueeze(0) if single_sequence else x_conv,
-            weight,
-            bias,
-            activation="silu",
-            conv_states=state_work,
-            has_initial_state=has_initial_state,
-            cache_indices=local_indices,
+        # cache_indices must be int32: int64 is accepted and silently miscomputes
+        # on the sibling `causal_conv1d_update` op. Padded cuda-graph rows carry
+        # -1 and are skipped on the sign of the index, not on `pad_slot_id`,
+        # which this operator never consults -- so their output lanes hold
+        # garbage rather than zeros and the caller must discard them.
+        return torch.ops.npu.causal_conv1d(
+            # `x` has to be contiguous, and on the fused-projection path it is not:
+            # glm5_next splits qkv off the front of one wide fused output, so it is a
+            # last-dim prefix slice -- rows contiguous, row stride wrong. The operator
+            # rejects it with "x must be contiguous" rather than reading it wrong,
+            # which is the good failure mode. No-op when the projections are unfused,
+            # which is why single-layer testing of this call never saw it: the harness
+            # predates the fusion and got a freshly allocated qkv.
+            x.contiguous(),
+            self._get_conv_weights_t(layer),
+            conv_states=state,
+            bias=layer.bias,
             query_start_loc=query_start_loc,
-            seq_lens_cpu=seq_lens_cpu,
+            cache_indices=cache_indices.to(torch.int32),
+            activation_mode=1,
+            pad_slot_id=-1,
+            run_mode=1,
         )
-        if single_sequence:
-            # [1, dim, T] -> [dim, cu_seq_len], the 2-D path's own return contract.
-            out = out.squeeze(0)
-        state.index_copy_(0, cache_indices.to(torch.int64), state_work.to(state.dtype))
-        return out.to(x.dtype).transpose(0, 1)
 
     def _prepare_extend_gate_inputs(
         self,
@@ -576,9 +502,15 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             )
 
         intermediate_indices = self.verify_intermediate_state_indices[:batch_size]
+        # UNVERIFIED: no MTP workload on this deployment exercises this path.
+        # `causal_conv1d_linear_verify_npu` demands a contiguous channel-major
+        # [pool, channels, window] conv state, which the window-major pool is
+        # not, so hand it a transposed copy. Read-only is what makes the copy
+        # sound: `update_persistent_state=False` means the operator writes only
+        # `intermediate_conv_window`, never back through this tensor.
         processed_qkv = causal_conv1d_linear_verify_npu(
             dense_qkv.transpose(1, 2).contiguous(),
-            cache.conv[0],
+            cache.conv[0].transpose(-1, -2).contiguous(),
             layer.conv_weights,
             layer.bias,
             cache_indices[:batch_size],
@@ -727,8 +659,14 @@ class AscendKDAHybridLinearAttnBackend:
                     False,
                 )
                 if has_conv_snapshots:
+                    # UNVERIFIED: no MTP workload on this deployment reaches
+                    # here. The scratch stays channel-major because
+                    # `causal_conv1d_linear_verify_npu` writes it that way,
+                    # while the persistent pool is window-major; the scatter
+                    # matches shapes and then indexes through strides, so a
+                    # transposed view is enough and no copy is needed.
                     intermediate_conv_window_cache = (
-                        mamba_caches.intermediate_conv_window[0]
+                        mamba_caches.intermediate_conv_window[0].transpose(-1, -2)
                     )
                     speculative_state_scatter_npu(
                         conv_states,
