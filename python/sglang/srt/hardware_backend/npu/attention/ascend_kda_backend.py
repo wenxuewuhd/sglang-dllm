@@ -340,7 +340,10 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         # Depthwise conv is channel-independent, so one packed call over the
         # full qkv width replaces three per-block calls.
         qkv = torch.ops.npu.causal_conv1d(
-            mixed_qkv,
+            # Contiguous for the same reason as the decode call: the fused
+            # projection hands qkv over as a last-dim prefix slice of one wide
+            # output. No-op when the projections are unfused.
+            mixed_qkv.contiguous(),
             self._get_conv_weights_t(layer),
             conv_states=conv_states,
             bias=layer.bias,
@@ -401,7 +404,14 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         # which this operator never consults -- so their output lanes hold
         # garbage rather than zeros and the caller must discard them.
         return torch.ops.npu.causal_conv1d(
-            x,
+            # `x` has to be contiguous, and on the fused-projection path it is not:
+            # glm5_next splits qkv off the front of one wide fused output, so it is a
+            # last-dim prefix slice -- rows contiguous, row stride wrong. The operator
+            # rejects it with "x must be contiguous" rather than reading it wrong,
+            # which is the good failure mode. No-op when the projections are unfused,
+            # which is why single-layer testing of this call never saw it: the harness
+            # predates the fusion and got a freshly allocated qkv.
+            x.contiguous(),
             self._get_conv_weights_t(layer),
             conv_states=state,
             bias=layer.bias,
