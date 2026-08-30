@@ -160,10 +160,15 @@ errorStr: MTE accesses an invalid GM address
 | 索引/槽位错误 | `layer_check/check_kda_spec_snapshot.py`（ragged 2–32，置换等变性 + 只读 + 负对照）| 实测 |
 | draft-extend 行布局 | 加了响亮断言，**没触发** | 实测 |
 | 投机路径里的 `is_cuda` 门 | 扫过，只有 `memory_pool.py:943` 且前面有 `not _is_npu` | 实测 |
-| **契约外的输入** | — | ⛔ **未排除，去查这个** |
+| **图内的静态界** | — | ⭐ **就是这里，去查这个** |
 
-**方法**：`$ROOT/run/launch_glm_mtp_blocking.sh` 带 `ASCEND_LAUNCH_BLOCKING=1`，
-让异步错误在**真正出错的算子**处暴露，拿到 Python 帧。
+⭐ **已定位到图内**：错误自己报在 `NPUGraph.cpp:284, replay`，而 **`--disable-cuda-graph`
+之后同一个 ragged 16 批连跑两次全过**（接受长度 1.978/1.982）。
+=> **不是算子错，是图内某个「捕获时定尺寸」的静态界被 ragged 运行时超过。**
+**本轮已经在这一类里修过一个**（`max_visible_pool_runs`），很可能还有第二个。
+**起点**：列出 spec 路径上每一个 `[:bs]` / `[:batch_size]` 的静态缓冲切片，
+逐个问「分配尺寸覆盖得住 ragged 运行时的最坏取值吗」。
+⚠ `ASCEND_LAUNCH_BLOCKING=1` 对这个**没用** —— 一次图重放是一个不透明提交。
 ⚠ **先测崩溃率再谈修好**（单卡线的建议，成立）：组批本身不确定 =>
 MTE 是**间歇性**的，不知道崩溃概率就定不了样本量，
 **「改一版没崩」和「这次运气好」分不开**。

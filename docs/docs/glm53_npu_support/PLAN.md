@@ -1463,10 +1463,27 @@ errorStr: MTE accesses an invalid GM address or the cross-device memory access t
   ② `kpool_spec_update_index_cache` 里的每个索引 —— 逐个算过边界；
   ③ `verify_intermediate_state_indices[:batch_size]` —— 按
   `max(get_eager_max_batch_size, pool_size)` 分配，128 够用
-- **下一步**：按 `debug-cuda-crash` 的方法学开 kernel API 日志逐个 kernel 定位。
-  最高嫌疑仍是 `ascend_kda_backend.py` 里那两处标着 `UNVERIFIED` 的快照路径
-  （:505 与 :662），它们**只有投机解码能到达**，而单卡线明确警告过其中一条的
-  contiguous 约束**只在 bs >= 2 才暴露**
+- ⭐ **已定位到图内（2026-08-30 收尾时测出）**。两条独立证据：
+  ① 错误自己报在 **`NPUGraph.cpp:284, replay`** —— 崩的是**图重放**，不是 eager 路径
+     （这也是 `ASCEND_LAUNCH_BLOCKING=1` 定位不到具体算子的原因：
+     **一次图重放是一个不透明提交**，同步模式管不到它内部）
+  ② **加 `--disable-cuda-graph` 之后，同一个 ragged 16 批连跑两次全过**
+     （接受长度 1.978 / 1.982，几乎全接受）
+  => **不是算子错，是图内某个「捕获时定尺寸」的静态界被 ragged 运行时超过。**
+- **下一步（起点很具体）**：查投机路径上所有在**捕获期**定尺寸、运行期由 ragged 数据填充的
+  缓冲与界。**本轮已经在这一类里修过一个** —— `max_visible_pool_runs`
+  （ceil 的和 ≠ 和的 ceil，界不够大 -> scatter 跑出 `max_runs+1` 的缓冲区，
+  同样是 AI CPU/AI Core 越界）。**很可能还有第二个同类的。**
+  ⚠ 排查顺序建议：先列出 spec 路径上每一个 `[:bs]` / `[:batch_size]` 的静态缓冲切片，
+  逐个问「它的分配尺寸覆盖得住 ragged 运行时的最坏取值吗」。
+- ⚠ **两次通过不是证明**：组批本身不确定（见 RESUME「精度是怎么判的」），
+  这个失败是**间歇性**的。**先测崩溃率再谈修好**，否则「修好了」和「运气好」分不开。
+  上面那两次只是把嫌疑从「算子」移到「图」，不是「关图就没问题」的结论。
+- 已排除（别重走）：快照方向错误（wrapper 形状校验会 ValueError 不会 MTE，**演绎**）、
+  conv layout 静默错（contiguous 校验响亮，**演绎**）、
+  索引/槽位错误（`layer_check/check_kda_spec_snapshot.py` 在 ragged 2-32 上过，
+  带置换等变性 + 只读 + 负对照）、draft-extend 行布局（响亮断言没触发）、
+  投机路径里的 `is_cuda` 门（扫过，只有 `memory_pool.py:943` 且前有 `not _is_npu`）
 
 #### 性能：bs=1 下净加速为零，而且要吃掉一半 KV 池
 
