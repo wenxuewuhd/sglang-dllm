@@ -32,7 +32,8 @@ import functools
 import json
 import logging
 import os
-from typing import Optional
+import re
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -251,11 +252,15 @@ def _fill_stage(layer):
     _par_copy(b2, down)
 
 
-def _prefetch_ensure(layer, num_layers):
-    """Ensure ``layer``'s buffers are filled, then kick off ``layer + 1``.
+def _prefetch_ensure(layer):
+    """Ensure ``layer``'s buffers are filled, then kick off the NEXT MoE layer.
 
     Waits for this layer's prefetch, or fills synchronously on a new prefill / out-of-sequence
     layer.  Returns ``layer % 2``.
+
+    The successor comes from :func:`_next_moe_layer`, not ``layer + 1`` bounded by
+    ``num_layers``: only the expert-bearing layers have a GGUF, and prefetching a layer that
+    has none raises inside the worker, which surfaces one layer later as a streaming failure.
     """
     import concurrent.futures
 
@@ -266,8 +271,8 @@ def _prefetch_ensure(layer, num_layers):
     else:
         _PF["futs"].clear()  # new prefill / resync -> fill this layer now
         _fill_stage(layer)
-    nxt = layer + 1
-    if nxt < num_layers:
+    nxt = _next_moe_layer(layer)
+    if nxt is not None:
         _PF["futs"][nxt] = _PF["ex"].submit(_fill_stage, nxt)
     _PF["next"] = nxt
     return layer % 2
@@ -364,14 +369,71 @@ def _remember_dims(E: int, H: int, I: int, num_layers: int) -> None:
         _CFG.update(E=E, H=H, I=I, num_layers=num_layers)
 
 
+def _read_ckpt_config() -> dict:
+    """``config.json`` with ``text_config`` flattened one level up.
+
+    GLM-5.3-Flash ships a multimodal config: every text-model field this module reads --
+    ``n_routed_experts``, ``hidden_size``, ``moe_intermediate_size``, ``num_hidden_layers``,
+    ``swiglu_limit`` -- lives under ``text_config``, and a bare ``cfg["..."]`` raises or
+    (worse, for ``swiglu_limit``) silently returns ``None``.  DeepSeek-V4-Flash keeps them
+    at the top level.  Top level wins where both exist, so DeepSeek is unaffected.
+    """
+    cfg = json.load(open(os.path.join(_ckpt_dir(), "config.json")))
+    sub = cfg.get("text_config")
+    if isinstance(sub, dict):
+        merged = dict(sub)
+        merged.update({k: v for k, v in cfg.items() if k != "text_config"})
+        return merged
+    return cfg
+
+
 def _get_cfg():
     if not _CFG:
-        cfg = json.load(open(os.path.join(_ckpt_dir(), "config.json")))
+        cfg = _read_ckpt_config()
         _CFG["E"] = int(cfg["n_routed_experts"])
         _CFG["H"] = int(cfg["hidden_size"])
         _CFG["I"] = int(cfg["moe_intermediate_size"])
         _CFG["num_layers"] = int(cfg["num_hidden_layers"])
     return _CFG["E"], _CFG["H"], _CFG["I"], _CFG["num_layers"]
+
+
+def _moe_layers() -> tuple:
+    """The layer indices that actually run a KT MoE, taken from the load-time registry.
+
+    ``range(num_layers)`` is only correct when every layer is a MoE layer, which is true
+    for DeepSeek-V4-Flash (``first_k_dense_replace=0``) and false for GLM-5.3-Flash, whose
+    layers 0..2 are dense.  A loop over ``range()`` then asks for expert tensors that do
+    not exist, and -- the silent half -- the "first layer" / "last layer" triggers that
+    reset and flush the dynamic resident set are keyed on 0 and ``num_layers - 1``, so on
+    GLM the reset never fires at all.
+
+    Layers at or past ``num_hidden_layers`` are dropped: GLM's checkpoint carries a full
+    288-expert set for layer 45, the MTP head, which is not served, so a trigger keyed on
+    it would never fire in a real forward pass.
+    """
+    n = int(_CFG.get("num_layers") or 0)
+    ls = tuple(sorted(L for L in _REGISTRY if not n or L < n))
+    return ls or tuple(range(n))
+
+
+def _first_moe_layer():
+    ls = _moe_layers()
+    return ls[0] if ls else None
+
+
+def _last_moe_layer():
+    ls = _moe_layers()
+    return ls[-1] if ls else None
+
+
+def _next_moe_layer(layer):
+    """The layer that will be streamed after ``layer``, or ``None`` if it is the last."""
+    ls = _moe_layers()
+    try:
+        i = ls.index(layer)
+    except ValueError:
+        return None
+    return ls[i + 1] if i + 1 < len(ls) else None
 
 
 def _layer_buf(L: int, E: int, H: int, I: int) -> dict:
@@ -414,6 +476,128 @@ def _shard_header(path):
         return json.loads(f.read(n)), 8 + n
 
 
+# ----- checkpoint tensor naming: probed, never hardcoded -----
+# The readers below address the checkpoint by tensor name, and the families we serve spell
+# those names differently:
+#
+#   DeepSeek-V4-Flash  W8A8   layers.{L}.ffn.experts.{e}.{w1,w3,w2}.{weight,weight_scale}
+#                     MXFP4   layers.{L}.ffn.experts.{e}.{w1,w3,w2}.{weight,scale}
+#   GLM-5.3-Flash      W8A8   model.language_model.layers.{L}.mlp.experts.{e}.
+#                             {gate,up,down}_proj.{weight,weight_scale}
+#                     MXFP4   ... .{gate,up,down}_proj.{weight_packed,weight_scale}
+#
+# Hardcoding the DeepSeek spelling is what made this whole module fall back to the hybrid
+# path on GLM, and hardcoding both spellings only moves the problem to the next checkpoint.
+# So probe the checkpoint's own index, exactly as
+# ``kt-kernel/tools/mxfp4_gguf/convert_mxfp4_gguf.py`` already does for the GGUF conversion.
+#
+# That helper is deliberately NOT imported.  It lives in a tools/ script directory of the
+# ktransformers superproject, of which this sglang tree is a git submodule; importing it
+# would invert the dependency and make an sglang module unimportable without ktransformers
+# on sys.path.  Its design is reproduced instead: anchor on expert 0's gate tensor, exclude
+# ``.shared_experts`` (same parent, would otherwise match), and match the layer number on a
+# dot boundary so layer 3 does not also match layer 30.
+
+
+class _ExpertNaming(NamedTuple):
+    """How one checkpoint family spells its routed-expert tensors."""
+
+    prefix_tmpl: str  # e.g. "model.language_model.layers.{L}.mlp.experts"
+    gate: str
+    up: str
+    down: str
+    weight: str  # suffix holding the quantised weight
+    scale: str  # suffix holding its scale
+
+    @property
+    def projs(self) -> tuple:
+        return (self.gate, self.up, self.down)
+
+    def weight_key(self, layer: int, expert: int, proj: str) -> str:
+        return f"{self.prefix_tmpl.format(L=layer)}.{expert}.{proj}.{self.weight}"
+
+    def scale_key(self, layer: int, expert: int, proj: str) -> str:
+        return f"{self.prefix_tmpl.format(L=layer)}.{expert}.{proj}.{self.scale}"
+
+
+# (gate, up, down), weight suffix, scale suffix.  Probed in order; the first whose expert-0
+# gate tensor exists in the index wins.  ``gate``/``up`` map to the two halves of w13 and
+# ``down`` to w2, so DeepSeek's (w1, w3, w2) is the right order, not (w1, w2, w3).
+_W8A8_NAMING_CANDIDATES = (
+    (("w1", "w3", "w2"), "weight", "weight_scale"),  # DeepSeek-V4-Flash
+    (("gate_proj", "up_proj", "down_proj"), "weight", "weight_scale"),  # GLM-5.3 / HF
+)
+_MXFP4_NAMING_CANDIDATES = (
+    (("w1", "w3", "w2"), "weight", "scale"),  # DeepSeek-V4-Flash native MXFP4
+    (
+        ("gate_proj", "up_proj", "down_proj"),
+        "weight_packed",
+        "weight_scale",
+    ),  # compressed-tensors MXFP4 (GLM-5.3)
+)
+
+_NAMING: dict = {}  # "W8A8"/"MXFP4" -> _ExpertNaming
+_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+
+
+def _detect_expert_naming(weight_map, candidates, kind: str) -> _ExpertNaming:
+    """Probe ``weight_map`` for the routed-expert spelling; cached per checkpoint kind."""
+    cached = _NAMING.get(kind)
+    if cached is not None:
+        return cached
+    for (gate, up, down), wsuf, ssuf in candidates:
+        needle = f".experts.0.{gate}.{wsuf}"
+        for k in weight_map:
+            if not k.endswith(needle) or ".shared_experts" in k:
+                continue
+            m = _LAYER_RE.search(k)
+            if m is None:
+                continue
+            head = k[: -len(needle)] + ".experts"  # ...layers.{N}.mlp.experts
+            tmpl = head[: m.start(1)] + "{L}" + head[m.end(1) :]
+            naming = _ExpertNaming(tmpl, gate, up, down, wsuf, ssuf)
+            _NAMING[kind] = naming
+            logger.info(
+                "[KT_STREAM] %s expert naming probed from the checkpoint index: "
+                "%s.{e}.(%s|%s|%s).(%s|%s)",
+                kind,
+                tmpl,
+                gate,
+                up,
+                down,
+                wsuf,
+                ssuf,
+            )
+            return naming
+    raise ValueError(
+        f"no routed experts found in the {kind} checkpoint index. Tried "
+        + ", ".join(f"*.experts.0.{g}.{w}" for (g, _, _), w, _ in candidates)
+    )
+
+
+def _expert_layers(weight_map, naming: _ExpertNaming, num_layers: int) -> tuple:
+    """Layers carrying routed experts, restricted to the served range.
+
+    ``range(num_layers)`` over-reaches on GLM-5.3-Flash at both ends: layers 0..2 are dense
+    (``first_k_dense_replace=3``) and the checkpoint also holds a 288-expert set for layer
+    45, the MTP head, one past ``num_hidden_layers`` and never served.  DeepSeek-V4-Flash
+    has neither, so this returns exactly ``range(num_layers)`` there.
+    """
+    return tuple(
+        L
+        for L in range(num_layers)
+        if naming.weight_key(L, 0, naming.gate) in weight_map
+    )
+
+
+def _w8a8_naming() -> _ExpertNaming:
+    return _detect_expert_naming(_index(), _W8A8_NAMING_CANDIDATES, "W8A8")
+
+
+def _mxfp4_naming() -> _ExpertNaming:
+    return _detect_expert_naming(_mxfp4_index(), _MXFP4_NAMING_CANDIDATES, "MXFP4")
+
+
 def _read_layer_odirect(L, E, H, I, scratch) -> None:
     """Fill ``_LBUF[L]`` (pinned flat13/flat2 + scales) via O_DIRECT reads + per-expert rearrange.
 
@@ -422,54 +606,50 @@ def _read_layer_odirect(L, E, H, I, scratch) -> None:
     from safetensors import safe_open
 
     idx = _index()
+    nm = _w8a8_naming()
     b = _layer_buf(L, E, H, I)
     f13 = b["flat13"].view(E, 2 * I, H)
     f2 = b["flat2"].view(E, H, I)
     byfile = {}
     for e in range(E):
-        for w in ("w1", "w2", "w3"):
-            byfile.setdefault(idx[f"layers.{L}.ffn.experts.{e}.{w}.weight"], []).append(
-                (e, w)
-            )
+        for p in nm.projs:
+            byfile.setdefault(idx[nm.weight_key(L, e, p)], []).append((e, p))
     for fn, items in byfile.items():
         path = os.path.join(_ckpt_dir(), fn)
         hdr, base = _shard_header(path)
         offs = {
-            (e, w): hdr[f"layers.{L}.ffn.experts.{e}.{w}.weight"]["data_offsets"]
-            for e, w in items
+            (e, p): hdr[nm.weight_key(L, e, p)]["data_offsets"] for e, p in items
         }
         lo = min(o[0] for o in offs.values())
         hi = max(o[1] for o in offs.values())
         region = _odirect_region(path, base, lo, hi, scratch)
-        for e, w in items:
-            o0, o1 = offs[(e, w)]
+        for e, p in items:
+            o0, o1 = offs[(e, p)]
             blk = torch.frombuffer(region[o0 - lo : o1 - lo], dtype=torch.int8)
-            if w == "w1":
+            if p == nm.gate:
                 f13[e, 0:I].copy_(blk.view(I, H))
-            elif w == "w3":
+            elif p == nm.up:
                 f13[e, I : 2 * I].copy_(blk.view(I, H))
             else:
                 f2[e].copy_(blk.view(H, I))
     # scales (tiny) via normal get_tensor
     sfiles = {}
     for e in range(E):
-        for w in ("w1", "w2", "w3"):
-            sfiles.setdefault(
-                idx[f"layers.{L}.ffn.experts.{e}.{w}.weight_scale"], []
-            ).append((e, w))
+        for p in nm.projs:
+            sfiles.setdefault(idx[nm.scale_key(L, e, p)], []).append((e, p))
     for fn, items in sfiles.items():
         with safe_open(os.path.join(_ckpt_dir(), fn), framework="pt") as f:
-            for e, w in items:
-                t = f.get_tensor(f"layers.{L}.ffn.experts.{e}.{w}.weight_scale")
-                if w == "w1":
+            for e, p in items:
+                t = f.get_tensor(nm.scale_key(L, e, p))
+                if p == nm.gate:
                     b["s13"][e, 0:I] = t.reshape(I, 1)
-                elif w == "w3":
+                elif p == nm.up:
                     b["s13"][e, I : 2 * I] = t.reshape(I, 1)
                 else:
                     b["s2"][e] = t.reshape(H, 1)
 
 
-_BG = {"ex": None, "done_q": None, "t_start": 0.0, "started": False}
+_BG = {"ex": None, "done_q": None, "t_start": 0.0, "started": False, "layers": ()}
 
 
 def _start_bg_reads(E, H, I, num_layers, nworkers=8) -> None:
@@ -485,6 +665,8 @@ def _start_bg_reads(E, H, I, num_layers, nworkers=8) -> None:
     import time
     from concurrent.futures import ThreadPoolExecutor
 
+    layers = _expert_layers(_index(), _w8a8_naming(), num_layers)
+    _BG["layers"] = layers
     _BG["done_q"] = queue.Queue()
     _BG["t_start"] = time.perf_counter()
     _BG["ex"] = ThreadPoolExecutor(max_workers=nworkers)
@@ -498,22 +680,31 @@ def _start_bg_reads(E, H, I, num_layers, nworkers=8) -> None:
         _read_layer_odirect(L, E, H, I, _tls.scratch)
         _BG["done_q"].put(L)
 
-    for L in range(num_layers):
+    for L in layers:
         _BG["ex"].submit(rd, L)
     logger.info(
-        "[KT_STREAM] background reads started (%d layers, %d workers), overlapping load",
+        "[KT_STREAM] background reads started (%d expert layers %s..%s of %d, %d workers), "
+        "overlapping load",
+        len(layers),
+        layers[0] if layers else "-",
+        layers[-1] if layers else "-",
         num_layers,
         nworkers,
     )
 
 
-def _finish_bg_build(num_layers, dev) -> None:
-    """Drain the background reads, NZ-casting each layer as its read completes."""
+def _finish_bg_build(dev) -> None:
+    """Drain the background reads, NZ-casting each layer as its read completes.
+
+    Drains exactly as many layers as :func:`_start_bg_reads` submitted -- the expert-bearing
+    ones, not ``range(num_layers)``, which would block forever on a model with dense layers.
+    """
     import time
 
     _free_slot()  # its HBM is the NZ-cast scratch
     t0 = time.perf_counter()
-    for _ in range(num_layers):
+    layers = _BG["layers"]
+    for _ in range(len(layers)):
         L = _BG["done_q"].get()
         _finalize_layer(L, dev)
     _BG["ex"].shutdown()
@@ -521,14 +712,14 @@ def _finish_bg_build(num_layers, dev) -> None:
         "[KT_STREAM] pool build done: total %.0fs (NZ drain %.0fs, %d layers)",
         time.perf_counter() - _BG["t_start"],
         time.perf_counter() - t0,
-        num_layers,
+        len(layers),
     )
 
 
 def _build_pool_parread(E, H, I, num_layers, dev, nworkers=8) -> None:
     """Non-overlapped path (lazy fallback): start the reads then immediately drain + NZ."""
     _start_bg_reads(E, H, I, num_layers, nworkers)
-    _finish_bg_build(num_layers, dev)
+    _finish_bg_build(dev)
 
 
 def _inplace_nz(flat: torch.Tensor, E: int, A: int, B: int, dev) -> torch.Tensor:
@@ -552,6 +743,7 @@ def _finalize_layer(L: int, dev) -> None:
     import time
 
     E, H, I, num_layers = _get_cfg()
+    n_expert_layers = len(_BG["layers"]) or num_layers
     b = _LBUF[L]
     t0 = time.perf_counter()
     h13 = _inplace_nz(b["flat13"], E, 2 * I, H, dev)  # -> [E, H, 2I] NZ view
@@ -560,14 +752,14 @@ def _finalize_layer(L: int, dev) -> None:
     s2b = b["s2"].squeeze(-1).to(torch.bfloat16).to(dev)
     _POOL[L] = (h13, h2, s13b, s2b)
     b["s13"] = b["s2"] = None
-    if len(_POOL) == num_layers:
+    if len(_POOL) == n_expert_layers:
         _POOL_BUILT = True
     logger.info(
         "[KT_STREAM] layer %d NZ-finalized in-loop (%.1fs, %d/%d done)",
         L,
         time.perf_counter() - t0,
         len(_POOL),
-        num_layers,
+        n_expert_layers,
     )
 
 
@@ -594,6 +786,7 @@ def _load_layer_mxfp4(layer: int, E: int, H: int, I: int):
     from safetensors import safe_open
 
     idx = _mxfp4_index()
+    nm = _mxfp4_naming()
     cache: dict = {}
 
     def _open(k):
@@ -605,19 +798,19 @@ def _load_layer_mxfp4(layer: int, E: int, H: int, I: int):
     def stack(proj):
         cs, ss = [], []
         for e in range(E):
-            wk = f"layers.{layer}.ffn.experts.{e}.{proj}.weight"
-            sk = f"layers.{layer}.ffn.experts.{e}.{proj}.scale"
+            wk = nm.weight_key(layer, e, proj)
+            sk = nm.scale_key(layer, e, proj)
             h = _open(wk)
             cs.append(_as_u8(h.get_tensor(wk)))
             ss.append(_as_u8(h.get_tensor(sk)))
         return torch.stack(cs), torch.stack(ss)
 
     _pin = (lambda t: t.pin_memory()) if _PIN_MXFP4 else (lambda t: t)
-    c1, s1 = stack("w1")
-    c3, s3 = stack("w3")
+    c1, s1 = stack(nm.gate)
+    c3, s3 = stack(nm.up)
     c13 = _pin(torch.cat([c1, c3], dim=1))
     s13 = _pin(torch.cat([s1, s3], dim=1))
-    c2, s2 = stack("w2")
+    c2, s2 = stack(nm.down)
     return c13, s13, _pin(c2), _pin(s2)
 
 
@@ -640,7 +833,7 @@ def _build_mxfp4_pool(E: int, H: int, I: int, num_layers: int) -> None:
         num_layers,
         _mxfp4_ckpt_dir(),
     )
-    for L in range(num_layers):
+    for L in _expert_layers(_mxfp4_index(), _mxfp4_naming(), num_layers):
         _MXFP4_POOL[L] = _load_layer_mxfp4(L, E, H, I)
     _MXFP4_POOL_BUILT = True
     logger.info(
@@ -652,7 +845,7 @@ def _build_mxfp4_pool(E: int, H: int, I: int, num_layers: int) -> None:
 # The depool pool is just pinned host MXFP4 codes+scale (no NZ cast -- the bytes ARE the product),
 # so building it is purely a read problem.  Reading all layers in parallel with O_DIRECT, started at
 # model-load time, overlaps the rest of the load.  MXFP4 is 4-bit, so the reads are cheap.
-_BG_MX = {"ex": None, "done_q": None, "t_start": 0.0, "started": False}
+_BG_MX = {"ex": None, "done_q": None, "t_start": 0.0, "started": False, "layers": ()}
 
 
 def _mxfp4_index():
@@ -717,23 +910,21 @@ def _read_layer_mxfp4_odirect(L, E, H, I, scratch) -> None:
     :func:`_load_layer_mxfp4`.
     """
     idx = _mxfp4_index()
+    nm = _mxfp4_naming()
     c13, s13, c2, s2 = _mxfp4_layer_buf(L, E, H, I)
-    for suf, (dst13, dst2, w13, w2_n) in (
-        ("weight", (c13, c2, H // 2, I // 2)),
-        ("scale", (s13, s2, H // 32, I // 32)),
+    for keyfn, (dst13, dst2, w13, w2_n) in (
+        (nm.weight_key, (c13, c2, H // 2, I // 2)),
+        (nm.scale_key, (s13, s2, H // 32, I // 32)),
     ):
         byfile = {}
         for e in range(E):
-            for proj in ("w1", "w2", "w3"):
-                k = f"layers.{L}.ffn.experts.{e}.{proj}.{suf}"
-                byfile.setdefault(idx[k], []).append((e, proj))
+            for proj in nm.projs:
+                byfile.setdefault(idx[keyfn(L, e, proj)], []).append((e, proj))
         for fn, items in byfile.items():
             path = os.path.join(_mxfp4_ckpt_dir(), fn)
             hdr, base = _shard_header(path)
             offs = {
-                (e, proj): hdr[f"layers.{L}.ffn.experts.{e}.{proj}.{suf}"][
-                    "data_offsets"
-                ]
+                (e, proj): hdr[keyfn(L, e, proj)]["data_offsets"]
                 for e, proj in items
             }
             lo = min(o[0] for o in offs.values())
@@ -742,9 +933,9 @@ def _read_layer_mxfp4_odirect(L, E, H, I, scratch) -> None:
             for e, proj in items:
                 o0, o1 = offs[(e, proj)]
                 blk = torch.frombuffer(region[o0 - lo : o1 - lo], dtype=torch.uint8)
-                if proj == "w1":
+                if proj == nm.gate:
                     dst13[e, 0:I].copy_(blk.view(I, w13))
-                elif proj == "w3":
+                elif proj == nm.up:
                     dst13[e, I : 2 * I].copy_(blk.view(I, w13))
                 else:
                     dst2[e].copy_(blk.view(H, w2_n))
@@ -762,6 +953,8 @@ def _start_bg_reads_mxfp4(E, H, I, num_layers, nworkers=8) -> None:
     import time
     from concurrent.futures import ThreadPoolExecutor
 
+    layers = _expert_layers(_mxfp4_index(), _mxfp4_naming(), num_layers)
+    _BG_MX["layers"] = layers
     _BG_MX["done_q"] = queue.Queue()
     _BG_MX["t_start"] = time.perf_counter()
     _BG_MX["ex"] = ThreadPoolExecutor(max_workers=nworkers)
@@ -778,17 +971,20 @@ def _start_bg_reads_mxfp4(E, H, I, num_layers, nworkers=8) -> None:
         except Exception as e:
             _BG_MX["done_q"].put(("ERR", L, repr(e)[:200]))
 
-    for L in range(num_layers):
+    for L in layers:
         _BG_MX["ex"].submit(rd, L)
     logger.info(
-        "[KT_STREAM][depool] MXFP4 background reads started (%d layers, %d workers), "
-        "overlapping load",
+        "[KT_STREAM][depool] MXFP4 background reads started (%d expert layers %s..%s of "
+        "%d, %d workers), overlapping load",
+        len(layers),
+        layers[0] if layers else "-",
+        layers[-1] if layers else "-",
         num_layers,
         nworkers,
     )
 
 
-def _finish_bg_build_mxfp4(num_layers) -> None:
+def _finish_bg_build_mxfp4() -> None:
     """Drain the background MXFP4 reads (no NZ pass).
 
     Raises if any layer read failed, so the caller can fall back to the serial builder.
@@ -797,7 +993,8 @@ def _finish_bg_build_mxfp4(num_layers) -> None:
     import time
 
     errs = []
-    for _ in range(num_layers):
+    layers = _BG_MX["layers"]
+    for _ in range(len(layers)):
         item = _BG_MX["done_q"].get()
         if isinstance(item, tuple):
             errs.append(item)
@@ -810,7 +1007,7 @@ def _finish_bg_build_mxfp4(num_layers) -> None:
     logger.info(
         "[KT_STREAM][depool] MXFP4 pool built in %.0fs (parallel O_DIRECT, %d layers)",
         time.perf_counter() - _BG_MX["t_start"],
-        num_layers,
+        len(layers),
     )
 
 
@@ -955,7 +1152,7 @@ def maybe_reserve_slot(wrapper, dev, layer=None) -> None:
                     _BG_MX["started"] = True
                     _start_bg_reads_mxfp4(E, H, I, num_layers)
                 if wrapper.kt_config.layer_idx == num_layers - 1:
-                    _finish_bg_build_mxfp4(num_layers)
+                    _finish_bg_build_mxfp4()
             return
         if E and H and I:
             reserve_slot(E, H, I, dev)
@@ -967,7 +1164,7 @@ def maybe_reserve_slot(wrapper, dev, layer=None) -> None:
                 _BG["started"] = True
                 _start_bg_reads(E, H, I, num_layers)
             if wrapper.kt_config.layer_idx == num_layers - 1:
-                _finish_bg_build(num_layers, dev)
+                _finish_bg_build(dev)
                 reserve_slot(E, H, I, dev)
     except Exception as e:
         logger.warning(
@@ -999,29 +1196,53 @@ def _routing_ops():
     return _INIT_ROUTING, _FINALIZE_ROUTING
 
 
-@functools.lru_cache(maxsize=2)
-def _log_stream_swiglu_once(limit: float) -> None:
+@functools.lru_cache(maxsize=4)
+def _log_stream_swiglu_once(limit: float, source: str) -> None:
     print(f"[KT_STREAM][swiglu] streaming-prefill clamp "
-          f"{'ACTIVE limit=%.4g' % limit if limit > 0 else 'OFF'}", flush=True)
+          f"{'ACTIVE limit=%.4g' % limit if limit > 0 else 'OFF'} (from {source})",
+          flush=True)
 
 
 @functools.lru_cache(maxsize=1)
-def _swiglu_limit() -> float:
-    """The checkpoint's swiglu_limit, read the same way the module reads E/H/I."""
+def _swiglu_limit_from_config() -> float:
+    """Fallback: the checkpoint's own swiglu_limit, ``text_config``-aware.
+
+    GLM-5.3-Flash nests it under ``text_config`` and its value is 10.0.  Reading the top
+    level only, as this used to, returned 0.0 -- and 0.0 does not fail, it just skips the
+    clamp, so the streamed experts silently computed a different function from both the
+    resident NPU experts and the CPU MoE, which do clamp.
+    """
     try:
-        cfg = json.load(open(os.path.join(_ckpt_dir(), "config.json")))
-        return float(cfg.get("swiglu_limit") or 0.0)
+        return float(_read_ckpt_config().get("swiglu_limit") or 0.0)
     except Exception:
         return 0.0
 
 
-def _apply_swiglu_limit_streaming(x: torch.Tensor) -> None:
+def _swiglu_limit(layer_idx=None) -> tuple:
+    """(limit, source) for the streamed experts of ``layer_idx``.
+
+    The layer's own ``moe_runner_config.swiglu_limit`` is the authoritative source: it is
+    the exact expression ``kt_ep_wrapper.create_weights`` hands to the CPU kernel and that
+    the resident NPU experts run with, so taking it from there is the only way the three
+    cannot drift apart, whatever the checkpoint calls its fields.  config.json is the
+    fallback for a layer that was never registered (registration needs
+    ``KT_PREFILL_STREAM=1`` at model-load time).
+    """
+    ent = _REGISTRY.get(layer_idx)
+    if ent is not None:
+        rc = getattr(ent[0], "moe_runner_config", None)
+        if rc is not None and hasattr(rc, "swiglu_limit"):
+            return float(rc.swiglu_limit or 0.0), "moe_runner_config"
+    return _swiglu_limit_from_config(), "config.json"
+
+
+def _apply_swiglu_limit_streaming(x: torch.Tensor, layer_idx=None) -> None:
     """In-place asymmetric clamp on the gate/up halves. Shares the runner's implementation so
     the streamed experts and the resident ones cannot drift apart."""
     from sglang.srt.hardware_backend.npu.moe.activation import apply_swiglu_limit_
 
-    limit = _swiglu_limit()
-    _log_stream_swiglu_once(limit)
+    limit, source = _swiglu_limit(layer_idx)
+    _log_stream_swiglu_once(limit, source)
     apply_swiglu_limit_(x, limit)
 
 
@@ -1035,6 +1256,7 @@ def _streaming_fused_experts(
     topk_ids: torch.Tensor,
     top_k: int,
     num_experts: int,
+    layer_idx=None,
 ) -> torch.Tensor:
     """Run one W8A8 MoE layer over the streamed expert set, end to end.
 
@@ -1088,7 +1310,7 @@ def _streaming_fused_experts(
     # 3. activation: swiglu plus the re-quantisation gmm2 needs (NPUSwigluQuant).
     #    The model's own SwiGLU clamp has to be applied here too, or the streamed experts
     #    would differ numerically from both the CPU MoE and DeepSeek's reference.
-    _apply_swiglu_limit_streaming(permuted)
+    _apply_swiglu_limit_streaming(permuted, layer_idx)
     permuted, swiglu_scale = torch.ops.npu.npu_dequant_swiglu_quant(
         permuted, quant_mode=1, activate_left=True
     )
@@ -1155,7 +1377,7 @@ def _stream_layer_weights(layer_idx: int, dev):
     # de-interleaves (scale|codes) in UB via Gather (KT_MXFP4_BLK_KERNEL, default); the software
     # 16-of-17 strided de-interleave it replaces was the prefill bottleneck.
     if _KT_PREFETCH:
-        par = _prefetch_ensure(layer_idx, num_layers)
+        par = _prefetch_ensure(layer_idx)
     else:
         _fill_stage(layer_idx)
         par = layer_idx % 2
@@ -1192,6 +1414,7 @@ def _streaming_forward(layer_idx, x, topk_output, top_k, num_experts) -> torch.T
         topk_ids=topk_output.topk_ids,
         top_k=top_k,
         num_experts=num_experts,
+        layer_idx=layer_idx,
     )
 
     # Dynamic resident: the W8A8 path gathers from the resident W8A8 pool at the end of the
@@ -1208,12 +1431,13 @@ def _streaming_forward(layer_idx, x, topk_output, top_k, num_experts) -> torch.T
                     repr(e)[:140],
                 )
         else:
-            if layer_idx == 0:
+            moe_layers = _moe_layers()
+            if layer_idx == moe_layers[0]:
                 _REQ_HIST.clear()
             _REQ_HIST[layer_idx] = torch.bincount(
                 _hist_ids(topk_output.topk_ids).to(torch.int64), minlength=E
             )[:E]
-            if layer_idx == num_layers - 1 and len(_REQ_HIST) == num_layers:
+            if layer_idx == moe_layers[-1] and len(_REQ_HIST) == len(moe_layers):
                 try:
                     _apply_dynamic_residency()
                 except Exception as e:
@@ -1284,7 +1508,8 @@ def _apply_resident_layer_depool(L, topk_output, w13, s13b, w2, s2b):
     if K <= 0 or wrap.gpu_experts_mask is None or wrap.logical_to_gpu_index is None:
         return
     E, H, I, num_layers = _get_cfg()
-    if L == 0:
+    moe_layers = _moe_layers()
+    if L == moe_layers[0]:
         _RES_PEND.clear()
     counts = torch.bincount(
         _hist_ids(topk_output.topk_ids).to(torch.int64), minlength=E
@@ -1301,7 +1526,7 @@ def _apply_resident_layer_depool(L, topk_output, w13, s13b, w2, s2b):
     layer.w13_weight_scale.data.copy_(torch.index_select(s13b, 0, top))
     layer.w2_weight_scale.data.copy_(torch.index_select(s2b, 0, top))
     _RES_PEND[L] = (wrap, top, counts)
-    if L == num_layers - 1:
+    if L == moe_layers[-1]:
         share_sum = 0.0
         for _LL, (wr, tp, cnt) in sorted(_RES_PEND.items()):
             _set_resident_masks(wr, tp.cpu(), K, E)
@@ -1325,7 +1550,8 @@ def _apply_dynamic_residency() -> None:
     import time
 
     E, H, I, num_layers = _get_cfg()
-    for L in range(num_layers):
+    moe_layers = _moe_layers()
+    for L in moe_layers:
         _pool_ok = (L in _MXFP4_POOL) if _KT_MXFP4_DEPOOL else (L in _POOL)
         if L not in _REQ_HIST or L not in _REGISTRY or not _pool_ok:
             logger.warning("[KT_STREAM] dyn-resident: layer %d incomplete; abort", L)
@@ -1333,7 +1559,7 @@ def _apply_dynamic_residency() -> None:
     t0 = time.perf_counter()
     share_sum = 0.0
     K = 0
-    for L in range(num_layers):
+    for L in moe_layers:
         layer, wrap = _REGISTRY[L]
         K = int(wrap.num_gpu_experts)
         if K <= 0 or wrap.gpu_experts_mask is None or wrap.logical_to_gpu_index is None:
@@ -1398,9 +1624,9 @@ def _apply_dynamic_residency() -> None:
         "[KT_STREAM] dynamic resident applied: top-%d x %d layers in %.1fs, "
         "prefill top-K activation share=%.3f",
         K,
-        num_layers,
+        len(moe_layers),
         time.perf_counter() - t0,
-        share_sum / num_layers,
+        share_sum / max(len(moe_layers), 1),
     )
 
 
@@ -1423,11 +1649,16 @@ def _warmup_consumes(layer_idx: int, num_tokens: int) -> bool:
     if _KT_STREAM_WARMUP <= 0 or num_tokens <= 1:
         return False
     st = _STREAM_WARMUP_STATE
-    if layer_idx == 0:
+    # The budget is counted once per prefill, on the FIRST MoE layer -- not on layer 0,
+    # which on GLM-5.3-Flash is dense and never reaches this function.  With that test the
+    # counter never advanced, so every prefill forever read as "still warming up" and the
+    # streaming path was disabled outright, silently, for the whole run.
+    first = _first_moe_layer()
+    if layer_idx == first:
         st["seen"] = st.get("seen", 0) + 1
     if st.get("seen", 0) > _KT_STREAM_WARMUP:
         return False
-    if layer_idx == 0:
+    if layer_idx == first:
         logger.info(
             "[KT_STREAM] warmup prefill %d/%d -> hybrid (prime the CPU MoE)",
             st["seen"],
