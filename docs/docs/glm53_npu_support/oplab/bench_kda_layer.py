@@ -3,9 +3,9 @@
 
 WHAT THIS IS
 ------------
-The 34 KDA (linear-attention) layers of GLM-5.3-Flash INT8 cost **10.357 ms of
+The 34 KDA (linear-attention) layers of GLM-5.3-Flash INT8 cost **10.408 ms of
 the 31.274 ms decode step** on one Atlas A3 die at bs=1 with the NPU graph on.
-That is 272 kernel launches, **8 per layer, 304.6 us per layer** -- or really 9
+That is 272 kernel launches, **8 per layer, 306.1 us per layer** -- or really 9
 per layer; see README 5.1, the ninth is filed under `unclassified`.  This script
 rebuilds them, in order, with the deployed shapes and dtypes, and
 times them inside a captured NPU graph.  Nothing here imports a model, loads a
@@ -26,7 +26,7 @@ The reference (config I, `../int8_singlecard/data/kernel_attribution_cfgI.txt`):
        121.6  34      3.6  layer_norm_gated_fwd_kernel
         50.7  34      1.5  Cast                          "2"
     --------------------------------------------------------------------------
-     10356.9 272           = 10.357 ms/step, 304.6 us/layer
+     10356.9 272           = 10.408 ms/step, 306.1 us/layer
 
 THE SEQUENCE (glm5_next.py Glm5NextLinearAttention.forward, fused path)
 
@@ -151,8 +151,8 @@ REF = {
     ("layer_norm_gated_fwd_kernel", None): 3.6,
     ("Cast", "2"): 1.5,
 }
-REF_LAYER_US = 304.6
-REF_STEP_MS = 10.357
+REF_LAYER_US = 306.1
+REF_STEP_MS = 10.408
 
 PROF_ROOT = os.environ.get("OPLAB_PROF_DIR", "/var/tmp/glm53/oplab/kda")
 

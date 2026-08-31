@@ -4,7 +4,7 @@
 WHAT THIS IS
 ------------
 The 11 DSA (DeepSeek sparse attention) layers of GLM-5.3-Flash INT8 cost
-**5.143 ms of the 31.274 ms decode step** on one Atlas A3 die at bs=1 with the
+**5.395 ms of the 31.274 ms decode step** on one Atlas A3 die at bs=1 with the
 NPU graph on.  That is 891 kernel launches, **81 per layer, 468 us per layer**.
 This script rebuilds that layer -- INT8 NZ projections, the kpool indexer, the
 lightning indexer, the sparse flash attention and both MLA absorbs -- with the
@@ -27,7 +27,7 @@ section `--- DSA ---`.  The head of it:
        204.9  11    18.6   LightningIndexer        "1,32,128;19480,64,1,128;..."
        ... ~46 more groups, mostly index and bookkeeping
     ---------------------------------------------------------------------------
-      5143    891          = 5.143 ms/step, 468 us/layer
+      5143    891          = 5.395 ms/step, 468 us/layer
 
 THE SEQUENCE (deepseek_v2_attention_mla_npu.py forward_dsa_prepare/core_npu)
 
@@ -205,8 +205,8 @@ REF = {
     ("RmsNorm", "1,1,512;512"): 4.0,
     ("DynamicQuant", "1,1536"): 2.6,
 }
-REF_LAYER_US = 467.6  # 5143.0 / 11
-REF_STEP_MS = 5.143
+REF_LAYER_US = 490.4  # 5143.0 / 11
+REF_STEP_MS = 5.395
 REF_KERNELS_PER_LAYER = 81
 
 PROF_ROOT = os.environ.get("OPLAB_PROF_DIR", "/var/tmp/glm53/oplab/dsa")
