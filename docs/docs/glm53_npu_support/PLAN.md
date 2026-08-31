@@ -21,6 +21,7 @@
 | **eager 精度判定**（回归阶梯第 1 级） | ✅ **8/8 在测出来的地板内**，最差 0.91×。见 `REGRESSION.md` |
 | **整网 NPU Graph** | ✅ **2026-08-29 11:06 跑通**。45 层 / 6 个 bs 桶 / 16 卡 HCCL 全在图内；同 batch 宽度下与 eager **逐位相同**；decode **约 8×**。见 P6.6b |
 | **P4.2 出口判据 GSM8K** | ✅ **97.35%**（全 1319 题、stop rate 100%、图模式 TP16 128 并发），判据 97.50%，差 0.32 个 SE。见 P4.2 |
+| **MTP / 投机解码** | ⚠ **部分打开**：单请求与等长批可用（接受长度 1.71–2.00），**ragged 批上有未解决的越界，已定位到图内**。⚠ 而且 bs=1 净加速为零、吃掉 55% 的 KV 池，**修好也先别开**。见 **P8** |
 | **长上下文** | ✅ **2026-08-30 跑通 1,048,576**，**两个构型都确认**：INT8 TP8（8 张 die，不用整机）与 **BF16 TP16 交付构型**。五深度召回 5/5、前缀对拍 `max\|dlp\| = 0.000e+00`；TP16 上 TTFT 292.1 s、decode 25.5 ms/token。见 **P7** |
 
 **eager 基线的 logits 判定：已通过**（2026-08-29）。地板测出来了 ——
@@ -206,6 +207,56 @@ device 时间类的（AI_CPU 回退、int64 算术、标量瓶颈 kernel）才�
 | ~~3~~ | ~~全零 rope 的 workaround~~ | **已实现**（`ascend_backend.py` 的 `_nope_zero_rope`）。实测：`query_rope`/`key_rope` 签名是 Optional，但**缺省、0 宽、16、32、128 全部报错，只收宽度 64**。全零 rope 数值正确（对 torch MLA 参考 rel 3e-3，即 bf16 输出舍入）。**一页零页用 stride-0 `expand` 铺满整个 cache**，与真实零 cache 逐位相同 —— 总共 8 KB，而不是多一份约 10% 的 KV。⚠ 算子文档说不支持非连续输入，所以这是**观察到的行为、不是承诺的行为**；哪天 CANN 不认 stride-0 就退回分配真张量 |
 
 ### 2.4 陷阱（能跑但算错 / 名实不符）
+
+⛔ **`tensor.is_cuda` 在这台机器上是 True，所以每一处 `if x.is_cuda` 的门 NPU 都会通过。**
+`hardware_backend/npu/utils.py:152` 导入 `torch_npu.contrib.transfer_to_npu`，之后：
+
+| 判据 | NPU 上的值 | |
+|---|---|---|
+| `tensor.is_cuda` | **True** | ❌ 撒谎 |
+| `tensor.device.type` | `"npu"` | ✅ |
+| `sglang.is_cuda()` | False | ✅ |
+| `torch.cuda.is_available()` | False | ✅ **因为 utils.py:155 手工补回来了** |
+
+⚠ **最后一行是这条的形状**：那行补丁的注释写着「Re-mock torch.cuda.is_available cuz
+transfer_to_npu mocks it True」—— **别名早就被知道，补的是撞上的那一个实例，不是这一类。**
+
+**实际后果（2026-08-30 实测）**：`logprob_processor.py:528` 的
+`if ... and pruned_states.is_cuda` 放 NPU 进了一个 CUDA 专用的融合 Triton kernel，
+而它的编译让 **`bishengir-compile` SIGSEGV，八个 rank 全死** ——
+**任何客户端传一个合法的 `top_logprobs_num` 就能打掉服务**。已修（改判 `device.type`），
+验过 k=1/5/8/20 全部正常返回。
+
+⚠ **补丁打的是属性本身，所以「import 之前拿到的张量是安全的」这个直觉不成立**
+（`glm53_int8_1card` 实测）：import 前建的张量 `t0.is_cuda` 是 False，
+执行那行 import 之后**同一个 t0 也变成 True**。
+
+⚠ **`srt/` 下还有 88 处张量级 `.is_cuda` 门没查。** 每一处背后的 CUDA 快路径
+在 NPU 上都是**静默启用**的。这一处靠打死进程暴露了自己；
+**其余的更可能是「安静地算错」，那才是这类问题的常见形态。**
+**已扫过的（`glm53_int8_1card` 做的，MoE / KDA / DSA / 量化调用链）**：4 处，
+**本构型下全部不可达**，但那是构型的性质不是代码的性质 ——
+`kpool_fp8_index.py:607`（只被 CUDA 版 indexer 调，NPU 走自己那份）、
+`expert_pack.py:36`（只被 ExpertPack / GGUF 加载器调，我们走 compressed-tensors）、
+`unquant.py:273/:310`（`is_cutedsl()` 排在 `x.is_cuda` 前面，短路）。
+**换量化格式或换 indexer，这几处立刻变活。**
+
+⚠ **一条值得记的巧合**：`expert_pack.py:36` 那处若变活，NPU 会滑进 CUDA 的
+`silu_and_mul_clamp` —— **正是单卡线花两轮证明「厂商算子根本不 clamp」的那条路**
+（见 §2.4 的 `npu_clipped_swiglu` 默认参数陷阱）。**两条独立的坑指向同一个函数。**
+
+=> **新写代码不要用 `tensor.is_cuda` 判平台**，用 `device.type` 或 `sglang.is_cuda()`。
+=> **做性能归因之前先扫一遍你量的那条路**：如果某个「CUDA 专用」分支其实在跑，
+   你量到的 kernel 组成和你以为的不是一回事。
+
+
+⚠ **`top_logprobs_num` 会打死整个服务**（2026-08-30 实测）。请求里带
+`{"return_logprob": true, "top_logprobs_num": 5}` 触发一个此前没编译过的 Triton kernel
+的 JIT，**`bishengir-compile` 自身 SIGSEGV**（LLVM 栈回溯让人去提 llvm-project 的 bug），
+八个 rank 全部 `Scheduler hit an exception`，服务当场死 —— **不是返回错误，是进程没了**。
+与下面 `_hadamard128` 的 codegen UB 同族，**建议一起上报上游**。
+生产含义：任何客户端都能用一个合法的 OpenAI 兼容参数把服务打掉。
+
 
 | 陷阱 | 表现 |
 |---|---|
@@ -478,7 +529,7 @@ int8/fp8 是在 host 上重建后以 bf16 交给算子的（算子拒 int8），
       （max|gate_up| = 2.17，limit 是 10），要验 clamp 必须放大输入
 - [x] ~~**P3.5 出口判据** —— 四模块逐层 golden 对齐~~ —— 五类层全部端到端已验，见上
 
-### P4 · BF16 端到端 ☐ ← **当前战线：eager 已判定通过，等开 graph**
+### P4 · BF16 端到端 ✅（eager 与 graph 都已判定通过，GSM8K 97.35%）
 - [x] **P4.1 TP16 / 32K / 纯文本 / 关 NPU Graph 启动** —— ✅ **2026-08-29 09:20 跑通**
       - 权重 37.25 GB/die，`max_total_num_tokens=1195072`，可用 7.66 GB
         （比 fp8 索引缓存那版少 1.53 GB —— **bf16 索引缓存的实测代价**，此前只有推算）
@@ -1226,7 +1277,7 @@ DSA 每步 170 次 aten dispatch，MoE 只要 25 次。
       ⚠ 原文的「开 TQE=2 后约 8 µs」**已作废**：TQE=2 在图模式下根本起不来（见 P6.9）。
       而且图模式本身就把 launch 开销吃掉了，**这条在图下的收益需要重新量**
 
-### P7 · 长上下文 ✅（2026-08-30，INT8 W8A8 TP8 上闭环；BF16 TP16 的交付构型确认待做）
+### P7 · 长上下文 ✅（2026-08-30 闭环，**INT8 TP8 与 BF16 TP16 交付构型都已确认**）
 
 **结论：GLM-5.3-Flash 在 8 张 die 上跑通了 checkpoint 声称的完整 1,048,576 上下文**，
 五个深度的针全部召回。**不需要整机** —— 这一条推翻了「长上下文得先做容量测算才知道能不能跑」
@@ -1286,6 +1337,11 @@ MLA latent 不按 TP 切，所以这是**每 die** 的值。三份独立部署�
 形状地板回来），工具会警告。
 
 #### 阶梯（全部在同一台 `--context-length 1048576` 的服务上跑）
+
+⚠ **下表的 decode 数字是 `ba2a6372fa` 合并 `int8_singlecard` 之前量的，已偏慢。**
+合并后同一条 32640 提示在同构型上是 **22.3 ms/token**，表里是 27.6 —— 差 19%。
+**召回与前缀不变性不受影响**（那是功能与逐位判据，不是计时）；
+要引用性能数字请重测，或标明「合并前」。
 
 | 提示 token | 召回 | TTFT (s) | 二次模型预测 | 误差 | decode ms/token | 前缀不变性 |
 |---|---|---|---|---|---|---|
@@ -1359,6 +1415,125 @@ TP1 是全部 32）。**主导项恰好不是被 TP 切得最干净的那部分�
       **开着它出来的召回数字不可信**。
 - [ ] **1M 的性能优化**。二次项占 43% 是可攻击的，但先量清楚 prefill 在真实负载里的占比
       （与 P3.4 的重启条件同理）。
+
+### P5.1 · shared expert 并进 GroupedMatmul —— 精度回归通过（2026-08-30，TP8 288 专家）
+
+单卡线的 `3f7db2fece`（放开 `glm5_next.py` 的 `not _is_cuda` 门 + `npu/moe/topk.py`
+的 `_append_fused_shared_slot`）在**它自己的 16 专家部署上验不了精度**：teacher-forced
+`mean|dlp| = 1.243e-01` 对重测地板 `1.233e-01` = 1.01x，**地板本身高到 1.2e-01**，
+判据没有分辨率。**这里用 288 专家的真 checkpoint 回归。**
+
+| 轮次 | 构型 | GSM8K | stop rate |
+|---|---|---|---|
+| 原基线（`d279764c1b`）| INT8 TP8 | 97.42% | — |
+| **B′** | 合并树 + 本线全部改动，**无融合** | **97.65%**（1288/1319）| 100.00% |
+| **C** | **+ 融合**（日志确认 `Shared experts fusion optimization enabled`）| **97.42%**（1285/1319）| 100.00% |
+| 第四轮 | **+ `c69883df97`**（decode 写入器的 arange 记忆化）| **97.35%**（1284/1319）| 100.00% |
+
+四轮跨越三次代码改动，**最大差 0.30pp** —— 这就是这个判据在这个部署上的实际分辨率。
+
+**差 3 题 = −0.23pp。** 两轮独立二项之差的 SE 是 `sqrt(2) x 0.47 = 0.66pp`，
+实测是 **0.35 个 SE** —— 一致。
+
+⚠ **说准它答了什么**：排除的是「明显掉精度」，**排除不了小于约 1.3pp（2 SE）的真实退化**。
+
+⚠ **为什么要 B′ 这一轮**：单卡线原本只要「融合前后对比」，但那 18 个只在 TP1 验过的
+commit（含 KDA 投影融合、conv 池翻 window-major 两条**非逐位**改动）当时已经在树上。
+不先隔离，C 与原基线的差就是「18 个 commit + 融合」的混合，**掉了也说不清该回退谁**。
+B′ 顺带回答了那 18 个：在 288 专家上干净。
+
+⚠ **两轮的构型可比性核过**：KV 池 938,176 vs 938,048（差 128 token），
+并发/mem-frac/ctx/chunk 全同。**并且先确认了融合真的生效** —— 否则「无差异」
+测的是同一个东西两遍，是假阴性。
+
+### P8 · MTP / 投机解码 ☐（bring-up 通了，**ragged 批上有未解决的越界，已定位到图内**）
+
+**跑起来了，但只在单请求或长度一致的批上。** 这一节最重要的是那个未解决的 bug。
+
+#### 已经通的
+
+| | |
+|---|---|
+| draft 模型 | `Glm5NextForConditionalGenerationNextN`，**1.27 GB/die**，走 compressed-tensors 量化 |
+| 池 | target + draft 两个 KV 池都建起来 |
+| 图捕获 | decode / TARGET_VERIFY / draft-extend **三种全过** |
+| 投机确实在发生 | 接受长度 **1.71–2.00**（`num_draft_tokens=2`，两条打满 2.000）|
+| 长提示召回 | MTP 开着，32576 token 五深度 **5/5** |
+
+W8A8 checkpoint 的 layer 45 **是量化的**（871 个 scale），`quantization_config.ignore`
+只列了本就不量化的 norm/gate、没有通配符，所以 `_resolve_nextn_quant_config` 走量化路径是对的。
+
+#### ⛔ 未解决：**批内长度不一致（ragged）时** AI Core 越界
+
+```
+errorStr: MTE accesses an invalid GM address or the cross-device memory access times out
+```
+
+⚠ **触发条件是 ragged，不是并发数** —— 这一条我先判错过一次，记下来免得重蹈：
+- 长度**几乎相同**的短提示：并发 1/2/4/8/16 全过，32 崩
+- **GSM8K（提示长度差异大）**：`#running-req: 16` 就崩
+=> 先看到的「32 崩」让我写成了「并发 >= 32」，实际是**批越大越容易 ragged**。
+   **「阈值」形式的结论要先问一句「我扫的那个维度是真正的自变量吗」。**
+- 单请求（bs=1）六次跑全绿 —— 这个失败模式**结构上需要批里有别人**，
+  与 RESUME 教训 7 同形
+- 异步错误，宿主端在 `prepare_for_draft_extend -> ForwardBatch.init_new`
+  或 `overlap_utils.resolve_forward_inputs` 处撞到它撞上的下一个 copy
+- **已排除三个嫌疑**：① draft-extend 的行布局（`prepare_for_draft_extend` 的
+  `extend_num_tokens = bs * (num_draft_tokens + num_front_tokens)` 可能不等于
+  `bs * num_draft_tokens`）—— 加了响亮断言，**没触发**；
+  ② `kpool_spec_update_index_cache` 里的每个索引 —— 逐个算过边界；
+  ③ `verify_intermediate_state_indices[:batch_size]` —— 按
+  `max(get_eager_max_batch_size, pool_size)` 分配，128 够用
+- ⭐ **已定位到图内（2026-08-30 收尾时测出）**。两条独立证据：
+  ① 错误自己报在 **`NPUGraph.cpp:284, replay`** —— 崩的是**图重放**，不是 eager 路径
+     （这也是 `ASCEND_LAUNCH_BLOCKING=1` 定位不到具体算子的原因：
+     **一次图重放是一个不透明提交**，同步模式管不到它内部）
+  ② **加 `--disable-cuda-graph` 之后，同一个 ragged 16 批连跑两次全过**
+     （接受长度 1.978 / 1.982，几乎全接受）
+  => **不是算子错，是图内某个「捕获时定尺寸」的静态界被 ragged 运行时超过。**
+- **下一步（起点很具体）**：查投机路径上所有在**捕获期**定尺寸、运行期由 ragged 数据填充的
+  缓冲与界。**本轮已经在这一类里修过一个** —— `max_visible_pool_runs`
+  （ceil 的和 ≠ 和的 ceil，界不够大 -> scatter 跑出 `max_runs+1` 的缓冲区，
+  同样是 AI CPU/AI Core 越界）。**很可能还有第二个同类的。**
+  ⚠ 排查顺序建议：先列出 spec 路径上每一个 `[:bs]` / `[:batch_size]` 的静态缓冲切片，
+  逐个问「它的分配尺寸覆盖得住 ragged 运行时的最坏取值吗」。
+- ⚠ **两次通过不是证明**：组批本身不确定（见 RESUME「精度是怎么判的」），
+  这个失败是**间歇性**的。**先测崩溃率再谈修好**，否则「修好了」和「运气好」分不开。
+  上面那两次只是把嫌疑从「算子」移到「图」，不是「关图就没问题」的结论。
+- 已排除（别重走）：快照方向错误（wrapper 形状校验会 ValueError 不会 MTE，**演绎**）、
+  conv layout 静默错（contiguous 校验响亮，**演绎**）、
+  索引/槽位错误（`layer_check/check_kda_spec_snapshot.py` 在 ragged 2-32 上过，
+  带置换等变性 + 只读 + 负对照）、draft-extend 行布局（响亮断言没触发）、
+  投机路径里的 `is_cuda` 门（扫过，只有 `memory_pool.py:943` 且前有 `not _is_npu`）
+
+#### 性能：bs=1 下净加速为零，而且要吃掉一半 KV 池
+
+| | 每步 | 每步产出 | 每 token |
+|---|---|---|---|
+| 无 MTP | 23.3 ms | 1 | **22.3 ms**（三次重复一致）|
+| MTP | 43.2 ms | 1.97 | **21.9 ms** |
+
+**verify 步是 decode 步的 1.86x，只换来 1.95 个 token —— 打平。**
+一个 verify 周期要跑 draft-extend + draft decode + target verify **三次前向**，
+而 draft 虽然只有一层，**每次前向的固定开销（launch、HCCL、图重放）不按层数缩放**。
+
+⚠ **容量代价更值得看**：`mrr=128` 下投机的中间缓冲吃掉 **4.57 GB/die**
+（`intermediate_ssm_state_cache` 4.41 + conv window 0.16），它随
+`max_running_requests x num_draft_tokens` 线性增长，且在 KV 池定容**之后**从同一份预算里扣：
+
+| | 无 MTP | MTP |
+|---|---|---|
+| KV 池（mrr=128, mem-frac 0.85）| 938,176 token | **418,496 token** |
+
+**MTP 把 KV 池砍掉 55%**，而 KV 池决定能同时装多少长请求。
+=> **在把那个 OOB 修掉、并证明高并发下有实际吞吐收益之前，不建议开 MTP。**
+
+#### ⚠ 判据上的一个坑（花了这一轮很多时间才想明白）
+
+「贪心下 MTP 必须与非 MTP 输出逐位相同」**在这台机器上不是合法判据** ——
+基线自己跨 batch 宽度就不可复现（见 RESUME「精度是怎么判的」一节）。
+能用的是：**GSM8K 统计** + **接受长度**（后者不需要参考：verify 算错就配不上
+target 的 argmax，接受长度会塌向 1.0，**算错的 verify 产不出「每个 draft 都被接受」**）。
 
 ---
 

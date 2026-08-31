@@ -162,6 +162,7 @@ def generate_streaming(host, port, ids, n_new, timeout=7200):
     t0 = time.time()
     ttft = None
     n_chunks = 0
+    n_out = 0
     text = ""
     with requests.post(
         f"http://{host}:{port}/generate",
@@ -181,18 +182,32 @@ def generate_streaming(host, port, ids, n_new, timeout=7200):
                 ttft = time.time() - t0
             n_chunks += 1
             try:
-                text = json.loads(chunk)["text"]
-            except (ValueError, KeyError):
+                body = json.loads(chunk)
+                text = body["text"]
+                # Chunks are not tokens. Under speculative decoding one chunk
+                # carries a whole accepted run, so dividing the decode phase by
+                # the chunk count reports ms per VERIFY STEP and calls it ms per
+                # token -- measured 2026-08-30: 44.6 against a true 22.2, which
+                # makes a 1.24x speedup read as a 1.6x slowdown.
+                n_out = body["meta_info"]["completion_tokens"]
+            except ValueError:
                 pass
+            except KeyError:
+                # A rejected request streams one chunk with an "error" object and
+                # no "text". Silently reporting zero tokens turns that into a
+                # plausible-looking measurement, which is worse than a crash.
+                raise SystemExit(f"server returned no text: {chunk[:400]}")
     total = time.time() - t0
-    # The first chunk carries the first token, so the decode phase covers the rest.
-    decoded_after_first = max(n_chunks - 1, 1)
+    # The first token arrives with the first chunk, so the decode phase spans the
+    # rest of them.
+    decoded_after_first = max(n_out - 1, 1)
     return {
         "n_prompt": len(ids),
         "n_new": n_new,
         "ttft_s": ttft,
         "total_s": total,
         "n_chunks": n_chunks,
+        "completion_tokens": n_out,
         "decode_ms_per_token": (total - ttft) / decoded_after_first * 1000,
         "text": text,
     }
@@ -206,7 +221,8 @@ def run_needle(args, tok):
     got = generate_streaming(args.host, args.port, ids, args.max_new)
     decode_ms = got["decode_ms_per_token"]
     print(f"  TTFT {got['ttft_s']:.1f} s ({len(ids) / got['ttft_s']:.0f} tok/s prefill)"
-          f"   total {got['total_s']:.1f} s over {got['n_chunks']} chunks"
+          f"   total {got['total_s']:.1f} s, {got['completion_tokens']} tokens in "
+          f"{got['n_chunks']} chunks"
           f"   -> decode {decode_ms:.1f} ms/token", flush=True)
 
     text = got["text"]
