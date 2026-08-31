@@ -81,6 +81,7 @@ source /mnt/workspace/y00359136/work/glm53_dev/env/env.sh   # 然后用 npy 代�
 | **[PLAN.md](./PLAN.md)** | 活的计划 + 全部核实结论 | 环境好了之后。§2 算子结论，§3 阶段计划 |
 | **[REGRESSION.md](./REGRESSION.md)** | 回归阶梯：改完跑什么，各级覆盖什么、抓不到什么 | **每次改动之后** |
 | **[SHARED_CHANGES.md](./SHARED_CHANGES.md)** | 共享路径改动台账：动了谁、影响谁、还欠什么回归 | 改到非 NPU 专属文件时 |
+| **[HANDOFF_MOE_OFFLOAD.md](./HANDOFF_MOE_OFFLOAD.md)** | **MoE offload 起步交接**：MoE 在哪接线（含仓库已有的 KTransformers 接入点和 offload server args）、单卡怎么跑、MoE 这块的七个坑 | **做 MoE offload 之前** |
 | `probe/` | 探测脚本 | `p0_5_ops.py` 验环境；`p0_6_*.py` 验算子 shape；`p3_4_lightning_indexer.py` 验 kpool 打分算子 |
 | `launch_dsv4_a3.sh.example` | DSv4-Flash 起服务脚本（A3 TP16/DP16+DeepEP） | 冒烟 / 精度回归 |
 | [`layer_check/`](./layer_check/) | 逐层与整层对拍、图捕获验证、统一计时口径。**双参考法的说明在 `ACCEPTANCE.md`，实现在 `tolerance.py`** | 改完要验数值时 |
