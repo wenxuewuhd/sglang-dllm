@@ -114,6 +114,35 @@ def _kt_npu_graph_host_forward(args) -> None:
     wrapper.run_pinned_forward_sync(hidden_states, stream_handle)
 
 
+def _kt_numa_nodes(threadpool_count: int):
+    """Which NUMA nodes the CPU-MoE subpools bind to, from ``KT_NUMA_NODES``.
+
+    kt-kernel otherwise maps subpool *i* to node *i*, so every server on a host lands
+    on node 0 first and they contend for one node's memory bandwidth while seven sit
+    idle. That is fine for a single deployment -- the target is a one-node container --
+    but it makes two concurrent servers on a development box measure each other.
+
+    ``KT_NUMA_NODES=4,5`` places the subpools explicitly. The length must match
+    ``--kt-threadpool-count``; kt-kernel raises otherwise, and we let it, because a
+    silently ignored placement is exactly the failure this exists to prevent.
+
+    ⚠ On a host whose nodes are not uniformly connected, the choice matters a great
+    deal: this A3 box pairs its nodes (0,1) (2,3) (4,5) (6,7) and a read across pairs
+    runs at 20 GB/s against 150 GB/s within one. Keep a server's subpools inside one
+    pair.
+    """
+    raw = os.environ.get("KT_NUMA_NODES", "").strip()
+    if not raw:
+        return None
+    nodes = [int(x) for x in raw.replace(",", " ").split()]
+    logger.info(
+        "KT CPU MoE subpools pinned to NUMA nodes %s (threadpool_count=%d)",
+        nodes,
+        threadpool_count,
+    )
+    return nodes
+
+
 def resolve_kt_weight_path_for_layer(weight_path: str, layer_idx: int) -> str:
     """Resolve a per-layer KT weight path without requiring a launcher patch."""
     if "{layer_idx}" in weight_path:
@@ -441,7 +470,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 gpu_experts_mask=self.gpu_experts_mask,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
-                numa_nodes=None,
+                numa_nodes=_kt_numa_nodes(self.kt_config.threadpool_count),
                 weight_path=resolve_kt_weight_path_for_layer(
                     self.kt_config.weight_path, self.kt_config.layer_idx
                 ),
