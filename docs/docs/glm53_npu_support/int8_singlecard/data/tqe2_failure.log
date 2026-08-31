@@ -1,0 +1,30 @@
+waiting for die 0 to come back to idle...
+die 0 free: 3133 MiB used
+log /mnt/workspace/y00359136/work/glm53_dev/env/run/glm_w8a8_tp1_tqe2_1029.log
+/mnt/workspace/y00359136/work/glm53_dev/env/run/ab_tp1.sh: line 40: 2754504 Killed                  nohup bash $RUN/launch_glm_w8a8_tp1.sh > $LOG 2>&1
+FAILED:
+    decode = capture_decode_graph(model_runner=model_runner)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/workspace/y00359136/work/glm53_dev/wt-int8-singlecard/python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py", line 478, in capture_decode_graph
+    runner = graph_runners[model_runner.device](model_runner)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/workspace/y00359136/work/glm53_dev/wt-int8-singlecard/python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py", line 103, in __init__
+    super().__init__(
+  File "/mnt/workspace/y00359136/work/glm53_dev/wt-int8-singlecard/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py", line 468, in __init__
+    raise Exception(
+Exception: Capture cuda graph failed: Do not support TASK_QUEUE_ENABLE = 2 during NPU graph capture, please export TASK_QUEUE_ENABLE=1/0.
+[ERROR] 2026-08-30-10:30:56 (PID:2754906, Device:0, RankID:-1) ERR00007 PTA feature not supported
+Possible solutions:
+1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)
+2. set --cuda-graph-max-bs-decode to a smaller value (e.g., 16)
+3. disable decode CUDA graph by --cuda-graph-backend-decode=disabled. (Not recommended. Huge performance loss)
+Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose 
+
+
+[2026-08-30 10:30:56] Received sigquit from a child process. It usually means the child failed.
+/mnt/workspace/y00359136/work/glm53_dev/wt-int8-singlecard/python/sglang/srt/managers/scheduler.py:-1: ResourceWarning: Unclosed socket <zmq.Socket(zmq.DEALER) at 0xfffb4bda11d0>
+[2026-08-30 10:30:56] kill_process_tree called: parent_pid=2754504, include_parent=True, pid=2754504
+/mnt/workspace/y00359136/work/glm53_dev/wt-int8-singlecard/python/sglang/srt/managers/scheduler.py:-1: ResourceWarning: Unclosed socket <zmq.Socket(zmq.PUSH) at 0xfffb4bda1240>
+/mnt/workspace/y00359136/work/glm53_dev/wt-int8-singlecard/python/sglang/srt/managers/scheduler.py:-1: ResourceWarning: Unclosed socket <zmq.Socket(zmq.PUSH) at 0xfffb4bda1a90>
+/mnt/workspace/y00359136/work/glm53_dev/wt-int8-singlecard/python/sglang/srt/managers/scheduler.py:-1: ResourceWarning: Unclosed socket <zmq.Socket(zmq.PULL) at 0xffffb69a4d70>
+/mnt/workspace/y00359136/work/glm53_dev/wt-int8-singlecard/python/sglang/srt/managers/scheduler.py:-1: ResourceWarning: Unclosed context <zmq.Context() at 0xfffb4bc2c050>
