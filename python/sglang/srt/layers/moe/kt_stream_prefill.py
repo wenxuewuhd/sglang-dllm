@@ -60,6 +60,9 @@ _NZ_CHUNK = int(
     os.environ.get("KT_PREFILL_STREAM_NZ_CHUNK", "64")
 )  # experts/chunk for ND->NZ
 _ACL_FORMAT_FRACTAL_NZ = 29
+# Experts per H2D + convert chunk on the GGUF-dedup path.  Same variable the AscendC wrapper
+# chunks convert_proj_blk by, so both stay in step.
+_H2D_CHUNK = int(os.environ.get("KT_MXFP4_NZ_CHUNK", "32") or "32")
 
 # DEPOOL (KT_MXFP4_DEPOOL=1): instead of a resident W8A8 NZ pool (~277GB for DeepSeek-V4), store the
 # MXFP4 codes+scale (~137GB, 4-bit) and convert MXFP4 -> W8A8-NZ on the fly per layer with the fused
@@ -1342,6 +1345,45 @@ def _streaming_fused_experts(
     )
 
 
+def _convert_blk_chunked(host13, host2, H, I, dev, slot13, slot2):
+    """H2D and convert the layer's GGUF blocks one expert chunk at a time.
+
+    The whole-layer staging copy this replaces put ~3.6 GiB of raw blocks on the die purely so
+    convert_proj_blk could slice them, on the same prefill that then has to find ~514 MiB of
+    convert transient -- an over-budget die fails there, silently falls back to hybrid, and (see
+    the commit-protocol note below) used to leave the resident set inconsistent.  A dim-0 slice
+    of the pinned ping-pong buffer is still contiguous and still pinned, so the DMA path is
+    unchanged; only the peak is, from ~3.6 GiB to ~3.6 * chunk/E.
+
+    Chunk size is KT_MXFP4_NZ_CHUNK, the same variable convert_proj_blk chunks its own loop by,
+    so the kernel sees exactly the launch shape it saw before.
+    """
+    convert = _mxfp4_convert_blk_fn()
+    if slot13 is None or slot2 is None:
+        # No reserved slot (reserve skipped or failed): the convert has to allocate its own
+        # full-size output anyway, so chunking the H2D saves nothing worth a second code path.
+        return convert(
+            host13.to(dev, non_blocking=True), host2.to(dev, non_blocking=True), H, I
+        )
+    E = host13.shape[0]
+    s13b = torch.empty((E, host13.shape[1]), dtype=torch.bfloat16, device=dev)
+    s2b = torch.empty((E, host2.shape[1]), dtype=torch.bfloat16, device=dev)
+    for c in range(0, E, _H2D_CHUNK):
+        ce = min(c + _H2D_CHUNK, E)
+        b13 = host13[c:ce].to(dev, non_blocking=True)
+        b2 = host2[c:ce].to(dev, non_blocking=True)
+        # slot13/slot2 are NZ; a dim-0 slice of an NZ tensor is format-safe (the same slicing
+        # convert_proj_blk already does on its own out_nz), so the chunk converts straight into
+        # its final place.
+        _, s13c, _, s2c = convert(
+            b13, b2, H, I, out_w13=slot13[c:ce], out_w2=slot2[c:ce]
+        )
+        s13b[c:ce] = s13c
+        s2b[c:ce] = s2c
+        del b13, b2, s13c, s2c
+    return slot13, s13b, slot2, s2b
+
+
 def _stream_layer_weights(layer_idx: int, dev):
     """Materialise this layer's full expert weights in the reused HBM slot.
 
@@ -1386,10 +1428,12 @@ def _stream_layer_weights(layer_idx: int, dev):
     else:
         _fill_stage(layer_idx)
         par = layer_idx % 2
+    if _KT_BLK_KERNEL:
+        return _convert_blk_chunked(
+            _MX_PP["w13"][par], _MX_PP["w2"][par], H, I, dev, slot13, slot2
+        )
     blk13 = _MX_PP["w13"][par].to(dev, non_blocking=True)
     blk2 = _MX_PP["w2"][par].to(dev, non_blocking=True)
-    if _KT_BLK_KERNEL:
-        return _mxfp4_convert_blk_fn()(blk13, blk2, H, I, out_w13=slot13, out_w2=slot2)
 
     def _di(d):
         E_, OUT_, n17 = d.shape
