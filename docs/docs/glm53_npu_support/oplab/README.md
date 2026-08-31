@@ -11,6 +11,345 @@
 
 ---
 
+## 00. 从零搭一个只跑这两个用例的环境
+
+**写给不在这台机器上、也没有我们那套 `env/env.sh` 的团队。**
+下面每一条命令都在一个**全新的 `python -m venv`** 里真敲过一遍（2026-08-31，
+本机 die 2），失败过的步骤也照实写在 §00.7。已有环境的人直接看 §1。
+
+### 00.1 硬性前提 vs「我们验过的版本」
+
+这两件事不一样，分开写：
+
+| | 是不是硬要求 | 说明 |
+|---|---|---|
+| **Ascend A3（`Ascend910_9362`）** | **硬**（对数字） | 用例本身在任何 torch_npu 能跑的卡上都能跑完，但 §0 的微秒数和 `baseline_*.txt` 是这张卡的。换卡数会变，见 §00.6 |
+| **CANN toolkit** | **硬** | 必须装好并 `source .../set_env.sh`。`npu_format_cast`（DSA 用例）会**懒加载 CANN 的 tbe**，缺了当场报 `error code 500001` |
+| **驱动 / HDK** | **硬**（下限） | 要能带起你装的 torch_npu |
+| **Python 3.12** | 软 | 只是因为我们手上的 wheel 是 `cp312`。换版本要换 wheel |
+| **`torch_npu.contrib.transfer_to_npu`** | **硬**（DSA） | 没有它 `allow_internal_format` 这个属性都不存在，INT8 权重转 NZ 变成静默 no-op，`o_proj` 103 µs 而不是 58 µs。见 §7 第 10 条 |
+
+**我们验过的具体版本**（不是要求，是「这套组合确实跑通了」）：
+
+| | 版本 |
+|---|---|
+| 卡 | `Ascend910_9362`（A3），单 die |
+| 驱动 | `Version=25.5.5`，`ascendhal 7.35.23`（`/usr/local/Ascend/driver/version.info`）；`npu-smi 25.5.5` |
+| CANN toolkit | **9.2.0**（`innerversion V100R001C11B134`），装在 `/home/developer/Ascend/cann-9.2.0` |
+| torch | **2.10.0**（`import torch` 打印 `2.10.0+cpu` —— **这是对的**，torch_npu 是 out-of-tree 后端，不要去找 `+npu` 的包） |
+| torch_npu | **2.10.0.post4** |
+| triton-ascend | **3.2.2**（它提供的 `triton` 模块自称 `3.2.0`） |
+| sgl_kernel_npu | **2026.6.1** |
+| Python | 3.12.9 |
+
+⚠ **不需要**的东西，实测确认：本章的 venv 里**没有** sglang 的 `env.sh`、
+**没有** `opp_custom/vendors/{customize,custom_transformer}`（那两套自定义 opp
+包是整网 INT8 里别的算子用的）、**没有** transformers / vllm / sglang 的服务侧依赖。
+两个用例在只 source 了 CANN `set_env.sh` 的环境里跑完。
+
+### 00.2 最小依赖集
+
+用例实际 import 的东西，逐条核对过：
+
+| 来源 | 提供什么 |
+|---|---|
+| `torch` + `torch_npu` | 设备、`torch.ops.npu.*` 的内置算子、`npu_format_cast`、NPUGraph |
+| `torch_npu.contrib.transfer_to_npu` | `torch.npu.config.allow_internal_format` 开关（**只有 DSA 用例 import**） |
+| `sgl_kernel_npu` | `torch.ops.npu.causal_conv1d`（KDA）、`torch.ops.npu.batch_matmul_transpose`（DSA） |
+| `triton`（triton-ascend） | 三个 Triton kernel 的编译执行 |
+| **4 个 sglang 模块** | 见下表 |
+
+| 用例 | sglang 模块 | 取什么 |
+|---|---|---|
+| KDA | `sglang/kernels/ops/attention/fla/fused_sigmoid_gating_recurrent.py` | `fused_sigmoid_gating_delta_rule_update` |
+| KDA | `sglang/kernels/ops/attention/fla/fused_norm_gate.py` | `layer_norm_gated_fwd` |
+| DSA | `sglang/srt/hardware_backend/npu/attention/kpool_indexer_npu.py` | `compress_pool_bf16`、`hadamard_transform_npu` |
+| DSA | `sglang/srt/layers/attention/dsa/kpool_fp8_index.py` | `expand_pooled_groups_to_topk`、`append_kpool_tail_to_topk` |
+
+### 00.3 ⚠ 那 4 个模块**不需要**整棵 sglang 树 —— 两条路都实测过
+
+**结论：把 4 个 `.py` 连同 13 个空 `__init__.py` 和一个 17 行的
+`sglang.srt.utils` 垫片拷出来就能跑，两个用例都跑通，算子清单与整棵树逐组相同。**
+
+两条路我都在同一个干净 venv 里跑到出数，不是推断：
+
+| | 额外要装的 pip 包 | 拷贝的文件 | KDA `--sections layer --reps 3` | DSA 同上 |
+|---|---|---|---|---|
+| **A. 整棵树上 `PYTHONPATH`** | **18 个顶层 + 传递依赖 = 30 个 dist-info，80 MB**（`orjson pybase64 requests urllib3 idna certifi packaging pillow starlette anyio torchvision==0.25.0 tqdm IPython traitlets pygments pydantic aiohttp msgspec`） | 0 | **283.06 µs/层** | **453.16 µs/层** |
+| **B. 只拷这 4 个模块** | **0** | 4 个 `.py`（3437 行）+ 13 个空 `__init__.py` + 17 行垫片，共 188 KB | **289.26 µs/层** | **452.16 µs/层** |
+
+四个数是**同一次会话里连着跑的 A/B**（§7 第 13 条：跨 run 比没有意义），
+同一张空闲 die。两条路的**算子清单逐组相同**（同样 9 组 / 99 组，同样的 shape
+和每层次数），µs 差落在噪声里 —— 拷贝不改变任何东西。
+
+**为什么 A 那么贵**：`sglang/__init__.py` 会跑起来，它 import
+`sglang.srt.utils.hf_transformers_patches` → `sglang.srt.utils.common`（`import orjson` 在第 82 行），
+再 import `sglang.lang.api` → `pydantic`。这 18 个包**没有一个**被那 4 个模块用到，
+纯粹是包 `__init__` 的过路费。
+
+**B 具体怎么拷。** 关键是**四个 `__init__.py` 必须换成空文件**——
+`sglang/`、`sglang/kernels/`、`sglang/kernels/ops/`、`sglang/kernels/ops/attention/`
+在真树里是有内容的（105 / 76 / 45 / 151 行），照拷就把整棵树的依赖又拉回来了；
+`sglang/srt/**` 那几层在真树里本来就没有 `__init__.py`（namespace package）。
+
+```bash
+SRC=<sglang-tree>/python          # 见 §00.4 的 commit
+DST=<你的目录>/standalone
+for d in sglang sglang/kernels sglang/kernels/ops sglang/kernels/ops/attention \
+         sglang/kernels/ops/attention/fla sglang/srt sglang/srt/utils \
+         sglang/srt/hardware_backend sglang/srt/hardware_backend/npu \
+         sglang/srt/hardware_backend/npu/attention \
+         sglang/srt/layers sglang/srt/layers/attention sglang/srt/layers/attention/dsa; do
+  mkdir -p "$DST/$d"; : > "$DST/$d/__init__.py"        # 空文件，不是拷贝
+done
+cp $SRC/sglang/kernels/ops/attention/fla/fused_sigmoid_gating_recurrent.py $DST/sglang/kernels/ops/attention/fla/
+cp $SRC/sglang/kernels/ops/attention/fla/fused_norm_gate.py                $DST/sglang/kernels/ops/attention/fla/
+cp $SRC/sglang/srt/hardware_backend/npu/attention/kpool_indexer_npu.py     $DST/sglang/srt/hardware_backend/npu/attention/
+cp $SRC/sglang/srt/layers/attention/dsa/kpool_fp8_index.py                 $DST/sglang/srt/layers/attention/dsa/
+```
+
+四个文件里**唯一**一处跨树的顶层 import 是 `fused_norm_gate.py` 的
+`from sglang.srt.utils import cdiv, cpu_has_amx_support, is_cpu, is_npu, next_power_of_2`。
+把 `$DST/sglang/srt/utils/__init__.py` 写成：
+
+```python
+"""Five-function stand-in for sglang.srt.utils, for the oplab benches only."""
+import os, platform, torch
+
+def is_npu() -> bool:
+    return hasattr(torch, "npu") and torch.npu.is_available()
+
+def is_cpu() -> bool:
+    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and \
+           platform.machine().lower() in ("x86_64", "aarch64", "arm64")
+
+def cpu_has_amx_support() -> bool:
+    return False          # AMX 是 Intel 的，这台 aarch64 上永远 False
+
+def cdiv(a: int, b: int) -> int:
+    return -(a // -b)
+
+def next_power_of_2(n: int):
+    return 1 << (n - 1).bit_length() if n > 0 else 1
+```
+
+`cdiv` / `next_power_of_2` 与 `srt/utils/common.py` 逐字相同；`is_npu` / `is_cpu`
+去掉了服务侧才有意义的分支；`cpu_has_amx_support` 只在 `is_cpu() and ...` 里被短路调用。
+
+另外三个文件里指向树深处的 import（`runtime_context`、`forward_context`、
+`sgl_kernel.fast_topk_v2`、`dp_attention` 等）**全都是函数体内的懒 import**，
+在这两个用例走的那 6 个函数里一个都不会执行 —— 这也是拷贝可行的原因。
+
+**如果你更愿意走 A（整棵树）**：树的版本是
+`wt-int8-singlecard` 分支 commit `6fb999ca3df1c0954b2db717b097b3b7704c94ae`
+（2026-08-31，`docs/docs/glm53_npu_support/oplab/` 就在这棵树里）。
+A 也确实跑通了，只是要多装 30 个包。
+
+### 00.4 一步一步装（我实际敲的命令，6 步）
+
+用的临时目录是 `/var/tmp/glm53/`（本机 `/mnt/workspace` 只剩 17 GB，别往那儿装）。
+
+```bash
+# 0) 三个 wheel 先备好。torch / torch_npu 见 §00.1 的版本；
+#    triton-ascend 和 sgl_kernel_npu 见 §00.7 第 1 条（都不在公开 PyPI 上）
+W=/mnt/workspace/y00359136/work/glm53_dev/env/wheels     # torch, torch_npu
+P=/mnt/workspace/y00359136/work/glm53_dev/env/pkg        # sgl_kernel_npu
+TA=/var/tmp/glm53/wheels                                 # triton_ascend
+IDX="-i https://repo.huaweicloud.com/repository/pypi/simple"
+DIR=/var/tmp/glm53/cleanenv/.venv-oplab
+
+# 1) 干净 venv（不要复用项目的 .venv-glm53）
+/opt/buildtools/python-3.12.9/bin/python3 -m venv $DIR
+$DIR/bin/pip install $IDX --upgrade pip
+
+# 2) torch + torch_npu，成对装，版本必须配套
+$DIR/bin/pip install $IDX \
+    $W/torch-2.10.0-cp312-cp312-manylinux_2_28_aarch64.whl \
+    $W/torch_npu-2.10.0.post4-cp312-cp312-manylinux_2_28_aarch64.whl
+
+# 3) triton-ascend —— 必须 --no-deps，理由见 §00.7 第 2 条
+$DIR/bin/pip install $IDX --no-deps \
+    $TA/triton_ascend-3.2.2-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl
+
+# 4) AOT 算子：causal_conv1d / batch_matmul_transpose
+$DIR/bin/pip install $IDX $P/sgl_kernel_npu-2026.6.1-cp312-cp312-linux_aarch64.whl
+
+# 5) 那些「没人声明但运行时要」的包，见 §00.7 第 3、4 条
+#    scipy 必须钉 1.13.1
+$DIR/bin/pip install $IDX 'numpy==1.26.4' 'scipy==1.13.1' pyyaml pybind11 decorator attrs psutil
+```
+
+装完 `pip list` 一共 **21 个包**（含 pip / setuptools），2.0 GB：
+
+```
+attrs 26.1.0        filelock 3.32.4   fsspec 2026.7.0   Jinja2 3.1.6
+MarkupSafe 3.0.3    mpmath 1.3.0      networkx 3.6.1    numpy 1.26.4
+decorator 5.3.1     psutil 7.2.2      pybind11 3.1.0    PyYAML 6.0.3
+scipy 1.13.1        sympy 1.14.0      typing_extensions 4.16.0
+sgl_kernel_npu 2026.6.1   torch 2.10.0   torch_npu 2.10.0.post4   triton_ascend 3.2.2
+pip 26.2.1          setuptools 84.0.0
+```
+
+跑用例的环境（**注意 `PYTHONPATH` 用 `:$PYTHONPATH` 追加**）：
+
+```bash
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+unset LD_PRELOAD                       # 系统预置的 libgomp 会干扰 torch_npu
+source /home/developer/Ascend/ascend-toolkit/set_env.sh    # 你的 CANN 路径
+export PATH=/var/tmp/glm53/cleanenv/.venv-oplab/bin:$PATH
+export PYTHONPATH=/var/tmp/glm53/standalone:$PYTHONPATH     # §00.3 的 B 路
+                                       # 走 A 路就换成 <tree>/python
+mkdir -p /var/tmp/glm53/oplab-run && cd /var/tmp/glm53/oplab-run   # 见 §7 第 14 条
+export ASCEND_RT_VISIBLE_DEVICES=2     # 换成你那张空闲的 die
+```
+
+⚠⚠ **`PYTHONPATH` 只能追加，不能覆盖。** `set_env.sh` 往里塞了
+`.../cann-9.2.0/python/site-packages` 和 `.../opp/built-in/op_impl/ai_core/tbe`，
+写成 `PYTHONPATH=<tree>/python` 会把它们挤掉，然后 **在算子编译时**才炸出
+`error code 500001` + `No module named 'tbe'` —— 错误信息里没有一个字提到
+`PYTHONPATH`。README §1 也记了这一条。
+
+### 00.5 验证清单
+
+**（1）import 能通** —— 30 秒，不碰卡：
+
+```bash
+python -c "
+import torch, torch_npu, sgl_kernel_npu, triton
+print(torch.__version__, torch_npu.__version__, triton.__version__)
+print(hasattr(torch.ops.npu,'causal_conv1d'), hasattr(torch.ops.npu,'batch_matmul_transpose'))
+from sglang.kernels.ops.attention.fla.fused_norm_gate import layer_norm_gated_fwd
+from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import fused_sigmoid_gating_delta_rule_update
+from sglang.srt.hardware_backend.npu.attention.kpool_indexer_npu import compress_pool_bf16, hadamard_transform_npu
+from sglang.srt.layers.attention.dsa.kpool_fp8_index import append_kpool_tail_to_topk, expand_pooled_groups_to_topk
+print('ALL FOUR OK')"
+```
+
+期望：`2.10.0+cpu 2.10.0.post4 3.2.0` / `True True` / `ALL FOUR OK`。
+
+**（2）最小 smoke** —— 各 1–2 分钟：
+
+```bash
+python bench_kda_layer.py --sections layer --reps 3
+python bench_dsa_layer.py --sections layer --reps 3
+```
+
+⚠ KDA 能过而 DSA 炸 `error code 500001`，是**正常的分辨点**：只有 DSA 用
+`npu_format_cast`，它才会去懒加载 CANN 的 tbe。看 §00.7 第 3 条。
+
+**（3）跑满 30 次，看数** ——`--sections layer` 不带 `--reps`：
+
+| | 干净空闲 die 上应该落在 | 本次干净 venv 实测（die 2，30 reps） |
+|---|---|---|
+| KDA 单层 p50 | **285–300 µs** | **290.94 µs**（×34 = 9.892 ms，−5.0%） |
+| DSA 单层 p50 | **440–470 µs** | **452.81 µs**（×11 = 4.981 ms，−7.7%） |
+
+单个算子的锚点（同一次运行）：`MatMulV2 "1,4096;24896,4096"` 166.7 µs、
+`MatMulV2 "1,8192;4096,8192"` 55.1 µs、`SparseFlashAttention` ~32.6 µs。
+
+**（4）⚠ 真正的判据：`regress_against_network.py` 的清单检查。**
+时间只是旁证，清单才是判据（理由见 §5.2、§7 第 15 条）：
+
+```bash
+PK=$(ls -dt /var/tmp/glm53/oplab/kda/layer/*ascend_pt | head -1)
+PD=$(ls -dt /var/tmp/glm53/oplab/dsa/layer/*ascend_pt | head -1)
+python regress_against_network.py --family KDA --profile "$PK" --steps 30
+python regress_against_network.py --family DSA --profile "$PD" --steps 30
+```
+
+在干净 venv 里实测通过，**和 §0 记录的状态逐条一致**：
+
+| | 组数 | 缺 | 多 | TOTAL ref/got |
+|---|---|---|---|---|
+| KDA | 9 组全部对上（op、shape、每层次数） | **0** | **0** | 306.1 / 291.1 = 0.95 |
+| DSA | — | **1**（`Cast "1,1,1"`，1.3 µs） | **6**（`ClipByValueV2 "1;;"`、`FloorMod "1;1"`、`IndexCheck "2;1;1"`、`BroadcastTo ";1"`、`Sub "1;1"`、`Equal "1;"`） | 490.4 / 453.1 = 0.92 |
+
+**这两行就是「环境搭对了」的判据。** 缺/多的条目数变了 —— 尤其是 KDA 不再是
+0/0 —— 说明环境有问题（多半是某个 kernel 没编出来，或者 NZ 没生效），
+而不是卡慢。TOTAL 那一列的比值变了只说明卡不同，见 §00.6。
+
+### 00.6 换机器之后：哪些数会变，哪些不会
+
+| | 跟机器走吗 | 说明 |
+|---|---|---|
+| **绝对微秒数**（`p50`、`×N 层`、`baseline_*.txt`） | **会变** | 跟卡型号、CANN / 驱动版本、die 是否空闲都有关。§7 第 9 条：die 被占会整体膨胀 ~1.7× 且不报错；§7 第 13 条：**同一张空闲 die 跨 run 单个小算子能差 34%** |
+| **算子清单**（哪些 op、什么输入 shape、每层几次） | **不变** | 这是模型和这段代码决定的，不是硬件。`regress_against_network.py` 量的就是这个 |
+| **kernel 总个数**（KDA 9/层、DSA 99/层） | **不变** | 同上 |
+| **`p50/ref` 那一列的比值** | **会变** | 分母 `ref` 是我们这台机器的整网实测 |
+
+⚠⚠ **所以：`reference_inventory_cfgI.json` 换机器后仍然是「清单」的标靶，
+但不再是「时间」的标靶。** 别把我们的 289 µs / 445 µs 当成你们机器上的目标。
+换机器后正确的做法是：
+
+1. 先用清单检查确认**跑的是同一件事**（KDA 0 缺 0 多，DSA 1 缺 6 多）；
+2. 然后在**你们自己的机器上**跑一次，把那次的数当作你们的基线；
+3. 优化的判据是**同一次 run 里的 A/B**，不是「今天的数比 README 里的数小」
+   （§7 第 13 条）。
+
+`--ref-seq` / `--context-len` 这些参数**不要动**：`p50/ref` 里的 `ref` 是
+按 cfgI 的 shape 采的，参数一动清单就对不上了（§7 第 9 条第一版误报就是这么来的）。
+
+### 00.7 装的时候实际踩到的 5 个坑
+
+按踩到的顺序，都是在干净 venv 里真炸过的：
+
+1. **`triton-ascend` 和 `sgl_kernel_npu` 都不在公开 PyPI 上。**
+   实测 `pip index versions triton-ascend` 在 pypi.org、
+   `repo.huaweicloud.com`、`mirrors.aliyun.com`、`pypi.tuna.tsinghua.edu.cn`
+   四个源上**全都是 "No matching distribution found"**。必须自己拿 wheel
+   （triton-ascend 见 `https://gitcode.com/Ascend/triton-ascend/`；
+   `sgl_kernel_npu` 是昇腾侧发的包，本机在 `env/pkg/` 下）。
+   ⚠ 另外：机器上散落的 `/tmp/pip-unpack-*/triton_ascend-*.whl` **全是断掉的
+   半截下载**（1 MB / 3 MB / 17 MB / 23 MB / 28 MB，完整的是 **270 MB**），
+   `pip` 只说一句 `Wheel ... is invalid`。拿到 wheel 先 `python -c
+   "import zipfile;zipfile.ZipFile('...')"` 验一下。
+
+2. **`pip install triton_ascend...whl`（不带 `--no-deps`）会把自己装坏。**
+   它的 metadata 写着 `Requires-Dist: triton==3.5.0`，pip 就从 PyPI 装了上游
+   Triton，把 `site-packages/triton/` 覆盖掉，报
+   `ModuleNotFoundError: No module named 'triton._C.libtriton.ascend'`。
+   **只能 `--no-deps`**，然后手工补 `numpy` / `pybind11` /（下面的）`scipy==1.13.1`。
+   同理，`pip install torchvision` 会顺手把 torch 升到 2.13.0，torch_npu 立刻变成
+   `undefined symbol: _ZN5torch8autograd10deleteNodeEPNS0_4NodeE` ——
+   **凡是可能碰 torch 的包都要 `--no-deps` 或钉版本**（`torchvision==0.25.0`）。
+
+3. **DSA 用例炸 `error code 500001`，真因藏在报错的第 20 行。**
+   ```
+   RuntimeError: SetPrecisionMode:.../LazyInitAclops.cpp:223 ... error code is 500001
+   ...
+   Environment_Error_Import_Python_Module_Failed(EC0010): Failed to import Python
+   module ModuleNotFoundError: No module named 'decorator'.
+   ```
+   `npu_format_cast` 会**懒加载 CANN 的 tbe**，而 tbe 是一堆 Python，缺哪个包就
+   在这里炸。实测按顺序缺了 **`decorator` → `scipy` → `attrs` → `psutil`** 四个，
+   每次只报一个，得装一个跑一次。
+   **KDA 用例完全不受影响**（它不 `npu_format_cast`），所以「KDA 过、DSA 炸」
+   不是用例的问题，是这四个包没装。
+   ⚠ 这和 §1 里那条 `No module named 'tbe'` 是**同一个坑的不同外衣** ——
+   `500001` 只说明「tbe 起不来」，具体原因每次不同，**一定要往下读到 EC0010 那行**。
+
+4. **`pip install scipy` 会装上 1.18.1，然后 CANN 报 `module 'numpy' has no
+   attribute 'long'`。** 新 scipy 要 `numpy>=2.0`，而 torch_npu / CANN 这套要
+   `numpy 1.26.4`。**必须钉 `scipy==1.13.1`**（也正是 triton-ascend 自己声明的版本）。
+   报错出现在 CANN 的 tbe 初始化里，跟 scipy 三个字毫无关系。
+
+5. **`torch_npu` 2.10.0.post4 有两个没声明的运行时依赖。**
+   `import torch_npu` 直接 `ModuleNotFoundError: No module named 'yaml'`
+   （`torch_npu/npu/_memory_viz.py:10`），而且被包成
+   `RuntimeError: Failed to load the backend extension: torch_npu`；
+   triton-ascend 那边同样缺 `pybind11`
+   （`triton/backends/ascend/utils.py:36`）。装 `pyyaml` + `pybind11` 解决。
+
+另外两条不是坑但会吓人：`import torch` 打印 **`2.10.0+cpu`** 是正常的；
+profiler 每次都会打一行 `Failed to get acl to npu flow events`，
+数照样出（用例读的是 `kernel_details.csv`）。
+
+清理：CANN 每次跑都会在 **cwd** 掉一个 `fusion_result.json`（仓库 `.gitignore`
+已忽略），异常时还会掉几百 MB 的 `extra-info/data-dump/`，权限 `-r--------`，
+`ls` 不留神就漏。**在 `/var/tmp/` 下建个空目录 `cd` 进去再跑**，详见 §7 第 14 条。
+
+---
+
 ## 0. 一句话结论
 
 | 层族 | 层数 | 用例单层 p50 | ×层数 | 整网实测 | 偏差 |
