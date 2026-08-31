@@ -43,6 +43,11 @@ logger = logging.getLogger(__name__)
 
 _KT_PREFILL_STREAM = os.environ.get("KT_PREFILL_STREAM", "") == "1"
 _T = int(os.environ.get("KT_PREFILL_STREAM_THRESHOLD", "512"))
+# KT_STREAM_STRICT=1 (testing): re-raise instead of falling back to the hybrid path when the
+# streaming prefill fails.  The production default swallows every failure so a serving process
+# never dies on a streaming bug -- which also means a permanently-broken streaming path shows up
+# only as a log line and a slow server.  With this set, a broken path fails loudly.
+_KT_STREAM_STRICT = os.environ.get("KT_STREAM_STRICT", "") == "1"
 # KT_HOT_TAIL_TOKENS=N (opt-in; default 0 = off = whole-prompt selection): pick the decode resident
 # hot pool from only the LAST N prompt tokens' routing instead of the whole prefill.  Decode
 # continues from the prompt tail, so the tail's expert distribution predicts decode routing better
@@ -1425,11 +1430,18 @@ def _streaming_forward(layer_idx, x, topk_output, top_k, num_experts) -> torch.T
             try:
                 _apply_resident_layer_depool(layer_idx, topk_output, w13, s13b, w2, s2b)
             except Exception as e:
+                # NOT "static set kept": earlier layers in this pass may already have had their
+                # resident weights rewritten.  Commit their masks before falling back, or they
+                # silently compute the wrong experts.  See the commit-protocol note above.
                 logger.warning(
-                    "[KT_STREAM] inline resident L%d failed (%s); static set kept",
+                    "[KT_STREAM] inline resident L%d failed (%s); this layer keeps the "
+                    "static set, already-written layers get committed",
                     layer_idx,
                     repr(e)[:140],
                 )
+                _abort_resident_commit(f"inline resident L{layer_idx}: {repr(e)[:80]}")
+                if _KT_STREAM_STRICT:
+                    raise
         else:
             moe_layers = _moe_layers()
             if layer_idx == moe_layers[0]:
@@ -1488,7 +1500,126 @@ def _set_resident_masks(wrap, top_cpu, K, E):
         wrap.wrapper.gpu_experts_mask.copy_(new_mask)
 
 
-_RES_PEND = {}  # L -> (wrap, top_device, counts_device): deferred mask updates
+# ---------------------------------------------------------------------------
+#  Resident-set commit protocol (silent-correctness hazard, see below)
+# ---------------------------------------------------------------------------
+# The depool path rewrites a layer's resident WEIGHTS the moment that layer is streamed, but the
+# matching MASKS (gpu_experts_mask / logical_to_gpu_index / kt-kernel's pinned C++ mask) used to be
+# deferred to the last MoE layer to avoid a per-layer host sync.  Those two facts together are a
+# silent wrong-answer bug: if the streaming pass ABORTS at layer L (a convert OOM is exactly what
+# an over-budget resident count produces), every layer < L holds expert ``top[i]``'s weights in
+# slot ``i`` while its mask still says slot ``i`` is expert ``i``.  Slot ``i`` then computes the
+# wrong expert's function, expert ``i`` is computed nowhere, and NOTHING raises -- the handler even
+# logs "static set kept", which for those layers is false.
+#
+# The fix is that the masks are a COMMIT of the weight writes, and every exit from the streaming
+# pass -- normal end, per-layer failure, or the blanket fallback in maybe_streaming_forward -- goes
+# through :func:`_flush_resident_masks`.  Flushing on abort is not a repair hack: the resident set
+# is per layer (each wrapper owns its own mask), so committing the already-written layers and
+# leaving the untouched ones on the static prefix set is a perfectly consistent state.  Restoring
+# prefix weights instead would need a second MXFP4 convert on the very path that just ran out of
+# memory.
+_RES_PEND = {}  # L -> (wrap, top_device, counts_device): WRITTEN weights, UNCOMMITTED masks
+_RES_WRITTEN = {}  # L -> top (device tensor): resident set the layer's WEIGHTS currently hold
+_RES_COMMITTED = {}  # L -> tuple(top): resident set the layer's MASKS currently claim
+_RES_TORN = set()  # layers whose weight write itself failed part way: unrepairable
+
+
+def _resident_inconsistent_layers():
+    """Layers whose resident weights and masks disagree -- i.e. layers computing wrong experts.
+
+    Empty is the only correct state outside a streaming pass.  ``_RES_WRITTEN`` is only ever
+    populated by the depool inline path; layers never touched by it are absent from both dicts
+    and are consistent by construction (static prefix weights + static prefix masks).
+    """
+    # ``_RES_WRITTEN`` holds device tensors so the write path pays no host sync; the D2H
+    # happens here, and here runs once per pass (flush) or on an abort, never per layer.
+    bad = [
+        L
+        for L, top in _RES_WRITTEN.items()
+        if _RES_COMMITTED.get(L) != tuple(top.tolist())
+    ]
+    return sorted(set(bad) | _RES_TORN)
+
+
+def _assert_resident_consistent(where=""):
+    """Assert the invariant the whole commit protocol exists to keep.
+
+    Raises rather than logging: a violation means the model is silently computing the wrong
+    experts, which is strictly worse than a crash.
+    """
+    bad = _resident_inconsistent_layers()
+    if bad:
+        raise AssertionError(
+            f"[KT_STREAM] resident weights/masks inconsistent at {where}: layers {bad[:16]}"
+            f"{'...' if len(bad) > 16 else ''} hold hot-expert weights under a stale mask"
+            f"{f'; torn writes at {sorted(_RES_TORN)}' if _RES_TORN else ''}"
+        )
+
+
+def _flush_resident_masks(reason: str = "end of pass"):
+    """Commit every pending layer's mask, making its weights and routing agree again.
+
+    Called at the last MoE layer (the normal path) and from every abort path.  Returns the
+    number of layers committed.  ``_RES_TORN`` is unrepairable by definition -- a partially
+    written layer has no resident set that describes it -- so it raises.
+    """
+    if _RES_TORN:
+        raise RuntimeError(
+            f"[KT_STREAM] resident weight write TORN at layers {sorted(_RES_TORN)} "
+            f"({reason}); the slots hold a mix of two expert sets and no mask describes them. "
+            "Refusing to continue with silently wrong experts."
+        )
+    if not _RES_PEND:
+        return 0
+    E = _get_cfg()[0]
+    share_sum = 0.0
+    n = 0
+    for _LL, (wr, tp, cnt) in sorted(_RES_PEND.items()):
+        top_cpu = tp.cpu()
+        _set_resident_masks(wr, top_cpu, int(wr.num_gpu_experts), E)
+        _RES_COMMITTED[_LL] = tuple(top_cpu.tolist())
+        share_sum += float(cnt[tp].sum().item()) / max(float(cnt.sum().item()), 1.0)
+        n += 1
+    _RES_PEND.clear()
+    logger.info(
+        "[KT_STREAM] inline resident: top-K x %d layers committed (%s), share=%.3f",
+        n,
+        reason,
+        share_sum / max(n, 1),
+    )
+    _assert_resident_consistent("flush")
+    return n
+
+
+def _abort_resident_commit(reason: str):
+    """Abort path: commit whatever was already written so nothing is left inconsistent.
+
+    Deliberately not silent -- a partial streaming pass means the layers past the abort point
+    keep the static prefix set while the ones before it got this prompt's hot set, which is
+    correct but not what was asked for.
+    """
+    try:
+        n = _flush_resident_masks(f"partial pass aborted: {reason}")
+    except RuntimeError:
+        raise
+    except Exception as e:  # committing must not itself hide the original failure
+        logger.error(
+            "[KT_STREAM] resident mask commit FAILED after %s (%s); layers %s may compute "
+            "the wrong experts",
+            reason,
+            repr(e)[:160],
+            _resident_inconsistent_layers()[:16],
+        )
+        raise
+    if n:
+        logger.warning(
+            "[KT_STREAM] streaming aborted after %d layer(s) had their resident weights "
+            "rewritten; their masks were committed so routing stays correct (%s)",
+            n,
+            reason,
+        )
+    return n
 
 
 def _apply_resident_layer_depool(L, topk_output, w13, s13b, w2, s2b):
@@ -1510,7 +1641,13 @@ def _apply_resident_layer_depool(L, topk_output, w13, s13b, w2, s2b):
     E, H, I, num_layers = _get_cfg()
     moe_layers = _moe_layers()
     if L == moe_layers[0]:
-        _RES_PEND.clear()
+        # A new pass must not start on top of an uncommitted one: that would mean a previous
+        # pass ended without going through any of the flush paths below, i.e. the very bug this
+        # protocol exists to prevent.  Commit it (correct, just not this prompt's hot set)
+        # rather than silently piling a second set of weight writes on a stale mask.
+        if _RES_PEND:
+            _abort_resident_commit("previous pass left uncommitted layers")
+        _assert_resident_consistent("start of streaming pass")
     counts = torch.bincount(
         _hist_ids(topk_output.topk_ids).to(torch.int64), minlength=E
     )[:E]
@@ -1521,24 +1658,23 @@ def _apply_resident_layer_depool(L, topk_output, w13, s13b, w2, s2b):
     # 紧邻的 scale 是 ND, 所以 scale 写进去了; mask/l2g 也写进去了。结果是槽位 i 用专家 i 的
     # 权重配专家 top[i] 的 scale, 而 CPU 又因 mask 认为 top[i] 已常驻而跳过它。
     # Tensor.copy_ 是格式感知的, 原地写 Parameter 自己的 storage(decode NPU graph 捕获的正是它)。
-    layer.w13_weight.data.copy_(torch.index_select(w13, 0, top))
-    layer.w2_weight.data.copy_(torch.index_select(w2, 0, top))
-    layer.w13_weight_scale.data.copy_(torch.index_select(s13b, 0, top))
-    layer.w2_weight_scale.data.copy_(torch.index_select(s2b, 0, top))
+    #
+    # Order matters for the commit protocol: every allocating op (the four index_selects, which
+    # are what an over-budget resident count makes fail) happens BEFORE the first byte of the
+    # resident params is overwritten, so an OOM here leaves this layer untouched and consistent.
+    g13, g2 = torch.index_select(w13, 0, top), torch.index_select(w2, 0, top)
+    gs13, gs2 = torch.index_select(s13b, 0, top), torch.index_select(s2b, 0, top)
+    # --- commit point: from here the layer's weights no longer match its mask ---
     _RES_PEND[L] = (wrap, top, counts)
+    _RES_WRITTEN[L] = top  # device tensor; materialised only by the (per-pass) consistency check
+    _RES_TORN.add(L)  # cleared once all four writes land; a raise in between is unrepairable
+    layer.w13_weight.data.copy_(g13)
+    layer.w2_weight.data.copy_(g2)
+    layer.w13_weight_scale.data.copy_(gs13)
+    layer.w2_weight_scale.data.copy_(gs2)
+    _RES_TORN.discard(L)
     if L == moe_layers[-1]:
-        share_sum = 0.0
-        for _LL, (wr, tp, cnt) in sorted(_RES_PEND.items()):
-            _set_resident_masks(wr, tp.cpu(), K, E)
-            share_sum += float(cnt[tp].sum().item()) / max(float(cnt.sum().item()), 1.0)
-        n = len(_RES_PEND)
-        _RES_PEND.clear()
-        logger.info(
-            "[KT_STREAM] inline resident: top-%d x %d layers folded into prefill, share=%.3f",
-            K,
-            n,
-            share_sum / max(n, 1),
-        )
+        _flush_resident_masks("end of pass")
 
 
 def _apply_dynamic_residency() -> None:
@@ -1725,4 +1861,11 @@ def maybe_streaming_forward(
         logger.warning(
             "[KT_STREAM] streaming failed (%s) -> hybrid fallback", repr(e)[:160]
         )
+        # The failure may have landed AFTER earlier layers rewrote their resident weights (a
+        # convert OOM at layer L is the expected shape of this).  Those layers hold hot-expert
+        # weights under a stale prefix mask until their masks are committed, so committing is
+        # not optional here -- it is the difference between a slower answer and a wrong one.
+        _abort_resident_commit(f"streaming forward: {repr(e)[:80]}")
+        if _KT_STREAM_STRICT:
+            raise
         return None
