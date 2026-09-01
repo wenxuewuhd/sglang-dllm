@@ -464,6 +464,13 @@ def _first_moe_layer():
 
 
 def _last_moe_layer():
+    """The last layer that runs a KT MoE, per the load-time registry.
+
+    FORWARD TIME ONLY, like everything else derived from _moe_layers(). During model load
+    the registry is still being filled one layer at a time, so this returns whichever
+    layer is being processed right now -- which makes `layer_idx == _last_moe_layer()`
+    true on every layer, not on the last one. Load-time triggers use num_layers - 1.
+    """
     ls = _moe_layers()
     return ls[-1] if ls else None
 
@@ -1204,26 +1211,35 @@ def maybe_reserve_slot(wrapper, dev, layer=None) -> None:
                 if not _BG_MX["started"]:
                     _BG_MX["started"] = True
                     _start_bg_reads_mxfp4(E, H, I, num_layers)
-                # The LAST MoE LAYER, not the last layer index. These are the same
-                # number on GLM-5.3-Flash only because its final layer happens to carry
-                # routed experts; on a checkpoint with trailing dense layers, num_layers-1
-                # is never a KT layer and the background reads would never be drained.
-                # _last_moe_layer() exists for exactly this and was going unused -- the
-                # same class of over-reach ce190931c1 fixed in the layer range itself.
-                if wrapper.kt_config.layer_idx == _last_moe_layer():
+                # NOTE: num_layers - 1, and NOT _last_moe_layer(), even though that reads
+                # like the more careful choice. _moe_layers() is derived from _REGISTRY,
+                # which this very function fills one layer at a time a few lines above --
+                # so during layer L's call the registry holds only 3..L and
+                # _last_moe_layer() returns L itself. The comparison would then be true on
+                # EVERY layer and drain at the first one, throwing away the whole point of
+                # starting these reads in the background.
+                #
+                # The registry-derived helpers are forward-time tools; every other caller
+                # of _moe_layers() runs after load, when it is complete.
+                #
+                # The residual limitation is real but hypothetical here: on a checkpoint
+                # whose last layer is dense, num_layers-1 is not a KT layer and this never
+                # fires. GLM-5.3-Flash has num_hidden_layers=45 with MoE on 3..44, so the
+                # trigger is 44 either way. Fixing that properly needs the dense-layer
+                # range from config, not the registry.
+                if wrapper.kt_config.layer_idx == num_layers - 1:
                     _finish_bg_build_mxfp4()
             return
         if E and H and I:
             reserve_slot(E, H, I, dev)
         # Overlap the pool build's O_DIRECT reads with the rest of model load: start the
         # background reads on the FIRST process_weights call (host-only, while the remaining
-        # weights load), then drain + NZ-cast on the LAST MoE layer (see above: not
-        # num_layers-1, which is only the same number by GLM's good luck).
+        # weights load), then drain + NZ-cast on the LAST call.
         if E and H and I and num_layers and not _POOL_BUILT:
             if not _BG["started"]:
                 _BG["started"] = True
                 _start_bg_reads(E, H, I, num_layers)
-            if wrapper.kt_config.layer_idx == _last_moe_layer():
+            if wrapper.kt_config.layer_idx == num_layers - 1:  # see the note above
                 _finish_bg_build(dev)
                 reserve_slot(E, H, I, dev)
     except Exception as e:
