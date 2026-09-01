@@ -26,6 +26,43 @@ Entry points:
   pre-dispatch hook (CPU submit + expert-id masking) must not run for a streamed
   layer.  A dispatcher hook cannot express that: hooks transform the dispatch
   inputs, they cannot short-circuit the dispatch.
+
+Environment variables.  All of them are read AT IMPORT and frozen into module globals, so
+setting one after the server is up does nothing -- and neither does setting one in a test
+after this module has been imported.  Vendor-prefixed (``KT_``) rather than routed through
+``srt/environ.py`` because they configure ktransformers, not sglang.
+
+===============================  =========  =====================================
+name                             default    effect
+===============================  =========  =====================================
+KT_PREFILL_STREAM                off        master switch for this module
+KT_PREFILL_STREAM_THRESHOLD      512        min chunk tokens to take the streaming path
+KT_PREFILL_STREAM_CKPT           (none)     W8A8 checkpoint dir; required by that reader
+KT_STREAM_STRICT                 off        re-raise instead of falling back to hybrid
+KT_STREAM_WARMUP                 0          warm-up passes before the first real prefill
+KT_DYNAMIC_RESIDENT              off        swap the resident set for this prompt's hot-K
+KT_HOT_TAIL_TOKENS               0          count hot experts over the last N prompt
+                                            tokens only (0 = the whole prefill)
+KT_MXFP4_DEPOOL                  off        convert MXFP4 on device instead of reading W8A8
+KT_MXFP4_CKPT                    (none)     MXFP4 checkpoint dir; required by depool
+KT_MXFP4_OP_DIR                  (none)     custom-op vendor dir; required by depool
+KT_MXFP4_PREFETCH                **on**     background O_DIRECT pool build during load
+KT_MXFP4_BLK_KERNEL              **on**     use the blocked convert kernel
+KT_MXFP4_POOL_NO_PIN             off        do not pin the host pool (pinned by default)
+KT_PREFILL_STREAM_NZ_CHUNK       64         experts per ND->NZ cast chunk (W8A8 reader)
+KT_MXFP4_NZ_CHUNK                32         experts per H2D chunk (depool reader)
+KT_MXFP4_COPY_THREADS            32         host copy threads for the pool build
+KT_MXFP4_GGUF_DEDUP              off        read layers from the CPU MoE's GGUF, no pool
+KT_GGUF_TEMPLATE                 (none)     per-layer GGUF path; required by dedup
+KT_GGUF_PY_DIR                   (none)     fallback location for the gguf reader
+===============================  =========  =====================================
+
+The two marked **on** default to enabled, which makes them the ones most likely to
+surprise: a reader who has never heard of them is already using them.
+
+Note the crossed names in the two chunk sizes: the constant ``_NZ_CHUNK`` reads
+``KT_PREFILL_STREAM_NZ_CHUNK`` while ``_H2D_CHUNK`` reads ``KT_MXFP4_NZ_CHUNK``.  They are
+different knobs on different readers and neither name predicts the other.
 """
 
 import functools
@@ -60,6 +97,9 @@ _NZ_CHUNK = int(
     os.environ.get("KT_PREFILL_STREAM_NZ_CHUNK", "64")
 )  # experts/chunk for ND->NZ
 _ACL_FORMAT_FRACTAL_NZ = 29
+_ACL_FORMAT_ND = (
+    2  # the plain row-major format; the NZ constant had a name, this did not
+)
 # Experts per H2D + convert chunk on the GGUF-dedup path.  Same variable the AscendC wrapper
 # chunks convert_proj_blk by, so both stay in step.
 _H2D_CHUNK = int(os.environ.get("KT_MXFP4_NZ_CHUNK", "32") or "32")
@@ -93,15 +133,11 @@ _MXFP4_CKPT = os.environ.get("KT_MXFP4_CKPT", "")
 _KT_GGUF_DEDUP = os.environ.get("KT_MXFP4_GGUF_DEDUP", "") == "1"
 _GGUF_TMPL = os.environ.get("KT_GGUF_TEMPLATE", "")
 _GGUF_READERS: dict = {}  # layer_idx -> GGUFReader (memmap)
-_GGUF_BLOCKS: dict = (
-    {}
-)  # layer_idx -> (gate, up, down) np memmap views [E,N,nb*17] block_mxfp4
+_GGUF_BLOCKS: dict = {}  # layer_idx -> (gate, up, down) np memmap views [E,N,nb*17] block_mxfp4
 
 _MXFP4_POOL: dict = {}  # layer_idx -> (c13, s13, c2, s2) pinned host MXFP4 (codes+e8m0)
 _MXFP4_POOL_BUILT = False  # set once the pool is fully populated
-_MXSTAGE: dict = (
-    {}
-)  # shape -> reused pinned [K,...] staging buf for the dyn-resident switch
+_MXSTAGE: dict = {}  # shape -> reused pinned [K,...] staging buf for the dyn-resident switch
 _MXIDX = None  # cached weight_map of the MXFP4 checkpoint index
 
 # ``npu_moe_init_routing_v2(expert_tokens_num_type=1)`` returns the per-expert token COUNT, which is
@@ -361,9 +397,7 @@ _REGISTRY: dict = {}  # layer_idx -> (layer_module, ktep_wrapper)
 # NZ-cast IN PLACE (chunked: pinned ND -> HBM -> transpose + format_cast -> bytes back into the SAME
 # pinned region; ND[E,A,B] and NZ[E,B,A] have identical byte counts).  The whole build is spread
 # inside the model-load loop, so the extra peak DDR is zero -- the pinned pool IS the product.
-_CFG: dict = (
-    {}
-)  # E, H, I, num_layers (from the wrapper, or from the checkpoint config.json)
+_CFG: dict = {}  # E, H, I, num_layers (from the wrapper, or from the checkpoint config.json)
 _LBUF: dict = {}  # layer -> {flat13, flat2 (pinned int8), s13, s2 (cpu fp32), count}
 
 
@@ -625,9 +659,7 @@ def _read_layer_odirect(L, E, H, I, scratch) -> None:
     for fn, items in byfile.items():
         path = os.path.join(_ckpt_dir(), fn)
         hdr, base = _shard_header(path)
-        offs = {
-            (e, p): hdr[nm.weight_key(L, e, p)]["data_offsets"] for e, p in items
-        }
+        offs = {(e, p): hdr[nm.weight_key(L, e, p)]["data_offsets"] for e, p in items}
         lo = min(o[0] for o in offs.values())
         hi = max(o[1] for o in offs.values())
         region = _odirect_region(path, base, lo, hi, scratch)
@@ -771,10 +803,24 @@ def _finalize_layer(L: int, dev) -> None:
     )
 
 
+_IS_PREFILL_PROBE_FAILED = False
+
+
 def _is_prefill() -> bool:
+    # Fails OPEN: if we cannot tell, assume prefill, because taking the streaming path
+    # during graph capture is the failure we can still detect downstream, whereas
+    # skipping it silently is not. Logged once -- this used to swallow with no trace at
+    # all, so a torch_npu that stopped answering looked exactly like normal operation.
+    global _IS_PREFILL_PROBE_FAILED
     try:
         return not torch.npu.is_current_stream_capturing()
-    except Exception:
+    except Exception as e:
+        if not _IS_PREFILL_PROBE_FAILED:
+            _IS_PREFILL_PROBE_FAILED = True
+            logger.warning(
+                "[KT_STREAM] cannot probe stream capture (%s); assuming prefill from here",
+                repr(e)[:160],
+            )
         return True
 
 
@@ -785,7 +831,7 @@ def _as_u8(t):
     return (t if t.dtype == torch.uint8 else t.view(torch.uint8)).contiguous()
 
 
-def _load_layer_mxfp4(layer: int, E: int, H: int, I: int):
+def _load_layer_mxfp4(layer: int, E: int):
     """Read one layer's E experts of native MXFP4 (codes + e8m0 scale) and build w13 = cat(w1,w3).
 
     Returns pinned host tensors: c13 [E,2I,H/2] u8, s13 [E,2I,H/32] u8, c2 [E,H,I/2] u8,
@@ -822,7 +868,7 @@ def _load_layer_mxfp4(layer: int, E: int, H: int, I: int):
     return c13, s13, _pin(c2), _pin(s2)
 
 
-def _build_mxfp4_pool(E: int, H: int, I: int, num_layers: int) -> None:
+def _build_mxfp4_pool(E: int, num_layers: int) -> None:
     """Serial fallback: fill ``_MXFP4_POOL`` with pinned MXFP4 codes+scale per layer.
 
     The fast path is the load-time parallel O_DIRECT build
@@ -842,7 +888,7 @@ def _build_mxfp4_pool(E: int, H: int, I: int, num_layers: int) -> None:
         _mxfp4_ckpt_dir(),
     )
     for L in _expert_layers(_mxfp4_index(), _mxfp4_naming(), num_layers):
-        _MXFP4_POOL[L] = _load_layer_mxfp4(L, E, H, I)
+        _MXFP4_POOL[L] = _load_layer_mxfp4(L, E)
     _MXFP4_POOL_BUILT = True
     logger.info(
         "[KT_STREAM][depool] MXFP4 pool built in %.0fs", time.perf_counter() - t0
@@ -932,8 +978,7 @@ def _read_layer_mxfp4_odirect(L, E, H, I, scratch) -> None:
             path = os.path.join(_mxfp4_ckpt_dir(), fn)
             hdr, base = _shard_header(path)
             offs = {
-                (e, proj): hdr[keyfn(L, e, proj)]["data_offsets"]
-                for e, proj in items
+                (e, proj): hdr[keyfn(L, e, proj)]["data_offsets"] for e, proj in items
             }
             lo = min(o[0] for o in offs.values())
             hi = max(o[1] for o in offs.values())
@@ -1159,19 +1204,26 @@ def maybe_reserve_slot(wrapper, dev, layer=None) -> None:
                 if not _BG_MX["started"]:
                     _BG_MX["started"] = True
                     _start_bg_reads_mxfp4(E, H, I, num_layers)
-                if wrapper.kt_config.layer_idx == num_layers - 1:
+                # The LAST MoE LAYER, not the last layer index. These are the same
+                # number on GLM-5.3-Flash only because its final layer happens to carry
+                # routed experts; on a checkpoint with trailing dense layers, num_layers-1
+                # is never a KT layer and the background reads would never be drained.
+                # _last_moe_layer() exists for exactly this and was going unused -- the
+                # same class of over-reach ce190931c1 fixed in the layer range itself.
+                if wrapper.kt_config.layer_idx == _last_moe_layer():
                     _finish_bg_build_mxfp4()
             return
         if E and H and I:
             reserve_slot(E, H, I, dev)
         # Overlap the pool build's O_DIRECT reads with the rest of model load: start the
         # background reads on the FIRST process_weights call (host-only, while the remaining
-        # weights load), then drain + NZ-cast on the LAST call.
+        # weights load), then drain + NZ-cast on the LAST MoE layer (see above: not
+        # num_layers-1, which is only the same number by GLM's good luck).
         if E and H and I and num_layers and not _POOL_BUILT:
             if not _BG["started"]:
                 _BG["started"] = True
                 _start_bg_reads(E, H, I, num_layers)
-            if wrapper.kt_config.layer_idx == num_layers - 1:
+            if wrapper.kt_config.layer_idx == _last_moe_layer():
                 _finish_bg_build(dev)
                 reserve_slot(E, H, I, dev)
     except Exception as e:
@@ -1179,6 +1231,8 @@ def maybe_reserve_slot(wrapper, dev, layer=None) -> None:
             "[KT_STREAM] reserve/build at load failed (%s); lazy fallback",
             repr(e)[:160],
         )
+        if _KT_STREAM_STRICT:
+            raise
 
 
 _INIT_ROUTING = None
@@ -1204,11 +1258,24 @@ def _routing_ops():
     return _INIT_ROUTING, _FINALIZE_ROUTING
 
 
-@functools.lru_cache(maxsize=4)
+_SWIGLU_LOGGED: set[tuple[float, str]] = set()
+
+
 def _log_stream_swiglu_once(limit: float, source: str) -> None:
-    print(f"[KT_STREAM][swiglu] streaming-prefill clamp "
-          f"{'ACTIVE limit=%.4g' % limit if limit > 0 else 'OFF'} (from {source})",
-          flush=True)
+    """Report the streaming clamp once per distinct (limit, source).
+
+    This was a bare print() behind an lru_cache used purely for its side effect: the
+    cache was the once-ness and the return value was always None. A set says that.
+    """
+    key = (limit, source)
+    if key in _SWIGLU_LOGGED:
+        return
+    _SWIGLU_LOGGED.add(key)
+    logger.info(
+        "[KT_STREAM][swiglu] streaming-prefill clamp %s (from %s)",
+        f"ACTIVE limit={limit:.4g}" if limit > 0 else "OFF",
+        source,
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -1222,7 +1289,15 @@ def _swiglu_limit_from_config() -> float:
     """
     try:
         return float(_read_ckpt_config().get("swiglu_limit") or 0.0)
-    except Exception:
+    except Exception as e:
+        # 0.0 means "no clamp", which is precisely the silent wrong-function failure this
+        # docstring describes. Never return it without saying so.
+        logger.warning(
+            "[KT_STREAM][swiglu] could not read swiglu_limit from the checkpoint config "
+            "(%s); streaming experts will NOT clamp, and will therefore compute a "
+            "different function from the resident NPU experts and the CPU MoE",
+            repr(e)[:160],
+        )
         return 0.0
 
 
@@ -1501,6 +1576,11 @@ def _streaming_forward(layer_idx, x, topk_output, top_k, num_experts) -> torch.T
                         "[KT_STREAM] dynamic residency failed (%s); static set kept",
                         repr(e)[:160],
                     )
+                    # Gated like its sibling twenty lines up. KT_STREAM_STRICT promises
+                    # that every streaming failure becomes loud; two of the four handlers
+                    # did not honour it, so the flag could not be trusted to mean that.
+                    if _KT_STREAM_STRICT:
+                        raise
     return out
 
 
@@ -1696,12 +1776,20 @@ def _apply_resident_layer_depool(L, topk_output, w13, s13b, w2, s2b):
         _hist_ids(topk_output.topk_ids).to(torch.int64), minlength=E
     )[:E]
     top = _pick_resident_top(counts, K)
-    # index_select(..., out=<param>.data) 在目标带 ACL 私有格式(FRACTAL_NZ)时是**静默 no-op**:
-    # torch_npu 无法往 NZ 的 out 里写, 于是把 .data 返回的临时 Tensor 重绑定到一个新分配的
-    # ND tensor 并丢弃, nn.Parameter 自己的 storage 一个字节都没动 —— 无异常无告警。
-    # 紧邻的 scale 是 ND, 所以 scale 写进去了; mask/l2g 也写进去了。结果是槽位 i 用专家 i 的
-    # 权重配专家 top[i] 的 scale, 而 CPU 又因 mask 认为 top[i] 已常驻而跳过它。
-    # Tensor.copy_ 是格式感知的, 原地写 Parameter 自己的 storage(decode NPU graph 捕获的正是它)。
+    # DANGER: index_select(..., out=<param>.data) is a SILENT NO-OP when the destination carries
+    # an ACL private format (FRACTAL_NZ). torch_npu cannot write into an NZ `out`, so it
+    # rebinds the temporary Tensor returned by .data to a freshly allocated ND tensor and
+    # throws that away: not one byte of the nn.Parameter's own storage is touched, with no
+    # exception and no warning.
+    #
+    # The damage is that this is PARTIAL. The neighbouring scale is ND, so the scale IS
+    # written, and so are the mask and the l2g table. Slot i then holds expert i's weights
+    # against expert top[i]'s scale, while the CPU side skips top[i] because the mask says
+    # it is already resident. Wrong output, nothing in the log.
+    #
+    # Tensor.copy_ is format-aware and writes in place into the Parameter's own storage --
+    # which is the storage the captured decode NPU graph refers to. Use it, not index_select
+    # with out=.
     #
     # Order matters for the commit protocol: every allocating op (the four index_selects, which
     # are what an over-budget resident count makes fail) happens BEFORE the first byte of the
@@ -1710,8 +1798,12 @@ def _apply_resident_layer_depool(L, topk_output, w13, s13b, w2, s2b):
     gs13, gs2 = torch.index_select(s13b, 0, top), torch.index_select(s2b, 0, top)
     # --- commit point: from here the layer's weights no longer match its mask ---
     _RES_PEND[L] = (wrap, top, counts)
-    _RES_WRITTEN[L] = top  # device tensor; materialised only by the (per-pass) consistency check
-    _RES_TORN.add(L)  # cleared once all four writes land; a raise in between is unrepairable
+    _RES_WRITTEN[L] = (
+        top  # device tensor; materialised only by the (per-pass) consistency check
+    )
+    _RES_TORN.add(
+        L
+    )  # cleared once all four writes land; a raise in between is unrepairable
     layer.w13_weight.data.copy_(g13)
     layer.w2_weight.data.copy_(g2)
     layer.w13_weight_scale.data.copy_(gs13)
@@ -1781,14 +1873,14 @@ def _apply_dynamic_residency() -> None:
             import torch_npu as _tn
 
             _topd = top.to(dev)
-            _nd13 = _tn.npu_format_cast(slot13, 2)  # whole pool NZ->ND
+            _nd13 = _tn.npu_format_cast(slot13, _ACL_FORMAT_ND)  # whole pool NZ->ND
             _g13 = _tn.npu_format_cast(
                 _nd13[_topd].contiguous(), _ACL_FORMAT_FRACTAL_NZ
             )
             del _nd13
             layer.w13_weight.data.copy_(_g13)
             del _g13
-            _nd2 = _tn.npu_format_cast(slot2, 2)
+            _nd2 = _tn.npu_format_cast(slot2, _ACL_FORMAT_ND)
             _g2 = _tn.npu_format_cast(_nd2[_topd].contiguous(), _ACL_FORMAT_FRACTAL_NZ)
             del _nd2
             layer.w2_weight.data.copy_(_g2)
@@ -1892,7 +1984,7 @@ def maybe_streaming_forward(
             elif not _MXFP4_POOL_BUILT:
                 # Normally built at model-load time (maybe_reserve_slot, parallel O_DIRECT);
                 # this serial builder only runs if that path failed or never started.
-                _build_mxfp4_pool(E, H, I, num_layers)
+                _build_mxfp4_pool(E, num_layers)
         elif not _POOL_BUILT:
             # Lazy fallback: parallel O_DIRECT build.  _build_pool_parread frees the slot
             # internally for NZ scratch; _stream_layer_weights re-allocates it afterwards.

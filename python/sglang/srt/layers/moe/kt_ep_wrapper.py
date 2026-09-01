@@ -126,7 +126,7 @@ def _kt_numa_nodes(threadpool_count: int):
     ``--kt-threadpool-count``; kt-kernel raises otherwise, and we let it, because a
     silently ignored placement is exactly the failure this exists to prevent.
 
-    ⚠ On a host whose nodes are not uniformly connected, the choice matters a great
+    WARNING: on a host whose nodes are not uniformly connected, the choice matters a great
     deal: this A3 box pairs its nodes (0,1) (2,3) (4,5) (6,7) and a read across pairs
     runs at 20 GB/s against 150 GB/s within one. Keep a server's subpools inside one
     pair.
@@ -206,8 +206,7 @@ def create_kt_config_from_server_args(
     if server_args.device == "npu":
         if not server_args.kt_num_gpu_experts or server_args.kt_num_gpu_experts < 1:
             raise ValueError(
-                "KT expert offload on NPU currently requires "
-                "--kt-num-gpu-experts >= 1"
+                "KT expert offload on NPU currently requires --kt-num-gpu-experts >= 1"
             )
         if server_args.tp_size != 1 or server_args.ep_size != 1:
             raise ValueError(
@@ -437,14 +436,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # kt_expert_masks sized its tables from n_routed_experts=288.  The
         # fallback then pinned the always-active fused slot to the CPU, costing a
         # host round trip on every token, with nothing in the log to say so.
-        if self.gpu_experts_mask is not None and self.gpu_experts_mask.numel() < num_experts:
+        if (
+            self.gpu_experts_mask is not None
+            and self.gpu_experts_mask.numel() < num_experts
+        ):
             raise ValueError(
                 f"KT layer {self.kt_config.layer_idx} has {num_experts} experts but the "
                 f"placement table was built for {self.gpu_experts_mask.numel()}. A layer "
-                f"may only be narrower than the global table (expert-parallel sharding), "
-                f"never wider. This usually means something appended experts after "
-                f"kt_expert_masks read n_routed_experts -- shared-expert fusion is the "
-                f"known case; run with --disable-shared-experts-fusion."
+                "may only be narrower than the global table (expert-parallel sharding), "
+                "never wider. This usually means something appended experts after "
+                "kt_expert_masks read n_routed_experts -- shared-expert fusion is the "
+                "known case; run with --disable-shared-experts-fusion."
             )
         if (
             self.gpu_experts_mask is None
@@ -709,9 +711,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             layer: The MoE layer module
             dispatch_output: Dispatched tokens and routing information
         """
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
+        assert self.moe_runner_config.activation == "silu", (
+            "Only SiLU activation is supported."
+        )
 
         if self.tp_rank != 0 or self.wrapper is None:
             return

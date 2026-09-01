@@ -18,6 +18,15 @@ import os
 import sys
 import types
 
+# The module under test imports sglang.srt.*, so the repo's python/ has to be importable.
+# Do it here rather than making the caller remember a PYTHONPATH: this file used to live
+# under docs/ and needed one, which is a good way to have a regression test nobody runs.
+_REPO_PYTHON = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../python")
+)
+if os.path.isdir(_REPO_PYTHON) and _REPO_PYTHON not in sys.path:
+    sys.path.insert(0, _REPO_PYTHON)
+
 import torch
 
 E, H, I = 16, 8, 4  # tiny stand-ins for 288 / 4096 / 2048
@@ -190,7 +199,7 @@ if __name__ == "__main__":
         if len(sys.argv) > 1
         else os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
-            "../../../../python/sglang/srt/layers/moe/kt_stream_prefill.py",
+            "../../python/sglang/srt/layers/moe/kt_stream_prefill.py",
         )
     )
     rc = 0
