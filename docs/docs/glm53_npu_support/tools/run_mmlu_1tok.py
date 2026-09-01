@@ -19,11 +19,26 @@ Prompts are raw completions, not chat -- no template, no thinking, one token out
 grouping is not reproducible across runs (PLAN §4), and while argmax is far less
 exposed to that than a logprob value is, matching it keeps the two runs' batch
 shape distributions the same.
+
+!! DISABLED BY DEFAULT -- THIS TOOL CRASHES THE SERVER ON THE ASCEND STACK. !!
+
+The ``margin`` statistic is the whole reason this file asks for logprobs, and
+``{"return_logprob": true, "top_logprobs_num": N}`` is exactly the request that
+JITs an uncompiled Triton kernel here; ``bishengir-compile`` takes a SIGSEGV and
+the server dies with it. Not a bug in this file and not ours to fix, so the tool
+refuses to run rather than leaving the knowledge in a document nobody reads.
+
+Use ``/var/tmp/glm53/acc/mmlu_safe.py`` instead: pure greedy single-token, no
+logprob fields at all, so it gives accuracy and flip rate. It cannot give margin
+-- margin needs the logprobs that crash the server, and there is no cheap
+substitute. Set ``MMLU_ALLOW_LOGPROB=1`` to run this anyway, on a server you are
+willing to lose.
 """
 
 import argparse
 import json
 import os
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -40,6 +55,48 @@ DEFAULT_DATA = Path(
 if not DEFAULT_DATA.is_file():
     DEFAULT_DATA = Path("/mnt/workspace/l84414662/glm53/env/eval/mmlu/test.parquet")
 LETTERS = "ABCD"
+
+#: Opt-in for the request shape that kills the server. Named for what it enables,
+#: not for a severity word, so `grep MMLU_ALLOW_LOGPROB` finds both the gate and
+#: every place someone chose to defeat it.
+ALLOW_ENV = "MMLU_ALLOW_LOGPROB"
+
+REFUSAL = f"""\
+run_mmlu_1tok.py is disabled: on this Ascend stack it kills the server.
+
+  It sends {{"return_logprob": true, "top_logprobs_num": N}}. That combination JITs
+  an uncompiled Triton kernel, bishengir-compile takes a SIGSEGV, and the server
+  process dies. This is not a fault in this script and fixing the Triton path is
+  out of scope; the request shape is simply unusable here.
+
+  Use instead:  /var/tmp/glm53/acc/mmlu_safe.py
+                pure greedy single-token, no logprob fields -> cannot trigger it.
+                Gives accuracy and flip rate. Does NOT give margin.
+
+  There is no safe way to get `margin` on this stack: margin is defined as
+  logprob(top1) - logprob(top2), and obtaining those logprobs is the crash.
+
+  If you genuinely accept losing the server (e.g. a scratch instance that is not
+  shared, and no one else's evaluation is in flight), re-run with:
+
+      {ALLOW_ENV}=1 $VENV/bin/python run_mmlu_1tok.py ...
+"""
+
+
+def check_allowed() -> None:
+    """Refuse to send the server-killing request unless explicitly opted in."""
+    if os.environ.get(ALLOW_ENV) == "1":
+        print(
+            f"{ALLOW_ENV}=1 set: sending return_logprob requests. This is the "
+            "combination that SIGSEGVs bishengir-compile and takes the server "
+            "down with it.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    print(REFUSAL, file=sys.stderr)
+    raise SystemExit(2)
+
 
 PROMPT = """The following is a multiple choice question about {subject}.
 
@@ -128,6 +185,10 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=600)
     ap.add_argument("--out", type=Path)
     args = ap.parse_args()
+
+    # After argparse so --help still works, but before the tokenizer, the dataset
+    # read, and anything that touches the network.
+    check_allowed()
 
     import pyarrow.parquet as pq
 

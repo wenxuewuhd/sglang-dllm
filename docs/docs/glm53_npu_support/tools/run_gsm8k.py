@@ -44,24 +44,76 @@ def gold_answer(line: dict) -> float | None:
     return float(m.group(1).replace(",", "")) if m else None
 
 
-def predicted_answer(text: str) -> float | None:
-    """The model's final number: from \\boxed{} if it used one, else the last number.
+def boxed_spans(text: str) -> list[str]:
+    r"""Every \boxed{...} body in `text`, matched by counting brace depth.
 
-    Both halves need care. \\boxed{} content is not always a bare number -- measured on
-    a full run, the model writes \\boxed{70\\%} and \\boxed{25 \\text{ hours}} -- so pull the
-    number back out of it rather than handing the whole string to float(). And search
-    only the segment after </think>: the reasoning trace is full of intermediate
-    numbers, and taking the last one from the whole text would sometimes score the
-    model's scratch work instead of its answer.
+    The obvious `re.findall(r"\\boxed\{([^}]*)\}", ...)` stops at the FIRST closing
+    brace, and \boxed{} bodies nest: GLM writes the LaTeX thousands separator as
+    168{,}000, so that regex returns "\$168{," -- which then parses to 168 instead
+    of 168000. A *parseable but truncated* number, so the "unparseable -> fall back"
+    guard below never fires and it scores a correct answer as wrong. Measured: 1 of
+    200 questions in one run (idx=409, true value 168000).
+
+    An unterminated \boxed{ (generation cut off mid-answer) contributes no span,
+    which is what the old regex did too -- the caller then falls back to the whole
+    answer segment.
+    """
+    out = []
+    for m in re.finditer(r"\\boxed\{", text):
+        i = m.end()
+        start = i
+        depth = 1
+        while i < len(text) and depth:
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+            i += 1
+        if depth == 0:
+            out.append(text[start : i - 1])
+    return out
+
+
+def strip_latex(text: str) -> str:
+    r"""Drop the LaTeX decoration that sits inside a \boxed{} around the number.
+
+    \text{...} is UNWRAPPED (contents kept), not deleted: \boxed{\text{42}} must stay
+    42. Deleting it -- as the offline rescore prototype did -- empties the box and
+    sends the extractor to the fallback, which then scores some earlier number from
+    the reasoning tail. That is exactly the class of silent shift this scorer must
+    not have.
+    """
+    text = re.sub(r"\\text\s*\{([^{}]*)\}", r"\1", text)
+    for artifact in ("{,}", "\\,", "\\!", "\\;", "\\ ", "\\$", "$", "\\%", "%"):
+        text = text.replace(artifact, "")
+    return text.replace("{", "").replace("}", "")
+
+
+def predicted_answer(text: str) -> float | None:
+    r"""The model's final number: from \boxed{} if it used one, else the last number.
+
+    Both halves need care. \boxed{} content is not always a bare number -- measured on
+    a full run, the model writes \boxed{70\%}, \boxed{25 \text{ hours}} and
+    \boxed{\$168{,}000} -- so strip the decoration and pull the number back out rather
+    than handing the whole string to float(). And search only the segment after
+    </think>: the reasoning trace is full of intermediate numbers, and taking the last
+    one from the whole text would sometimes score the model's scratch work instead of
+    its answer.
 
     An earlier version returned None when the boxed content would not parse, with no
     fallback. That scored 9 of 1319 correct answers as wrong -- an extraction artifact
     that looked exactly like a model error.
+
+    ! This scorer's outputs are compared against baselines produced by this same
+    scorer, so any change here must only rescue previously-truncated cases. The
+    brace-matching + strip_latex change above was checked against the 400 recorded
+    generations of the two 200-question runs: exactly one record moved (idx=409,
+    wrong -> right) and no other record's extracted value changed at all.
     """
     answer = text.split("</think>")[-1]
-    boxed = re.findall(r"\\boxed\{([^}]*)\}", answer)
+    boxed = boxed_spans(answer)
     for source in (boxed[-1] if boxed else "", answer):
-        nums = re.findall(r"-?\d[\d,]*(?:\.\d+)?", source)
+        nums = re.findall(r"-?\d[\d,]*(?:\.\d+)?", strip_latex(source))
         if nums:
             try:
                 return float(nums[-1].replace(",", ""))
