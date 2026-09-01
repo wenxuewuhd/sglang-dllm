@@ -66,7 +66,7 @@ def _check_hadamard() -> None:
           f"{(H - syl * HAD_SCALE).abs().max().item():.3e}")
     try:
         import sys
-        sys.path.insert(0, "/mnt/workspace/y00359136/work/glm53_dev/sglang-dllm/python")
+        sys.path.insert(0, "${GLM53_ROOT}/sglang-dllm/python")
         from sglang.kernels.ops.quantization.hadamard import hadamard_transform
         got = hadamard_transform(eye.float().to(DEV), scale=128 ** -0.5).cpu().double()
         print(f"[hadamard] vs sglang rotate_activation: max|d| = "

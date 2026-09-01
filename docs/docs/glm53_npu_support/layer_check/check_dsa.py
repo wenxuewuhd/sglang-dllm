@@ -22,6 +22,7 @@ Numbers reported per case:
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from pathlib import Path
 
@@ -31,7 +32,11 @@ import torch_npu  # noqa: F401
 import fixture as F
 import ref as RR
 
-SP = "/tmp/claude-1000/-mnt-workspace-y00359136-work-glm53-dev-sglang-dllm/d927eb2c-8461-4d46-9b1e-b27511958e37/scratchpad"
+# Where dump_reference.py left the stage-A tensors. This was a hardcoded absolute path
+# into one agent session's scratch directory, complete with that session's UUID, so it
+# resolved for exactly one run on exactly one machine.
+SP = os.environ.get("GLM53_REF_DIR") or os.path.join(
+    os.environ.get("GLM53_ARTIFACT_ROOT", "/var/tmp/glm53"), "refs")
 SLACK = 2.0
 KPOOL, GTOPK = 4, 512
 

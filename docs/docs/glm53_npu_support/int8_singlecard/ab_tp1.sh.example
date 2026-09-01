@@ -14,7 +14,7 @@ set -u
 NAME=${NAME:?set NAME}
 DIE=${DIE:-0}
 PORT=${PORT:-30013}
-RUN=/mnt/workspace/y00359136/work/glm53_dev/env/run
+RUN=${GLM53_ROOT}/env/run
 LOG=$RUN/glm_w8a8_tp1_${NAME}_$(date +%H%M).log
 
 # Kill only *our* server, by port. `pkill -f "[s]glang.launch_server"` matches every
@@ -71,8 +71,8 @@ grep -q "server is fired up" $LOG || { echo "TIMEOUT"; tail -25 $LOG; exit 1; }
 grep -E "Load weight end|Mamba Cache|KV Cache|Capture target decode NPU graph end" $LOG
 
 set +u  # env.sh sources CANN set_env scripts that read unset variables
-source /mnt/workspace/y00359136/work/glm53_dev/env/env.sh
-cd /mnt/workspace/y00359136/work/glm53_dev/wt-int8-singlecard/docs/docs/glm53_npu_support/tools
+source ${GLM53_ROOT}/env/env.sh
+cd ${GLM53_ROOT}/wt-int8-singlecard/docs/docs/glm53_npu_support/tools
 
 # Warm up before timing anything.  bench_graph_decode subtracts a max_new_tokens=1
 # run from a max_new_tokens=DEC+1 run, so a cold first request does not just add

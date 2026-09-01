@@ -27,7 +27,9 @@ python -c "import torch, torch_npu; print(torch.npu.get_device_name(0), torch.np
 ## 1. 拉代码
 
 ```bash
-git clone git@github.com:wenxuewuhd/sglang-dllm.git
+# ⚠ 私有 fork，地址按你自己的 remote 填。开源版本从 ktransformers-AK 的
+#   third_party/sglang submodule 进，不需要单独 clone。
+git clone <your-sglang-fork-url> sglang-dllm
 cd sglang-dllm
 git checkout glm53_dev
 ```

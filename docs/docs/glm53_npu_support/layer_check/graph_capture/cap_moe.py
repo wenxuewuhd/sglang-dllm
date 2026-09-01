@@ -11,7 +11,7 @@ SP = _os.environ.get("SCRATCH", "/tmp/glm53_scratch")
 sys.path.insert(0, LC); sys.path.insert(0, G)
 import gcap
 ap = argparse.ArgumentParser()
-ap.add_argument("--case", default="/mnt/workspace/y00359136/work/glm53_dev/env/goldens/moe_layer03_s1024.pt")
+ap.add_argument("--case", default="${GLM53_ROOT}/env/goldens/moe_layer03_s1024.pt")
 ap.add_argument("-M", type=int, default=16)
 ap.add_argument("--tp", type=int, default=16)
 ap.add_argument("--port", type=int, default=29711)

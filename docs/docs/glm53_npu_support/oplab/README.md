@@ -152,8 +152,8 @@ A 也确实跑通了，只是要多装 30 个包。
 ```bash
 # 0) 三个 wheel 先备好。torch / torch_npu 见 §00.1 的版本；
 #    triton-ascend 和 sgl_kernel_npu 见 §00.7 第 1 条（都不在公开 PyPI 上）
-W=/mnt/workspace/y00359136/work/glm53_dev/env/wheels     # torch, torch_npu
-P=/mnt/workspace/y00359136/work/glm53_dev/env/pkg        # sgl_kernel_npu
+W=${GLM53_ROOT}/env/wheels     # torch, torch_npu
+P=${GLM53_ROOT}/env/pkg        # sgl_kernel_npu
 TA=/var/tmp/glm53/wheels                                 # triton_ascend
 IDX="-i https://repo.huaweicloud.com/repository/pypi/simple"
 DIR=/var/tmp/glm53/cleanenv/.venv-oplab
@@ -387,8 +387,8 @@ profiler 每次都会打一行 `Failed to get acl to npu flow events`，
 ## 1. 怎么跑
 
 ```bash
-source /mnt/workspace/y00359136/work/glm53_dev/env/env.sh
-export PYTHONPATH=/mnt/workspace/y00359136/work/glm53_dev/wt-int8-singlecard/python:$PYTHONPATH
+source ${GLM53_ROOT}/env/env.sh
+export PYTHONPATH=${GLM53_ROOT}/wt-int8-singlecard/python:$PYTHONPATH
 cd docs/docs/glm53_npu_support/oplab
 
 ASCEND_RT_VISIBLE_DEVICES=0 python bench_kda_layer.py

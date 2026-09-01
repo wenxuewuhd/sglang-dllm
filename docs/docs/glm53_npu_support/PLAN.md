@@ -109,7 +109,7 @@ device 时间类的（AI_CPU 回退、int64 算术、标量瓶颈 kernel）才�
 - CANN **组件实为 9.1.0**（外层包名标 9.2.0，不可信）；toolkit 在 `/home/developer/Ascend/ascend-toolkit/`
 - Python 3.12.9 / torch **2.10.0** / torch_npu **2.10.0.post4** / triton-ascend **3.2.2**（带 `cann` 后端）
 - sgl-kernel-npu **20260826**，`cann9.1.0-a3-aarch64` + `py312`
-- `ROOT=/mnt/workspace/y00359136/work/glm53_dev/env`，`source $ROOT/env.sh` 后用 `npy` 代替 `python`
+- `ROOT=${GLM53_ROOT}/env`，`source $ROOT/env.sh` 后用 `npy` 代替 `python`
 - 参考环境 `$ROOT/.venv-ref`：transformers 5.16.1 + CPU torch。**绝不能装进 `.venv-glm53`**（sglang 钉 5.12.1）
 
 ### 磁盘

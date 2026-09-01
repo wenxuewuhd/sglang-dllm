@@ -12,7 +12,7 @@ project: the KDA layer-0 golden at `seq=64` has an **fp32-vs-bf16 relative error
 a 1e-1 gate would accept a badly broken one somewhere else. The right threshold is
 per-case and it is measurable.
 
-The method (implemented in [`reference/tolerance.py`](reference/tolerance.py), and
+The method (implemented in [`tolerance.py`](tolerance.py), and
 already used elsewhere in this project — see
 `docs/docs/glm53_npu_support/tools/golden_kda.py:11`):
 

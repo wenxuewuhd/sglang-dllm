@@ -28,7 +28,7 @@ from pathlib import Path
 
 import requests
 
-DATA = Path("/mnt/workspace/y00359136/work/glm53_dev/env/eval/gsm8k/test.jsonl")
+DATA = Path("${GLM53_ROOT}/env/eval/gsm8k/test.jsonl")
 # The dev box exports HTTP_PROXY=http://127.0.0.1:1056 and requests honours it even
 # for 127.0.0.1, where the proxy answers 503.
 NO_PROXY = {"http": None, "https": None}

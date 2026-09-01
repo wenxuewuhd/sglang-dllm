@@ -1,5 +1,14 @@
 # GLM-5.3-Flash 昇腾适配
 
+> **本目录里的 `${GLM53_ROOT}` 是占位符**，指你自己放这套东西的工作目录
+> （下面有 `env/`、各个 checkout 等）。原先这里写的是某个人家目录下的绝对路径，
+> 换个账号就全都指不到，所以统一换成了占位符。设一个环境变量或按你的布局替换即可：
+>
+> ```bash
+> export GLM53_ROOT=/your/workspace
+> ```
+
+
 > **新 agent 从这里开始。** 把下面「启动提示词」整段贴给它即可。
 
 ---
@@ -25,7 +34,7 @@ docs/docs/glm53_npu_support/ 下，按顺序：
 第一次接触这个项目、要从零把环境和精度跑通的，看 REPRODUCE.md。
 
 【环境】
-source /mnt/workspace/y00359136/work/glm53_dev/env/env.sh   # 然后用 npy 代替 python
+source ${GLM53_ROOT}/env/env.sh   # 然后用 npy 代替 python
 参考环境（HF golden，CPU）：$ROOT/.venv-ref/bin/python —— 绝不能装进 .venv-glm53
 
 【当前进度】
@@ -85,7 +94,7 @@ source /mnt/workspace/y00359136/work/glm53_dev/env/env.sh   # 然后用 npy 代�
 | `probe/` | 探测脚本 | `p0_5_ops.py` 验环境；`p0_6_*.py` 验算子 shape；`p3_4_lightning_indexer.py` 验 kpool 打分算子 |
 | `launch_dsv4_a3.sh.example` | DSv4-Flash 起服务脚本（A3 TP16/DP16+DeepEP） | 冒烟 / 精度回归 |
 | [`layer_check/`](./layer_check/) | 逐层与整层对拍、图捕获验证、统一计时口径。**双参考法的说明在 `ACCEPTANCE.md`，实现在 `tolerance.py`** | 改完要验数值时 |
-| 算子清单的对外呈现页 | https://claude.ai/code/artifact/54dbfb20-667f-465d-84c1-ea7d0cc1a827 | 发给下游同事时。**内容来自本目录，仓库为准**；要更新必须带上这个 URL，否则会新建一个而不是更新它 |
+| 算子清单的对外呈现页 | （内部链接，开源版本已移除；内容以本目录为准）| 发给下游同事时。**内容来自本目录，仓库为准**；要更新必须带上这个 URL，否则会新建一个而不是更新它 |
 | `tools/fp8_to_bf16.py` | FP8 blockwise → BF16 逐 shard 反量化 | 换权重版本要重转时 |
 | `tools/bf16_to_int8_ct.py` | BF16 → compressed-tensors W8A8-INT8。**不需要机器**（激活动态，无需校准）| P5 量化。产物已在 `/mnt/workspace/models/GLM-5.3-Flash-W8A8` |
 | `tools/golden_kda.py` / `golden_mhc.py` | 从 HF 参考实现生成 CPU golden | 模块级数值对拍 |

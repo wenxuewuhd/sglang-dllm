@@ -14,7 +14,7 @@ import custom_ops  # registers torch.ops.custom
 from harness import Case
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--case", default="/mnt/workspace/y00359136/work/glm53_dev/env/goldens/mhc_attn_layer20.pt")
+ap.add_argument("--case", default="${GLM53_ROOT}/env/goldens/mhc_attn_layer20.pt")
 ap.add_argument("-M", type=int, default=16)
 a = ap.parse_args()
 torch.npu.set_device(0); torch.set_grad_enabled(False)

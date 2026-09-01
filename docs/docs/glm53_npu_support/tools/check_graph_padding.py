@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 
 PORT = 30003
-G = "/mnt/workspace/y00359136/work/glm53_dev/env/goldens/logits/ref_server_eager_short_d100.json"
+G = "${GLM53_ROOT}/env/goldens/logits/ref_server_eager_short_d100.json"
 ref = json.load(open(G))["data"]
 NOPROXY = {"http": None, "https": None}
 

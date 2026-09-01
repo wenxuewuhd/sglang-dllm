@@ -58,7 +58,7 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 （安装文档写的 "Only python==3.11" 对应 9.0.0 档）。24.04 的 `python3` 就是 3.12：
 
 ```bash
-export ROOT=/mnt/workspace/y00359136/work/glm53_dev/env
+export ROOT=${GLM53_ROOT}/env
 python3 -m venv $ROOT/.venv-glm53
 ```
 

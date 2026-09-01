@@ -4,7 +4,7 @@
 # 配方来自上游 PR sgl-project/sglang#25144（[NPU] Add Ascend NPU support for DeepSeek-V4），
 # 已按本机路径改写（toolkit 在 /home/developer，vendor 装在 $ROOT/opp_custom）。
 set -x
-source /mnt/workspace/y00359136/work/glm53_dev/env/env.sh
+source ${GLM53_ROOT}/env/env.sh
 
 export PYTHONNOUSERSITE=1
 export PYTHONPATH=$REPO/python:$PYTHONPATH

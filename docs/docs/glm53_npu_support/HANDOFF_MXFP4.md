@@ -25,7 +25,9 @@
 export GLM_BASE=/mnt/workspace/w12345/glm53     # <- 改成你的工号
 mkdir -p $GLM_BASE && cd $GLM_BASE
 
-git clone git@github.com:wenxuewuhd/sglang-dllm.git
+# ⚠ 私有 fork，地址按你自己的 remote 填。开源版本从 ktransformers-AK 的
+#   third_party/sglang submodule 进，不需要单独 clone。
+git clone <your-sglang-fork-url> sglang-dllm
 cd sglang-dllm && git checkout glm53_dev
 
 export GLM_REPO=$GLM_BASE/sglang-dllm
@@ -54,7 +56,7 @@ git log --oneline -3        # 最上面应该是 docs(npu): ... handoff for the 
 #   /mnt/workspace/models/GLM-5.3-Flash-BF16     599 GB
 #   /mnt/workspace/models/GLM-5.3-Flash-W8A8     306 GB
 # golden：复制（约几十 MB）
-cp -r /mnt/workspace/y00359136/work/glm53_dev/env/goldens $GLM_ENV/goldens
+cp -r ${GLM53_ROOT}/env/goldens $GLM_ENV/goldens
 ```
 
 ⚠ **那个源目录属于上一个 session，可能已经不在了。** 拿不到也没关系，

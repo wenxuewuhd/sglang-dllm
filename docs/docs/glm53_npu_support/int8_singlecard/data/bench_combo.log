@@ -1,6 +1,0 @@
-
---- short (13 tok), 128 decode tokens
-  conc  prefill s  decode s  ms/token  decode tok/s total
-     1       0.39      4.59      35.8                27.9
-     4       0.72      5.77      45.1                88.8
-    16       1.08      8.33      65.1               246.0

@@ -25,10 +25,10 @@
 # (the TP16 value) -- 2 is a measured 1.74x on eager DSA decode and is one of
 # the things to A/B here, so it must not be silently different in the baseline.
 set -x
-source /mnt/workspace/y00359136/work/glm53_dev/env/env.sh
+source ${GLM53_ROOT}/env/env.sh
 export PYTHONNOUSERSITE=1
 # The worktree, not the main repo: another session is working in $REPO.
-export WT=${WT:-/mnt/workspace/y00359136/work/glm53_dev/wt-int8-singlecard}
+export WT=${WT:-${GLM53_ROOT}/wt-int8-singlecard}
 export PYTHONPATH=$WT/python:$PYTHONPATH
 
 export ASCEND_RT_VISIBLE_DEVICES=${DIE:-0}

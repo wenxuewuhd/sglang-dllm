@@ -1629,7 +1629,7 @@ KDA 投影**（§7.1）。量化它就是推翻模型作者的决定，而本部
 ## 对外页面（别新建，要更新那一个）
 
 本报告的对外呈现在**算子缺口那一页的第二部分**：
-<https://claude.ai/code/artifact/54dbfb20-667f-465d-84c1-ea7d0cc1a827>
+（内部呈现页链接，开源版本已移除；内容以本报告为准）
 
 ⚠ **更新时必须把这个 URL 传给 Artifact 工具**，否则会新建一页而不是更新它。
 页面的第一部分是算子清单（权威来源 `PLAN.md` §2.5 / §4），第二部分是本报告的摘要
@@ -1677,8 +1677,8 @@ KDA 投影**（§7.1）。量化它就是推翻模型作者的决定，而本部
 ## 9. 复现
 
 ```bash
-source /mnt/workspace/y00359136/work/glm53_dev/env/env.sh
-cd /mnt/workspace/y00359136/work/glm53_dev/wt-int8-singlecard/docs/docs/glm53_npu_support
+source ${GLM53_ROOT}/env/env.sh
+cd ${GLM53_ROOT}/wt-int8-singlecard/docs/docs/glm53_npu_support
 
 # 1) 裁一份 16 专家的 checkpoint（39 s，31.5 GiB，写在 / 上，不写 /mnt/workspace）
 $VENV/bin/python tools/prune_experts_int8.py \

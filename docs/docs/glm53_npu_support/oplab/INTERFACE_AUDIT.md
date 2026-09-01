@@ -316,7 +316,7 @@ NZ 权重格式、block table 宽度、page 布局、`index_kpool`、所有可�
 ## 6. 复现
 
 ```bash
-source /mnt/workspace/y00359136/work/glm53_dev/env/env.sh
+source ${GLM53_ROOT}/env/env.sh
 export PYTHONPATH=/var/tmp/glm53/opaudit:$WT/python:$PYTHONPATH
 
 # 用例侧

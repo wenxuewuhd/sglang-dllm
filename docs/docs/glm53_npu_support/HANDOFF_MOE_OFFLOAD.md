@@ -107,8 +107,8 @@ server args 也已经有：
 ### 3.1 起服务
 
 ```bash
-source /mnt/workspace/y00359136/work/glm53_dev/env/env.sh
-cd /mnt/workspace/y00359136/work/glm53_dev/env/run
+source ${GLM53_ROOT}/env/env.sh
+cd ${GLM53_ROOT}/env/run
 DIE=0 PORT=30013 ./launch_glm_w8a8_tp1.sh          # 约 45 秒起来
 ```
 
@@ -275,6 +275,6 @@ routed 预 clamp 278 **没有融合路径**（§4.1）；shared clamp+swiglu 282
 （`env/run/ab_tp1.sh:75` 写死了路径），**建议直接在它上面开新分支，别新建 worktree**：
 
 ```bash
-cd /mnt/workspace/y00359136/work/glm53_dev/wt-int8-singlecard
+cd ${GLM53_ROOT}/wt-int8-singlecard
 git checkout -b moe_offload glm53_dev
 ```

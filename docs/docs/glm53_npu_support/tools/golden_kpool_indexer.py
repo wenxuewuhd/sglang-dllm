@@ -122,7 +122,7 @@ def build_prompt_ids(model_dir: Path, seq: int) -> torch.Tensor:
     """Real text, not random ids: concatenate this repo's markdown docs."""
     tok = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
     repo = Path(__file__).resolve()
-    root = Path("/mnt/workspace/y00359136/work/glm53_dev/sglang-dllm")
+    root = Path("${GLM53_ROOT}/sglang-dllm")
     texts = []
     total = 0
     for p in sorted(root.rglob("*.md")):

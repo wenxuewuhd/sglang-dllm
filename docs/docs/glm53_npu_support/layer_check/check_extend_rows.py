@@ -21,7 +21,7 @@ import random
 import torch
 
 MODULE = pathlib.Path(
-    "/mnt/workspace/y00359136/work/glm53_dev/sglang-dllm/python/sglang/srt/"
+    "${GLM53_ROOT}/sglang-dllm/python/sglang/srt/"
     "hardware_backend/npu/attention/kpool_indexer_npu.py"
 )
 

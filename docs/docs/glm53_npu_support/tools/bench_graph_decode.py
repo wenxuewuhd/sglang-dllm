@@ -31,7 +31,7 @@ args = ap.parse_args()
 CONCURRENCY = [int(x) for x in args.concurrency.split(",")]
 
 NP = {"http": None, "https": None}
-G = "/mnt/workspace/y00359136/work/glm53_dev/env/goldens/logits"
+G = "${GLM53_ROOT}/env/goldens/logits"
 pools = {
     "short (13 tok)": [d["ids"] for d in json.load(open(f"{G}/ref_server_eager_short_d100.json"))["data"]],
     "long (3256 tok)": [d["ids"] for d in json.load(open(f"{G}/ref_server_eager_long_d100.json"))["data"]],

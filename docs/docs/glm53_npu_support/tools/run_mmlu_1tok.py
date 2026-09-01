@@ -45,15 +45,13 @@ from pathlib import Path
 
 import requests
 
-# The dataset lived in one person's home directory, which is not a dependency this
-# tool should carry. GLM53_EVAL_DIR overrides; the original path remains the last
-# fallback so an existing setup keeps working.
-DEFAULT_DATA = Path(
-    os.environ.get("GLM53_EVAL_DIR")
-    or "/mnt/workspace/y00359136/work/glm53_dev/env/eval"
-) / "mmlu" / "test.parquet"
-if not DEFAULT_DATA.is_file():
-    DEFAULT_DATA = Path("/mnt/workspace/l84414662/glm53/env/eval/mmlu/test.parquet")
+# The corpus is not vendored -- it is too big and it is shared between checkouts --
+# so its location comes from the environment. This used to fall back to two absolute
+# paths under two different people's home directories, which made the tool silently
+# unrunnable for anyone else and silently wrong for anyone who had a stale copy at
+# one of them. glm53_env.sh exports GLM53_EVAL_DIR; --data overrides it.
+_EVAL_DIR = os.environ.get("GLM53_EVAL_DIR") or ""
+DEFAULT_DATA = Path(_EVAL_DIR) / "mmlu" / "test.parquet" if _EVAL_DIR else None
 LETTERS = "ABCD"
 
 #: Opt-in for the request shape that kills the server. Named for what it enables,
@@ -185,6 +183,14 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=600)
     ap.add_argument("--out", type=Path)
     args = ap.parse_args()
+
+    if args.data is None:
+        ap.error(
+            "no corpus: set GLM53_EVAL_DIR to a directory holding mmlu/test.parquet, "
+            "or pass --data explicitly. (Sourcing glm53_env.sh exports it.)"
+        )
+    if not args.data.is_file():
+        ap.error(f"no corpus at {args.data}")
 
     # After argparse so --help still works, but before the tokenizer, the dataset
     # read, and anything that touches the network.
