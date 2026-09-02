@@ -114,6 +114,35 @@ def _kt_npu_graph_host_forward(args) -> None:
     wrapper.run_pinned_forward_sync(hidden_states, stream_handle)
 
 
+def _kt_numa_nodes(threadpool_count: int):
+    """Which NUMA nodes the CPU-MoE subpools bind to, from ``KT_NUMA_NODES``.
+
+    kt-kernel otherwise maps subpool *i* to node *i*, so every server on a host lands
+    on node 0 first and they contend for one node's memory bandwidth while seven sit
+    idle. That is fine for a single deployment -- the target is a one-node container --
+    but it makes two concurrent servers on a development box measure each other.
+
+    ``KT_NUMA_NODES=4,5`` places the subpools explicitly. The length must match
+    ``--kt-threadpool-count``; kt-kernel raises otherwise, and we let it, because a
+    silently ignored placement is exactly the failure this exists to prevent.
+
+    WARNING: on a host whose nodes are not uniformly connected, the choice matters a great
+    deal: this A3 box pairs its nodes (0,1) (2,3) (4,5) (6,7) and a read across pairs
+    runs at 20 GB/s against 150 GB/s within one. Keep a server's subpools inside one
+    pair.
+    """
+    raw = os.environ.get("KT_NUMA_NODES", "").strip()
+    if not raw:
+        return None
+    nodes = [int(x) for x in raw.replace(",", " ").split()]
+    logger.info(
+        "KT CPU MoE subpools pinned to NUMA nodes %s (threadpool_count=%d)",
+        nodes,
+        threadpool_count,
+    )
+    return nodes
+
+
 def resolve_kt_weight_path_for_layer(weight_path: str, layer_idx: int) -> str:
     """Resolve a per-layer KT weight path without requiring a launcher patch."""
     if "{layer_idx}" in weight_path:
@@ -397,6 +426,29 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # the global placement table; the prefix placement is identical either
         # way, so it is rebuilt at the local width and every consumer below
         # (the CPU kernel, routing, the checkpoint loader) reads one table.
+        #
+        # That rebuild is only correct when the layer is NARROWER than the global
+        # table, which is what sharding does.  A layer that is WIDER means the
+        # table was built from a stale idea of how many experts this layer has,
+        # and rebuilding silently discards the placement strategy the user asked
+        # for -- it does not fail, it just serves a different, worse placement
+        # forever.  GLM-5.3 hit exactly this: shared-expert fusion appends the
+        # shared expert as slot n_routed_experts, so FusedMoE is 289 wide while
+        # kt_expert_masks sized its tables from n_routed_experts=288.  The
+        # fallback then pinned the always-active fused slot to the CPU, costing a
+        # host round trip on every token, with nothing in the log to say so.
+        if (
+            self.gpu_experts_mask is not None
+            and self.gpu_experts_mask.numel() < num_experts
+        ):
+            raise ValueError(
+                f"KT layer {self.kt_config.layer_idx} has {num_experts} experts but the "
+                f"placement table was built for {self.gpu_experts_mask.numel()}. A layer "
+                "may only be narrower than the global table (expert-parallel sharding), "
+                "never wider. This usually means something appended experts after "
+                "kt_expert_masks read n_routed_experts -- shared-expert fusion is the "
+                "known case; run with --disable-shared-experts-fusion."
+            )
         if (
             self.gpu_experts_mask is None
             or self.gpu_experts_mask.numel() != num_experts
@@ -421,7 +473,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 gpu_experts_mask=self.gpu_experts_mask,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
-                numa_nodes=None,
+                numa_nodes=_kt_numa_nodes(self.kt_config.threadpool_count),
                 weight_path=resolve_kt_weight_path_for_layer(
                     self.kt_config.weight_path, self.kt_config.layer_idx
                 ),
