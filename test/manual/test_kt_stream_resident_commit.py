@@ -132,7 +132,6 @@ def run(path, scenario):
     os.environ["KT_PREFILL_STREAM"] = "1"
     mod = _load(path)
     mod._KT_PREFILL_STREAM = True
-    mod._KT_MXFP4_DEPOOL = True
     mod._KT_GGUF_DEDUP = True
     mod._KT_DYN_RESIDENT = True
     mod._T = 8

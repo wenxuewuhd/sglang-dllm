@@ -43,14 +43,12 @@ KT_STREAM_WARMUP                 0          warm-up passes before the first real
 KT_DYNAMIC_RESIDENT              off        swap the resident set for this prompt's hot-K
 KT_HOT_TAIL_TOKENS               0          count hot experts over the last N prompt
                                             tokens only (0 = the whole prefill)
-KT_MXFP4_DEPOOL                  off        convert MXFP4 on device instead of reading W8A8
 KT_MXFP4_CKPT                    (none)     MXFP4 checkpoint dir; required by depool
 KT_MXFP4_OP_DIR                  (none)     custom-op vendor dir; required by depool
 KT_MXFP4_PREFETCH                **on**     ping-pong prefetch of the next GGUF layer
 KT_MXFP4_BLK_KERNEL              **on**     use the blocked convert kernel
 KT_MXFP4_POOL_NO_PIN             off        do not pin the host pool (pinned by default)
-KT_PREFILL_STREAM_NZ_CHUNK       64         experts per ND->NZ cast chunk (W8A8 reader)
-KT_MXFP4_NZ_CHUNK                32         experts per H2D chunk (depool reader)
+KT_MXFP4_NZ_CHUNK                32         experts per H2D + convert chunk
 KT_MXFP4_COPY_THREADS            32         host copy threads for the pool build
 KT_MXFP4_GGUF_DEDUP              off        read layers from the CPU MoE's GGUF, no pool
 KT_GGUF_TEMPLATE                 (none)     per-layer GGUF path; required by dedup
@@ -60,9 +58,6 @@ KT_GGUF_PY_DIR                   (none)     fallback location for the gguf reade
 The two marked **on** default to enabled, which makes them the ones most likely to
 surprise: a reader who has never heard of them is already using them.
 
-Note the crossed names in the two chunk sizes: the constant ``_NZ_CHUNK`` reads
-``KT_PREFILL_STREAM_NZ_CHUNK`` while ``_H2D_CHUNK`` reads ``KT_MXFP4_NZ_CHUNK``.  They are
-different knobs on different readers and neither name predicts the other.
 """
 
 import functools
@@ -93,23 +88,11 @@ _KT_STREAM_STRICT = os.environ.get("KT_STREAM_STRICT", "") == "1"
 # experts are NPU-resident vs CPU, not the computed output.
 _HOT_TAIL = int(os.environ.get("KT_HOT_TAIL_TOKENS", "0") or "0")
 _CKPT = os.environ.get("KT_PREFILL_STREAM_CKPT", "")
-_NZ_CHUNK = int(
-    os.environ.get("KT_PREFILL_STREAM_NZ_CHUNK", "64")
-)  # experts/chunk for ND->NZ
 _ACL_FORMAT_FRACTAL_NZ = 29
-_ACL_FORMAT_ND = (
-    2  # the plain row-major format; the NZ constant had a name, this did not
-)
 # Experts per H2D + convert chunk on the GGUF-dedup path.  Same variable the AscendC wrapper
 # chunks convert_proj_blk by, so both stay in step.
 _H2D_CHUNK = int(os.environ.get("KT_MXFP4_NZ_CHUNK", "32") or "32")
 
-# DEPOOL (KT_MXFP4_DEPOOL=1): instead of a resident W8A8 NZ pool (~277GB for DeepSeek-V4), store the
-# MXFP4 codes+scale (~137GB, 4-bit) and convert MXFP4 -> W8A8-NZ on the fly per layer with the fused
-# AscendC kernel (KT_MXFP4_OP_DIR), hidden under the H2D.  Fully gated: when off, the W8A8 path
-# below is unchanged.  The MXFP4 weights are the original safetensors (.weight = codes, .scale =
-# e8m0), NOT the W8A8 checkpoint.
-_KT_MXFP4_DEPOOL = os.environ.get("KT_MXFP4_DEPOOL", "") == "1"
 # KT_MXFP4_POOL_NO_PIN=1: store the MXFP4 pool in pageable (unpinned) host memory.  Pinning the
 # ~140GB pool inflates the decode CPU-MoE wall (pin tax); unpinning removes it at the cost of a
 # slower streaming prefill H2D (no async DMA).  Default pinned (fast prefill).
@@ -379,10 +362,7 @@ def _mxfp4_convert_blk_fn():
 
 _KT_BLK_KERNEL = os.environ.get("KT_MXFP4_BLK_KERNEL", "1") == "1"
 
-# Module-level singletons (shared across all layers / wrapper instances).
-_POOL: dict = {}  # layer_idx -> (w13_host_nz, w2_host_nz, s13_bf16_npu, s2_bf16_npu)
 _SLOT: dict = {}  # 'w13'/'w2' -> reused NZ HBM slot
-_POOL_BUILT = False
 _SLOT_RESERVED = False
 
 # Dynamic decode-resident expert pool.  During a streaming prefill we count per-layer expert
@@ -393,7 +373,6 @@ _SLOT_RESERVED = False
 #   1. KTEPWrapperMethod.gpu_experts_mask / logical_to_gpu_index (device tensors)
 #   2. kt_kernel wrapper.gpu_experts_mask (pinned CPU bool, shared with C++ by pointer)
 _KT_DYN_RESIDENT = os.environ.get("KT_DYNAMIC_RESIDENT", "") == "1"
-_REQ_HIST: dict = {}  # layer_idx -> int64 device tensor [E] (current prefill pass)
 _REGISTRY: dict = {}  # layer_idx -> (layer_module, ktep_wrapper)
 
 # Incremental build: capture MATERIALISES each expert's int8 weight straight into that layer's FINAL
@@ -491,20 +470,6 @@ def _next_moe_layer(layer):
     return ls[i + 1] if i + 1 < len(ls) else None
 
 
-def _layer_buf(L: int, E: int, H: int, I: int) -> dict:
-    b = _LBUF.get(L)
-    if b is None:
-        b = {
-            "flat13": torch.empty(E * 2 * I * H, dtype=torch.int8, pin_memory=True),
-            "flat2": torch.empty(E * H * I, dtype=torch.int8, pin_memory=True),
-            "s13": torch.empty(E, 2 * I, 1, dtype=torch.float32),
-            "s2": torch.empty(E, H, 1, dtype=torch.float32),
-            "count": 0,
-        }
-        _LBUF[L] = b
-    return b
-
-
 # ----- parallel O_DIRECT pool reader -----
 # The build bottleneck is reading the expert int8 out of the W8A8 checkpoint.  The loader's buffered
 # single-thread reads are the floor; parallel O_DIRECT (bypassing the page cache) plus a per-expert
@@ -512,15 +477,6 @@ def _layer_buf(L: int, E: int, H: int, I: int) -> dict:
 # rearrange (experts are expert-major yet scattered on disk) is then the hard cap.
 _NVME_ALIGN = 4096
 _IDX = None
-
-
-def _index():
-    global _IDX
-    if _IDX is None:
-        _IDX = json.load(
-            open(os.path.join(_ckpt_dir(), "model.safetensors.index.json"))
-        )["weight_map"]
-    return _IDX
 
 
 def _shard_header(path):
@@ -575,13 +531,6 @@ class _ExpertNaming(NamedTuple):
         return f"{self.prefix_tmpl.format(L=layer)}.{expert}.{proj}.{self.scale}"
 
 
-# (gate, up, down), weight suffix, scale suffix.  Probed in order; the first whose expert-0
-# gate tensor exists in the index wins.  ``gate``/``up`` map to the two halves of w13 and
-# ``down`` to w2, so DeepSeek's (w1, w3, w2) is the right order, not (w1, w2, w3).
-_W8A8_NAMING_CANDIDATES = (
-    (("w1", "w3", "w2"), "weight", "weight_scale"),  # DeepSeek-V4-Flash
-    (("gate_proj", "up_proj", "down_proj"), "weight", "weight_scale"),  # GLM-5.3 / HF
-)
 _MXFP4_NAMING_CANDIDATES = (
     (("w1", "w3", "w2"), "weight", "scale"),  # DeepSeek-V4-Flash native MXFP4
     (
@@ -645,175 +594,8 @@ def _expert_layers(weight_map, naming: _ExpertNaming, num_layers: int) -> tuple:
     )
 
 
-def _w8a8_naming() -> _ExpertNaming:
-    return _detect_expert_naming(_index(), _W8A8_NAMING_CANDIDATES, "W8A8")
-
-
 def _mxfp4_naming() -> _ExpertNaming:
     return _detect_expert_naming(_mxfp4_index(), _MXFP4_NAMING_CANDIDATES, "MXFP4")
-
-
-def _read_layer_odirect(L, E, H, I, scratch) -> None:
-    """Fill ``_LBUF[L]`` (pinned flat13/flat2 + scales) via O_DIRECT reads + per-expert rearrange.
-
-    ``scratch``: a page-aligned mmap at least as large as one shard's expert region (reused).
-    """
-    from safetensors import safe_open
-
-    idx = _index()
-    nm = _w8a8_naming()
-    b = _layer_buf(L, E, H, I)
-    f13 = b["flat13"].view(E, 2 * I, H)
-    f2 = b["flat2"].view(E, H, I)
-    byfile = {}
-    for e in range(E):
-        for p in nm.projs:
-            byfile.setdefault(idx[nm.weight_key(L, e, p)], []).append((e, p))
-    for fn, items in byfile.items():
-        path = os.path.join(_ckpt_dir(), fn)
-        hdr, base = _shard_header(path)
-        offs = {(e, p): hdr[nm.weight_key(L, e, p)]["data_offsets"] for e, p in items}
-        lo = min(o[0] for o in offs.values())
-        hi = max(o[1] for o in offs.values())
-        region = _odirect_region(path, base, lo, hi, scratch)
-        for e, p in items:
-            o0, o1 = offs[(e, p)]
-            blk = torch.frombuffer(region[o0 - lo : o1 - lo], dtype=torch.int8)
-            if p == nm.gate:
-                f13[e, 0:I].copy_(blk.view(I, H))
-            elif p == nm.up:
-                f13[e, I : 2 * I].copy_(blk.view(I, H))
-            else:
-                f2[e].copy_(blk.view(H, I))
-    # scales (tiny) via normal get_tensor
-    sfiles = {}
-    for e in range(E):
-        for p in nm.projs:
-            sfiles.setdefault(idx[nm.scale_key(L, e, p)], []).append((e, p))
-    for fn, items in sfiles.items():
-        with safe_open(os.path.join(_ckpt_dir(), fn), framework="pt") as f:
-            for e, p in items:
-                t = f.get_tensor(nm.scale_key(L, e, p))
-                if p == nm.gate:
-                    b["s13"][e, 0:I] = t.reshape(I, 1)
-                elif p == nm.up:
-                    b["s13"][e, I : 2 * I] = t.reshape(I, 1)
-                else:
-                    b["s2"][e] = t.reshape(H, 1)
-
-
-_BG = {"ex": None, "done_q": None, "t_start": 0.0, "started": False, "layers": ()}
-
-
-def _start_bg_reads(E, H, I, num_layers, nworkers=8) -> None:
-    """Start the O_DIRECT read workers in the BACKGROUND (host-only, no HBM).
-
-    They overlap the rest of model load: the reads contend with the load on NVMe but use its
-    NPU/CPU phases freely.  The NZ cast happens later in :func:`_finish_bg_build`, which needs
-    HBM scratch.
-    """
-    import mmap
-    import queue
-    import threading
-    import time
-    from concurrent.futures import ThreadPoolExecutor
-
-    layers = _expert_layers(_index(), _w8a8_naming(), num_layers)
-    _BG["layers"] = layers
-    _BG["done_q"] = queue.Queue()
-    _BG["t_start"] = time.perf_counter()
-    _BG["ex"] = ThreadPoolExecutor(max_workers=nworkers)
-    _tls = threading.local()
-
-    def rd(L):
-        if not hasattr(_tls, "scratch"):
-            _tls.scratch = mmap.mmap(
-                -1, 8 * 1024**3
-            )  # page-aligned, per-thread, reused
-        _read_layer_odirect(L, E, H, I, _tls.scratch)
-        _BG["done_q"].put(L)
-
-    for L in layers:
-        _BG["ex"].submit(rd, L)
-    logger.info(
-        "[KT_STREAM] background reads started (%d expert layers %s..%s of %d, %d workers), "
-        "overlapping load",
-        len(layers),
-        layers[0] if layers else "-",
-        layers[-1] if layers else "-",
-        num_layers,
-        nworkers,
-    )
-
-
-def _finish_bg_build(dev) -> None:
-    """Drain the background reads, NZ-casting each layer as its read completes.
-
-    Drains exactly as many layers as :func:`_start_bg_reads` submitted -- the expert-bearing
-    ones, not ``range(num_layers)``, which would block forever on a model with dense layers.
-    """
-    import time
-
-    _free_slot()  # its HBM is the NZ-cast scratch
-    t0 = time.perf_counter()
-    layers = _BG["layers"]
-    for _ in range(len(layers)):
-        L = _BG["done_q"].get()
-        _finalize_layer(L, dev)
-    _BG["ex"].shutdown()
-    logger.info(
-        "[KT_STREAM] pool build done: total %.0fs (NZ drain %.0fs, %d layers)",
-        time.perf_counter() - _BG["t_start"],
-        time.perf_counter() - t0,
-        len(layers),
-    )
-
-
-def _build_pool_parread(E, H, I, num_layers, dev, nworkers=8) -> None:
-    """Non-overlapped path (lazy fallback): start the reads then immediately drain + NZ."""
-    _start_bg_reads(E, H, I, num_layers, nworkers)
-    _finish_bg_build(dev)
-
-
-def _inplace_nz(flat: torch.Tensor, E: int, A: int, B: int, dev) -> torch.Tensor:
-    """Chunked in-place ND[E,A,B] -> FRACTAL_NZ[E,B,A] over the same pinned bytes."""
-    import torch_npu
-
-    nd = flat.view(E, A, B)
-    nz_host = flat.view(E, B, A)
-    for c in range(0, E, _NZ_CHUNK):
-        sub = nd[c : c + _NZ_CHUNK].to(dev).transpose(1, 2).contiguous()
-        nz = torch_npu.npu_format_cast(sub, _ACL_FORMAT_FRACTAL_NZ)
-        nz_host[c : c + _NZ_CHUNK].copy_(nz)
-        del sub, nz
-    torch.npu.empty_cache()
-    return nz_host
-
-
-def _finalize_layer(L: int, dev) -> None:
-    """NZ-cast a completed layer in place and publish it to the pool."""
-    global _POOL_BUILT
-    import time
-
-    E, H, I, num_layers = _get_cfg()
-    n_expert_layers = len(_BG["layers"]) or num_layers
-    b = _LBUF[L]
-    t0 = time.perf_counter()
-    h13 = _inplace_nz(b["flat13"], E, 2 * I, H, dev)  # -> [E, H, 2I] NZ view
-    h2 = _inplace_nz(b["flat2"], E, H, I, dev)  # -> [E, I, H] NZ view
-    s13b = b["s13"].squeeze(-1).to(torch.bfloat16).to(dev)
-    s2b = b["s2"].squeeze(-1).to(torch.bfloat16).to(dev)
-    _POOL[L] = (h13, h2, s13b, s2b)
-    b["s13"] = b["s2"] = None
-    if len(_POOL) == n_expert_layers:
-        _POOL_BUILT = True
-    logger.info(
-        "[KT_STREAM] layer %d NZ-finalized in-loop (%.1fs, %d/%d done)",
-        L,
-        time.perf_counter() - t0,
-        len(_POOL),
-        n_expert_layers,
-    )
 
 
 _IS_PREFILL_PROBE_FAILED = False
@@ -1077,33 +859,6 @@ def _finish_bg_build_mxfp4() -> None:
     )
 
 
-def reserve_slot(E: int, H: int, I: int, dev) -> None:
-    """Allocate the reused NZ HBM streaming slot EARLY, during model load.
-
-    KV-pool sizing measures free HBM after loading, so a slot reserved here is automatically
-    excluded from the KV pool and cannot contend with it mid-forward.  Idempotent.
-    """
-    global _SLOT_RESERVED
-    if _SLOT_RESERVED:
-        return
-    import torch_npu
-
-    s13 = torch_npu.npu_format_cast(
-        torch.empty(E, H, 2 * I, dtype=torch.int8, device=dev), _ACL_FORMAT_FRACTAL_NZ
-    )
-    s2 = torch_npu.npu_format_cast(
-        torch.empty(E, I, H, dtype=torch.int8, device=dev), _ACL_FORMAT_FRACTAL_NZ
-    )
-    _SLOT["w13"], _SLOT["w2"] = s13, s2
-    _SLOT_RESERVED = True
-    logger.info(
-        "[KT_STREAM] reserved streaming slot %s+%s (%.2fGB) at model-load time",
-        tuple(s13.shape),
-        tuple(s2.shape),
-        (s13.numel() + s2.numel()) / 1e9,
-    )
-
-
 def reserve_slot_depool(E: int, H: int, I: int, dev) -> None:
     """Reserve the depool convert-output slot as PLAIN ND ``torch.empty`` (NOT ``format_cast``).
 
@@ -1127,36 +882,12 @@ def reserve_slot_depool(E: int, H: int, I: int, dev) -> None:
     )
 
 
-def _ensure_slot(w13_shape, w2_shape, dev):
-    import torch_npu
-
-    if "w13" not in _SLOT:
-        s13 = torch.empty(w13_shape, dtype=torch.int8, device=dev)
-        s2 = torch.empty(w2_shape, dtype=torch.int8, device=dev)
-        _SLOT["w13"] = torch_npu.npu_format_cast(s13, _ACL_FORMAT_FRACTAL_NZ)
-        _SLOT["w2"] = torch_npu.npu_format_cast(s2, _ACL_FORMAT_FRACTAL_NZ)
-    return _SLOT["w13"], _SLOT["w2"]
-
-
 def _wrapper_dims(wrapper: KTEPWrapperMethod):
     E = int(wrapper.global_num_experts or 0)
     H = int(wrapper.hidden_size or 0)
     I = int(wrapper.intermediate_size_per_partition or 0)
     num_layers = int(wrapper.kt_config.num_layers or 0)
     return E, H, I, num_layers
-
-
-def _free_slot() -> None:
-    """Release the reserved slot so its HBM can serve as build scratch.
-
-    The NZ cast has to round-trip through HBM, and the build runs before any streaming, so the
-    slot is idle then; :func:`_ensure_slot` re-allocates it afterwards.  The net HBM the
-    feature needs stays at one slot.
-    """
-    global _SLOT_RESERVED
-    _SLOT.clear()
-    _SLOT_RESERVED = False
-    torch.npu.empty_cache()
 
 
 def _remap_resident_params_to_cache(layer: torch.nn.Module, wrapper) -> None:
@@ -1195,7 +926,7 @@ def maybe_reserve_slot(wrapper, dev, layer=None) -> None:
             _REGISTRY[wrapper.kt_config.layer_idx] = (layer, wrapper)
             if _KT_DYN_RESIDENT:
                 _remap_resident_params_to_cache(layer, wrapper)
-        if _KT_MXFP4_DEPOOL and _KT_GGUF_DEDUP:
+        if _KT_GGUF_DEDUP:
             # GGUF dedup: there is no codes pool to build (each layer is read from the GGUF on
             # the fly), so mark it built and skip the lazy serial builder.  The convert-output
             # slot is still reserved so the KV pool is sized around it.
@@ -1207,47 +938,34 @@ def maybe_reserve_slot(wrapper, dev, layer=None) -> None:
             if E and H and I:
                 reserve_slot_depool(E, H, I, dev)
             return
-        if _KT_MXFP4_DEPOOL:
-            # Depool builds no W8A8 pool.  Reserve the convert-output slot (same reason as the
-            # dedup branch) and build the small MXFP4 pool with parallel O_DIRECT reads started
-            # on the first process_weights call, drained on the last layer.
-            if E and H and I:
-                reserve_slot_depool(E, H, I, dev)
-            if E and H and I and num_layers and not _MXFP4_POOL_BUILT:
-                if not _BG_MX["started"]:
-                    _BG_MX["started"] = True
-                    _start_bg_reads_mxfp4(E, H, I, num_layers)
-                # NOTE: num_layers - 1, and NOT _last_moe_layer(), even though that reads
-                # like the more careful choice. _moe_layers() is derived from _REGISTRY,
-                # which this very function fills one layer at a time a few lines above --
-                # so during layer L's call the registry holds only 3..L and
-                # _last_moe_layer() returns L itself. The comparison would then be true on
-                # EVERY layer and drain at the first one, throwing away the whole point of
-                # starting these reads in the background.
-                #
-                # The registry-derived helpers are forward-time tools; every other caller
-                # of _moe_layers() runs after load, when it is complete.
-                #
-                # The residual limitation is real but hypothetical here: on a checkpoint
-                # whose last layer is dense, num_layers-1 is not a KT layer and this never
-                # fires. GLM-5.3-Flash has num_hidden_layers=45 with MoE on 3..44, so the
-                # trigger is 44 either way. Fixing that properly needs the dense-layer
-                # range from config, not the registry.
-                if wrapper.kt_config.layer_idx == num_layers - 1:
-                    _finish_bg_build_mxfp4()
-            return
+        # Reserve the convert-output slot (same reason as the dedup branch) and build the
+        # small MXFP4 pool with parallel O_DIRECT reads started on the first process_weights
+        # call, drained on the last layer.
         if E and H and I:
-            reserve_slot(E, H, I, dev)
-        # Overlap the pool build's O_DIRECT reads with the rest of model load: start the
-        # background reads on the FIRST process_weights call (host-only, while the remaining
-        # weights load), then drain + NZ-cast on the LAST call.
-        if E and H and I and num_layers and not _POOL_BUILT:
-            if not _BG["started"]:
-                _BG["started"] = True
-                _start_bg_reads(E, H, I, num_layers)
-            if wrapper.kt_config.layer_idx == num_layers - 1:  # see the note above
-                _finish_bg_build(dev)
-                reserve_slot(E, H, I, dev)
+            reserve_slot_depool(E, H, I, dev)
+        if E and H and I and num_layers and not _MXFP4_POOL_BUILT:
+            if not _BG_MX["started"]:
+                _BG_MX["started"] = True
+                _start_bg_reads_mxfp4(E, H, I, num_layers)
+            # NOTE: num_layers - 1, and NOT _last_moe_layer(), even though that reads
+            # like the more careful choice. _moe_layers() is derived from _REGISTRY,
+            # which this very function fills one layer at a time a few lines above --
+            # so during layer L's call the registry holds only 3..L and
+            # _last_moe_layer() returns L itself. The comparison would then be true on
+            # EVERY layer and drain at the first one, throwing away the whole point of
+            # starting these reads in the background.
+            #
+            # The registry-derived helpers are forward-time tools; every other caller
+            # of _moe_layers() runs after load, when it is complete.
+            #
+            # The residual limitation is real but hypothetical here: on a checkpoint
+            # whose last layer is dense, num_layers-1 is not a KT layer and this never
+            # fires. GLM-5.3-Flash has num_hidden_layers=45 with MoE on 3..44, so the
+            # trigger is 44 either way. Fixing that properly needs the dense-layer
+            # range from config, not the registry.
+            if wrapper.kt_config.layer_idx == num_layers - 1:
+                _finish_bg_build_mxfp4()
+        return
     except Exception as e:
         logger.warning(
             "[KT_STREAM] reserve/build at load failed (%s); lazy fallback",
@@ -1487,15 +1205,6 @@ def _stream_layer_weights(layer_idx: int, dev):
 
     Returns ``(w13, w13_scale, w2, w2_scale)``.
     """
-    if not _KT_MXFP4_DEPOOL:
-        h13, h2, s13b, s2b = _POOL[layer_idx]
-        slot13, slot2 = _ensure_slot(h13.shape, h2.shape, dev)
-        slot13.copy_(
-            h13
-        )  # H2D this layer's experts (default stream, serial single slot)
-        slot2.copy_(h2)
-        return slot13, s13b, slot2, s2b
-
     E, H, I, num_layers = _get_cfg()
     # Reserved streaming slot (maybe_reserve_slot): the convert writes the full expert set
     # straight into it, reused across layers, so no per-layer multi-GB output allocation
@@ -1567,43 +1276,21 @@ def _streaming_forward(layer_idx, x, topk_output, top_k, num_experts) -> torch.T
     # Dynamic resident: the W8A8 path gathers from the resident W8A8 pool at the end of the
     # prefill; the depool path gathers the hot-K experts out of the weights it just converted.
     if _KT_DYN_RESIDENT:
-        E, _, _, num_layers = _get_cfg()
-        if _KT_MXFP4_DEPOOL:
-            try:
-                _apply_resident_layer_depool(layer_idx, topk_output, w13, s13b, w2, s2b)
-            except Exception as e:
-                # NOT "static set kept": earlier layers in this pass may already have had their
-                # resident weights rewritten.  Commit their masks before falling back, or they
-                # silently compute the wrong experts.  See the commit-protocol note above.
-                logger.warning(
-                    "[KT_STREAM] inline resident L%d failed (%s); this layer keeps the "
-                    "static set, already-written layers get committed",
-                    layer_idx,
-                    repr(e)[:140],
-                )
-                _abort_resident_commit(f"inline resident L{layer_idx}: {repr(e)[:80]}")
-                if _KT_STREAM_STRICT:
-                    raise
-        else:
-            moe_layers = _moe_layers()
-            if layer_idx == moe_layers[0]:
-                _REQ_HIST.clear()
-            _REQ_HIST[layer_idx] = torch.bincount(
-                _hist_ids(topk_output.topk_ids).to(torch.int64), minlength=E
-            )[:E]
-            if layer_idx == moe_layers[-1] and len(_REQ_HIST) == len(moe_layers):
-                try:
-                    _apply_dynamic_residency()
-                except Exception as e:
-                    logger.warning(
-                        "[KT_STREAM] dynamic residency failed (%s); static set kept",
-                        repr(e)[:160],
-                    )
-                    # Gated like its sibling twenty lines up. KT_STREAM_STRICT promises
-                    # that every streaming failure becomes loud; two of the four handlers
-                    # did not honour it, so the flag could not be trusted to mean that.
-                    if _KT_STREAM_STRICT:
-                        raise
+        try:
+            _apply_resident_layer_depool(layer_idx, topk_output, w13, s13b, w2, s2b)
+        except Exception as e:
+            # NOT "static set kept": earlier layers in this pass may already have had their
+            # resident weights rewritten.  Commit their masks before falling back, or they
+            # silently compute the wrong experts.  See the commit-protocol note above.
+            logger.warning(
+                "[KT_STREAM] inline resident L%d failed (%s); this layer keeps the "
+                "static set, already-written layers get committed",
+                layer_idx,
+                repr(e)[:140],
+            )
+            _abort_resident_commit(f"inline resident L{layer_idx}: {repr(e)[:80]}")
+            if _KT_STREAM_STRICT:
+                raise
     return out
 
 
@@ -1836,95 +1523,6 @@ def _apply_resident_layer_depool(L, topk_output, w13, s13b, w2, s2b):
         _flush_resident_masks("end of pass")
 
 
-def _apply_dynamic_residency() -> None:
-    """Replace the static-prefix resident expert set with this prefill's per-layer top-K.
-
-    Updates the resident weights, scales and routing structures in place (decode-graph and
-    C++-side safe).  Called at the end of a streaming prefill pass.
-    """
-    import time
-
-    E, H, I, num_layers = _get_cfg()
-    moe_layers = _moe_layers()
-    for L in moe_layers:
-        _pool_ok = (L in _MXFP4_POOL) if _KT_MXFP4_DEPOOL else (L in _POOL)
-        if L not in _REQ_HIST or L not in _REGISTRY or not _pool_ok:
-            logger.warning("[KT_STREAM] dyn-resident: layer %d incomplete; abort", L)
-            return
-    t0 = time.perf_counter()
-    share_sum = 0.0
-    K = 0
-    for L in moe_layers:
-        layer, wrap = _REGISTRY[L]
-        K = int(wrap.num_gpu_experts)
-        if K <= 0 or wrap.gpu_experts_mask is None or wrap.logical_to_gpu_index is None:
-            logger.warning("[KT_STREAM] dyn-resident: no resident slots/masks; abort")
-            return
-        counts = _REQ_HIST[L]
-        top = _pick_resident_top(counts, K)  # device, ascending logical ids
-        top_cpu = top.cpu()
-        if _KT_MXFP4_DEPOOL:
-            # Convert ONLY the hot-K experts' MXFP4 into the resident slots.  MXFP4 codes are
-            # plain packed bytes (not NZ), so a first-dim [top] slice is format-safe, and the
-            # fused kernel emits resident-shaped NZ + bf16 scale straight into place -- no
-            # whole-pool H2D and no NZ round-trip gather.
-            c13, s13, c2, s2 = _MXFP4_POOL[L]
-            dev = layer.w13_weight.device
-            c13d = _stage_pin_h2d(c13, top_cpu, dev)  # pinned staging -> DMA H2D
-            s13d = _stage_pin_h2d(s13, top_cpu, dev)
-            c2d = _stage_pin_h2d(c2, top_cpu, dev)
-            s2d = _stage_pin_h2d(s2, top_cpu, dev)
-            w13_top, s13b_top, w2_top, s2b_top = _mxfp4_convert_fn()(
-                c13d, s13d, c2d, s2d, H, I
-            )
-            layer.w13_weight.data.copy_(w13_top)
-            layer.w2_weight.data.copy_(w2_top)
-            layer.w13_weight_scale.data.copy_(s13b_top)
-            layer.w2_weight_scale.data.copy_(s2b_top)
-        else:
-            # Gather the resident experts ON THE DEVICE: host pool slices are format-unaware
-            # (NZ bytes sliced as ND give garbage), device slices are format-aware.  So H2D the
-            # whole pool into the NZ slot and slice there.
-            h13, h2, s13b, s2b = _POOL[L]
-            dev = layer.w13_weight.device
-            slot13, slot2 = _ensure_slot(h13.shape, h2.shape, dev)  # [E,...] NPU NZ
-            slot13.copy_(h13)  # whole-tensor H2D (correct NZ)
-            slot2.copy_(h2)
-            # Gather via an ND round trip: a per-slot NZ device copy is bandwidth-pathological,
-            # whereas format_cast NZ->ND runs at full HBM bandwidth, the ND fancy-index is
-            # cheap, and ND->NZ restores the format.  Equivalent, much faster.
-            import torch_npu as _tn
-
-            _topd = top.to(dev)
-            _nd13 = _tn.npu_format_cast(slot13, _ACL_FORMAT_ND)  # whole pool NZ->ND
-            _g13 = _tn.npu_format_cast(
-                _nd13[_topd].contiguous(), _ACL_FORMAT_FRACTAL_NZ
-            )
-            del _nd13
-            layer.w13_weight.data.copy_(_g13)
-            del _g13
-            _nd2 = _tn.npu_format_cast(slot2, _ACL_FORMAT_ND)
-            _g2 = _tn.npu_format_cast(_nd2[_topd].contiguous(), _ACL_FORMAT_FRACTAL_NZ)
-            del _nd2
-            layer.w2_weight.data.copy_(_g2)
-            del _g2
-            layer.w13_weight_scale.data.copy_(s13b[top])
-            layer.w2_weight_scale.data.copy_(s2b[top])
-        _set_resident_masks(wrap, top_cpu, K, E)
-        share_sum += float(counts[top].sum().item()) / max(
-            float(counts.sum().item()), 1.0
-        )
-    torch.npu.synchronize()
-    logger.info(
-        "[KT_STREAM] dynamic resident applied: top-%d x %d layers in %.1fs, "
-        "prefill top-K activation share=%.3f",
-        K,
-        len(moe_layers),
-        time.perf_counter() - t0,
-        share_sum / max(len(moe_layers), 1),
-    )
-
-
 # Run the first N real prefills through the HYBRID path (not streamed) to prime the CPU MoE.
 # Streamed prefills never invoke kt_kernel, so a stream-everything server (low threshold) keeps the
 # CPU MoE cold and decode stays slow until enough hybrid traffic warms it.  The OS page cache is not
@@ -2001,17 +1599,10 @@ def maybe_streaming_forward(
             )
             return None
         _remember_dims(E, H, I, num_layers)
-        if _KT_MXFP4_DEPOOL:
-            if _KT_GGUF_DEDUP:
-                pass  # no pool: each layer is read from the CPU MoE's GGUF on the fly
-            elif not _MXFP4_POOL_BUILT:
-                # Normally built at model-load time (maybe_reserve_slot, parallel O_DIRECT);
-                # this serial builder only runs if that path failed or never started.
-                _build_mxfp4_pool(E, num_layers)
-        elif not _POOL_BUILT:
-            # Lazy fallback: parallel O_DIRECT build.  _build_pool_parread frees the slot
-            # internally for NZ scratch; _stream_layer_weights re-allocates it afterwards.
-            _build_pool_parread(E, H, I, num_layers, hidden_states.device)
+        if not _KT_GGUF_DEDUP and not _MXFP4_POOL_BUILT:
+            # Normally built at model-load time (maybe_reserve_slot, parallel O_DIRECT);
+            # this serial builder only runs if that path failed or never started.
+            _build_mxfp4_pool(E, num_layers)
         top_k = topk_output.topk_ids.shape[1]
         return _streaming_forward(layer_idx, hidden_states, topk_output, top_k, E)
     except (
