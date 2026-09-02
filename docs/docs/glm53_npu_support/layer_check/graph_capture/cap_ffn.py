@@ -13,6 +13,7 @@ Three questions, in order:
 rank's weights into the same buffers between replays -- so a value baked at
 capture time would corrupt all 16 terms.
 """
+import os
 import sys, argparse, torch
 import os as _os
 from pathlib import Path as _Path
@@ -26,7 +27,7 @@ sys.path.insert(0, LC); sys.path.insert(0, G)
 import gcap
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--case", default="${GLM53_ROOT}/env/goldens/dense_ffn_layer02_t8192.pt")
+ap.add_argument("--case", default=f"{_GLM53_ROOT}/env/goldens/dense_ffn_layer02_t8192.pt")
 ap.add_argument("-M", type=int, default=16)
 ap.add_argument("--tp", type=int, default=16)
 ap.add_argument("--port", type=int, default=29755)
@@ -36,6 +37,9 @@ import torch_npu, custom_ops  # noqa
 from pathlib import Path
 from harness import Case, check, report
 import check_dense_ffn as CF
+
+# Root of the workspace holding env/, the goldens and the sibling checkouts.
+_GLM53_ROOT = os.environ.get("GLM53_ROOT") or os.environ.get("GLM53_WORKSPACE") or ""
 
 CF.init_single_process_group(a.port)
 case = Case.load(Path(a.case))

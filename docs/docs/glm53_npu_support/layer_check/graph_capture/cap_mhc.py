@@ -1,4 +1,5 @@
 """mHC decode-shape NPU-graph capture + baked-in-value check."""
+import os
 import sys, argparse, torch, torch_npu  # noqa
 import os as _os
 from pathlib import Path as _Path
@@ -14,7 +15,7 @@ import custom_ops  # registers torch.ops.custom
 from harness import Case
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--case", default="${GLM53_ROOT}/env/goldens/mhc_attn_layer20.pt")
+ap.add_argument("--case", default=f"{_GLM53_ROOT}/env/goldens/mhc_attn_layer20.pt")
 ap.add_argument("-M", type=int, default=16)
 a = ap.parse_args()
 torch.npu.set_device(0); torch.set_grad_enabled(False)
@@ -33,6 +34,9 @@ scale   = case.inputs["weight.scale"].to("npu", torch.float32).contiguous()
 flat    = streams.reshape(-1, n * d).contiguous()
 
 from sglang.kernels.ops.layernorm.mhc import hc_pre, hc_post
+
+# Root of the workspace holding env/, the goldens and the sibling checkouts.
+_GLM53_ROOT = os.environ.get("GLM53_ROOT") or os.environ.get("GLM53_WORKSPACE") or ""
 
 # static output buffers so replay lands somewhere we can read
 def step():

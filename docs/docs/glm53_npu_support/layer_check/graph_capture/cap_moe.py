@@ -1,4 +1,5 @@
 """MoE decode-shape NPU-graph capture + baked-in-value check (rank 0 of TP16)."""
+import os
 import sys, os, argparse, time, torch
 import os as _os
 from pathlib import Path as _Path
@@ -11,7 +12,7 @@ SP = _os.environ.get("SCRATCH", "/tmp/glm53_scratch")
 sys.path.insert(0, LC); sys.path.insert(0, G)
 import gcap
 ap = argparse.ArgumentParser()
-ap.add_argument("--case", default="${GLM53_ROOT}/env/goldens/moe_layer03_s1024.pt")
+ap.add_argument("--case", default=f"{_GLM53_ROOT}/env/goldens/moe_layer03_s1024.pt")
 ap.add_argument("-M", type=int, default=16)
 ap.add_argument("--tp", type=int, default=16)
 ap.add_argument("--port", type=int, default=29711)
@@ -32,6 +33,9 @@ from sglang.srt.server_args import ServerArgs
 get_context().set_server_args(ServerArgs(model_path=CM.MODEL, device="npu", tp_size=a.tp,
     dtype="bfloat16", moe_a2a_backend="none", trust_remote_code=True))
 from sglang.srt.distributed.parallel_state import init_distributed_environment, initialize_model_parallel
+
+# Root of the workspace holding env/, the goldens and the sibling checkouts.
+_GLM53_ROOT = os.environ.get("GLM53_ROOT") or os.environ.get("GLM53_WORKSPACE") or ""
 init_distributed_environment(world_size=1, rank=0, local_rank=0, backend="gloo",
                              distributed_init_method=f"tcp://127.0.0.1:{a.port}")
 initialize_model_parallel(tensor_model_parallel_size=1, backend="gloo")

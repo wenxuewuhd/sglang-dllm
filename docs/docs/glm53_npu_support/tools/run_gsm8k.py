@@ -19,6 +19,7 @@ cookbook's own three GPQA rounds spanned 3.5 points. Treat one run as one sample
 
 from __future__ import annotations
 
+import os
 import argparse
 import json
 import re
@@ -28,7 +29,10 @@ from pathlib import Path
 
 import requests
 
-DATA = Path("${GLM53_ROOT}/env/eval/gsm8k/test.jsonl")
+# Root of the workspace holding env/, the goldens and the sibling checkouts.
+_GLM53_ROOT = os.environ.get("GLM53_ROOT") or os.environ.get("GLM53_WORKSPACE") or ""
+
+DATA = Path(f"{_GLM53_ROOT}/env/eval/gsm8k/test.jsonl")
 # The dev box exports HTTP_PROXY=http://127.0.0.1:1056 and requests honours it even
 # for 127.0.0.1, where the proxy answers 503.
 NO_PROXY = {"http": None, "https": None}

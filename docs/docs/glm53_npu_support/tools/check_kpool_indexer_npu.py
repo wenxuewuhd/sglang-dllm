@@ -22,6 +22,7 @@ Run: npy kpool_stage_b_npu.py --ref ref32k.pt
 
 from __future__ import annotations
 
+import os
 import argparse
 import time
 from pathlib import Path
@@ -29,6 +30,9 @@ from pathlib import Path
 import torch
 
 import torch_npu  # noqa: F401
+
+# Root of the workspace holding env/, the goldens and the sibling checkouts.
+_GLM53_ROOT = os.environ.get("GLM53_ROOT") or os.environ.get("GLM53_WORKSPACE") or ""
 
 DEV = "npu"
 BLOCK = 64
@@ -66,7 +70,7 @@ def _check_hadamard() -> None:
           f"{(H - syl * HAD_SCALE).abs().max().item():.3e}")
     try:
         import sys
-        sys.path.insert(0, "${GLM53_ROOT}/sglang-dllm/python")
+        sys.path.insert(0, f"{_GLM53_ROOT}/sglang-dllm/python")
         from sglang.kernels.ops.quantization.hadamard import hadamard_transform
         got = hadamard_transform(eye.float().to(DEV), scale=128 ** -0.5).cpu().double()
         print(f"[hadamard] vs sglang rotate_activation: max|d| = "

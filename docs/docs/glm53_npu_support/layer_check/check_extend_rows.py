@@ -14,14 +14,18 @@ that the ops are capturable or fast on device -- that needs a machine.
     $ROOT/.venv-ref/bin/python check_extend_rows.py
 """
 
+import os
 import ast
 import pathlib
 import random
 
 import torch
 
+# Root of the workspace holding env/, the goldens and the sibling checkouts.
+_GLM53_ROOT = os.environ.get("GLM53_ROOT") or os.environ.get("GLM53_WORKSPACE") or ""
+
 MODULE = pathlib.Path(
-    "${GLM53_ROOT}/sglang-dllm/python/sglang/srt/"
+    f"{_GLM53_ROOT}/sglang-dllm/python/sglang/srt/"
     "hardware_backend/npu/attention/kpool_indexer_npu.py"
 )
 

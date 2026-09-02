@@ -7,6 +7,7 @@ KDA decode MUTATES the conv/ssm cache, so every timed or scored run is
 sandwiched between a save/restore of the two state tensors -- otherwise
 'eager then replay' would be comparing step N with step N+1.
 """
+import os
 import sys, argparse, time, torch
 import os as _os
 from pathlib import Path as _Path
@@ -19,7 +20,7 @@ SP = _os.environ.get("SCRATCH", "/tmp/glm53_scratch")
 sys.path.insert(0, LC); sys.path.insert(0, G)
 import gcap
 ap = argparse.ArgumentParser()
-ap.add_argument("--case", default="${GLM53_ROOT}/env/goldens/kda_layer00.pt")
+ap.add_argument("--case", default=f"{_GLM53_ROOT}/env/goldens/kda_layer00.pt")
 ap.add_argument("--tp", type=int, default=16)
 ap.add_argument("--batch", type=int, default=16)
 ap.add_argument("--ctx", type=int, default=32768)
@@ -176,6 +177,9 @@ conv_pad = conv.detach().float().cpu().clone(); ssm_pad = ssm.detach().float().c
 eo = gcap.rel(o_pad[:REAL], o_small)
 # which mamba slots actually moved?
 import numpy as _np
+
+# Root of the workspace holding env/, the goldens and the sibling checkouts.
+_GLM53_ROOT = os.environ.get("GLM53_ROOT") or os.environ.get("GLM53_WORKSPACE") or ""
 base_conv = saved[0].float().cpu(); base_ssm = saved[1].float().cpu()
 def moved(t, b):
     return [i for i in range(t.shape[0])

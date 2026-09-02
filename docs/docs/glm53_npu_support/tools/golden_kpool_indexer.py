@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -122,7 +123,8 @@ def build_prompt_ids(model_dir: Path, seq: int) -> torch.Tensor:
     """Real text, not random ids: concatenate this repo's markdown docs."""
     tok = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
     repo = Path(__file__).resolve()
-    root = Path("${GLM53_ROOT}/sglang-dllm")
+    # Sibling SGLang checkout; GLM53_ROOT (or GLM53_WORKSPACE) names the workspace.
+    root = Path(os.environ.get("GLM53_ROOT") or os.environ.get("GLM53_WORKSPACE") or "") / "sglang-dllm"
     texts = []
     total = 0
     for p in sorted(root.rglob("*.md")):

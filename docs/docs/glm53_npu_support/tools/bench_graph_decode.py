@@ -13,12 +13,16 @@ is shared, and numbers taken while someone else's training job is up are worthle
 
     $VENV/bin/python bench_graph_decode.py
 """
+import os
 import argparse
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
+
+# Root of the workspace holding env/, the goldens and the sibling checkouts.
+_GLM53_ROOT = os.environ.get("GLM53_ROOT") or os.environ.get("GLM53_WORKSPACE") or ""
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--concurrency", default="1,2,4,8,16",
@@ -31,7 +35,7 @@ args = ap.parse_args()
 CONCURRENCY = [int(x) for x in args.concurrency.split(",")]
 
 NP = {"http": None, "https": None}
-G = "${GLM53_ROOT}/env/goldens/logits"
+G = f"{_GLM53_ROOT}/env/goldens/logits"
 pools = {
     "short (13 tok)": [d["ids"] for d in json.load(open(f"{G}/ref_server_eager_short_d100.json"))["data"]],
     "long (3256 tok)": [d["ids"] for d in json.load(open(f"{G}/ref_server_eager_long_d100.json"))["data"]],

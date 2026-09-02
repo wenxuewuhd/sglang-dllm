@@ -14,12 +14,16 @@ coherent continuation that branches at a near-tied token.
 
     $VENV/bin/python check_graph_padding.py
 """
+import os
 import json
 from concurrent.futures import ThreadPoolExecutor
 import requests
 
+# Root of the workspace holding env/, the goldens and the sibling checkouts.
+_GLM53_ROOT = os.environ.get("GLM53_ROOT") or os.environ.get("GLM53_WORKSPACE") or ""
+
 PORT = 30003
-G = "${GLM53_ROOT}/env/goldens/logits/ref_server_eager_short_d100.json"
+G = f"{_GLM53_ROOT}/env/goldens/logits/ref_server_eager_short_d100.json"
 ref = json.load(open(G))["data"]
 NOPROXY = {"http": None, "https": None}
 
