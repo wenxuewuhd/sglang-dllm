@@ -122,9 +122,6 @@ _GGUF_BLOCKS: dict = (
 
 _MXFP4_POOL: dict = {}  # layer_idx -> (c13, s13, c2, s2) pinned host MXFP4 (codes+e8m0)
 _MXFP4_POOL_BUILT = False  # set once the pool is fully populated
-_MXSTAGE: dict = (
-    {}
-)  # shape -> reused pinned [K,...] staging buf for the dyn-resident switch
 _MXIDX = None  # cached weight_map of the MXFP4 checkpoint index
 
 # ``npu_moe_init_routing_v2(expert_tokens_num_type=1)`` returns the per-expert token COUNT, which is
@@ -309,23 +306,6 @@ def _prefetch_ensure(layer):
     return layer % 2
 
 
-def _stage_pin_h2d(src, idx_cpu, dev):
-    """Gather ``src[idx_cpu]`` (K hot experts) into a reused pinned buffer, then DMA to ``dev``.
-
-    Plain advanced indexing returns an UNpinned tensor, and the following H2D then loses DMA.
-    ``index_select`` into a pinned out buffer keeps the copy on the DMA path.  Works whether or
-    not the pool itself is pinned.
-    """
-    K = int(idx_cpu.numel())
-    shp = (K,) + tuple(src.shape[1:])
-    buf = _MXSTAGE.get(shp)
-    if buf is None:
-        buf = torch.empty(shp, dtype=src.dtype, pin_memory=True)
-        _MXSTAGE[shp] = buf
-    torch.index_select(src, 0, idx_cpu, out=buf)
-    return buf.to(dev, non_blocking=True)
-
-
 def _mxfp4_op_dir_on_path() -> None:
     """Put the AscendC MXFP4 operator wrapper on ``sys.path``.
 
@@ -448,18 +428,6 @@ def _first_moe_layer():
     return ls[0] if ls else None
 
 
-def _last_moe_layer():
-    """The last layer that runs a KT MoE, per the load-time registry.
-
-    FORWARD TIME ONLY, like everything else derived from _moe_layers(). During model load
-    the registry is still being filled one layer at a time, so this returns whichever
-    layer is being processed right now -- which makes `layer_idx == _last_moe_layer()`
-    true on every layer, not on the last one. Load-time triggers use num_layers - 1.
-    """
-    ls = _moe_layers()
-    return ls[-1] if ls else None
-
-
 def _next_moe_layer(layer):
     """The layer that will be streamed after ``layer``, or ``None`` if it is the last."""
     ls = _moe_layers()
@@ -497,9 +465,8 @@ def _shard_header(path):
 #                             {gate,up,down}_proj.{weight,weight_scale}
 #                     MXFP4   ... .{gate,up,down}_proj.{weight_packed,weight_scale}
 #
-# Hardcoding the DeepSeek spelling is what made this whole module fall back to the hybrid
-# path on GLM, and hardcoding both spellings only moves the problem to the next checkpoint.
-# So probe the checkpoint's own index, exactly as
+# Hardcoding both spellings only moves the problem to the next checkpoint, so probe the
+# checkpoint's own index, exactly as
 # ``kt-kernel/tools/mxfp4_gguf/convert_mxfp4_gguf.py`` already does for the GGUF conversion.
 #
 # That helper is deliberately NOT imported.  It lives in a tools/ script directory of the
@@ -602,10 +569,9 @@ _IS_PREFILL_PROBE_FAILED = False
 
 
 def _is_prefill() -> bool:
-    # Fails OPEN: if we cannot tell, assume prefill, because taking the streaming path
-    # during graph capture is the failure we can still detect downstream, whereas
-    # skipping it silently is not. Logged once -- this used to swallow with no trace at
-    # all, so a torch_npu that stopped answering looked exactly like normal operation.
+    # Fails OPEN: if we cannot tell, assume prefill -- taking the streaming path during
+    # graph capture is detectable downstream, skipping it silently is not. Logged once, so
+    # a torch_npu that stops answering does not look like normal operation.
     global _IS_PREFILL_PROBE_FAILED
     try:
         return not torch.npu.is_current_stream_capturing()
@@ -947,22 +913,11 @@ def maybe_reserve_slot(wrapper, dev, layer=None) -> None:
             if not _BG_MX["started"]:
                 _BG_MX["started"] = True
                 _start_bg_reads_mxfp4(E, H, I, num_layers)
-            # NOTE: num_layers - 1, and NOT _last_moe_layer(), even though that reads
-            # like the more careful choice. _moe_layers() is derived from _REGISTRY,
-            # which this very function fills one layer at a time a few lines above --
-            # so during layer L's call the registry holds only 3..L and
-            # _last_moe_layer() returns L itself. The comparison would then be true on
-            # EVERY layer and drain at the first one, throwing away the whole point of
-            # starting these reads in the background.
-            #
-            # The registry-derived helpers are forward-time tools; every other caller
-            # of _moe_layers() runs after load, when it is complete.
-            #
-            # The residual limitation is real but hypothetical here: on a checkpoint
-            # whose last layer is dense, num_layers-1 is not a KT layer and this never
-            # fires. GLM-5.3-Flash has num_hidden_layers=45 with MoE on 3..44, so the
-            # trigger is 44 either way. Fixing that properly needs the dense-layer
-            # range from config, not the registry.
+            # num_layers - 1, not anything derived from _moe_layers(): that reads _REGISTRY,
+            # which this function is still filling, so it would name the CURRENT layer and
+            # drain at the first one instead of the last. Residual limitation: on a
+            # checkpoint whose last layer is dense this never fires. GLM-5.3-Flash has MoE
+            # on 3..44 of 45, so 44 either way; fixing it needs the dense range from config.
             if wrapper.kt_config.layer_idx == num_layers - 1:
                 _finish_bg_build_mxfp4()
         return
@@ -1002,11 +957,7 @@ _SWIGLU_LOGGED: set[tuple[float, str]] = set()
 
 
 def _log_stream_swiglu_once(limit: float, source: str) -> None:
-    """Report the streaming clamp once per distinct (limit, source).
-
-    This was a bare print() behind an lru_cache used purely for its side effect: the
-    cache was the once-ness and the return value was always None. A set says that.
-    """
+    """Report the streaming clamp once per distinct (limit, source)."""
     key = (limit, source)
     if key in _SWIGLU_LOGGED:
         return
@@ -1163,12 +1114,9 @@ def _streaming_fused_experts(
 def _convert_blk_chunked(host13, host2, H, I, dev, slot13, slot2):
     """H2D and convert the layer's GGUF blocks one expert chunk at a time.
 
-    The whole-layer staging copy this replaces put ~3.6 GiB of raw blocks on the die purely so
-    convert_proj_blk could slice them, on the same prefill that then has to find ~514 MiB of
-    convert transient -- an over-budget die fails there, silently falls back to hybrid, and (see
-    the commit-protocol note below) used to leave the resident set inconsistent.  A dim-0 slice
-    of the pinned ping-pong buffer is still contiguous and still pinned, so the DMA path is
-    unchanged; only the peak is, from ~3.6 GiB to ~3.6 * chunk/E.
+    Peak goes from ~3.6 GiB of raw blocks staged whole to ~3.6 * chunk/E, on the same prefill
+    that must also find ~514 MiB of convert transient.  A dim-0 slice of the pinned ping-pong
+    buffer is still contiguous and still pinned, so the DMA path is unchanged.
 
     Chunk size is KT_MXFP4_NZ_CHUNK, the same variable convert_proj_blk chunks its own loop by,
     so the kernel sees exactly the launch shape it saw before.
@@ -1337,22 +1285,19 @@ def _set_resident_masks(wrap, top_cpu, K, E):
 # ---------------------------------------------------------------------------
 #  Resident-set commit protocol (silent-correctness hazard, see below)
 # ---------------------------------------------------------------------------
-# The depool path rewrites a layer's resident WEIGHTS the moment that layer is streamed, but the
-# matching MASKS (gpu_experts_mask / logical_to_gpu_index / kt-kernel's pinned C++ mask) used to be
-# deferred to the last MoE layer to avoid a per-layer host sync.  Those two facts together are a
-# silent wrong-answer bug: if the streaming pass ABORTS at layer L (a convert OOM is exactly what
-# an over-budget resident count produces), every layer < L holds expert ``top[i]``'s weights in
-# slot ``i`` while its mask still says slot ``i`` is expert ``i``.  Slot ``i`` then computes the
-# wrong expert's function, expert ``i`` is computed nowhere, and NOTHING raises -- the handler even
-# logs "static set kept", which for those layers is false.
+# A layer's resident WEIGHTS are rewritten the moment it is streamed; its MASKS
+# (gpu_experts_mask / logical_to_gpu_index / kt-kernel's pinned C++ mask) are the COMMIT of that
+# write.  If the two are allowed to drift -- masks deferred to the last MoE layer, say, to save a
+# per-layer host sync -- then a pass that ABORTS at layer L (a convert OOM, exactly what an
+# over-budget resident count produces) leaves every layer < L holding expert ``top[i]``'s weights
+# in slot ``i`` under a mask still claiming slot ``i`` is expert ``i``.  Wrong expert computed,
+# expert ``i`` computed nowhere, and NOTHING raises.
 #
-# The fix is that the masks are a COMMIT of the weight writes, and every exit from the streaming
-# pass -- normal end, per-layer failure, or the blanket fallback in maybe_streaming_forward -- goes
-# through :func:`_flush_resident_masks`.  Flushing on abort is not a repair hack: the resident set
-# is per layer (each wrapper owns its own mask), so committing the already-written layers and
-# leaving the untouched ones on the static prefix set is a perfectly consistent state.  Restoring
-# prefix weights instead would need a second MXFP4 convert on the very path that just ran out of
-# memory.
+# So every exit from the streaming pass -- normal end, per-layer failure, or the blanket fallback
+# in maybe_streaming_forward -- goes through :func:`_flush_resident_masks`.  Flushing on abort is
+# not a repair hack: the resident set is per layer, so committing the written layers and leaving
+# the rest on the static prefix set is a consistent state.  Restoring prefix weights instead would
+# need a second MXFP4 convert on the path that just ran out of memory.
 _RES_PEND = {}  # L -> (wrap, top_device, counts_device): WRITTEN weights, UNCOMMITTED masks
 _RES_WRITTEN = {}  # L -> top (device tensor): resident set the layer's WEIGHTS currently hold
 _RES_COMMITTED = {}  # L -> tuple(top): resident set the layer's MASKS currently claim
@@ -1486,20 +1431,13 @@ def _apply_resident_layer_depool(L, topk_output, w13, s13b, w2, s2b):
         _hist_ids(topk_output.topk_ids).to(torch.int64), minlength=E
     )[:E]
     top = _pick_resident_top(counts, K)
-    # DANGER: index_select(..., out=<param>.data) is a SILENT NO-OP when the destination carries
-    # an ACL private format (FRACTAL_NZ). torch_npu cannot write into an NZ `out`, so it
-    # rebinds the temporary Tensor returned by .data to a freshly allocated ND tensor and
-    # throws that away: not one byte of the nn.Parameter's own storage is touched, with no
-    # exception and no warning.
-    #
-    # The damage is that this is PARTIAL. The neighbouring scale is ND, so the scale IS
-    # written, and so are the mask and the l2g table. Slot i then holds expert i's weights
-    # against expert top[i]'s scale, while the CPU side skips top[i] because the mask says
-    # it is already resident. Wrong output, nothing in the log.
-    #
-    # Tensor.copy_ is format-aware and writes in place into the Parameter's own storage --
-    # which is the storage the captured decode NPU graph refers to. Use it, not index_select
-    # with out=.
+    # DANGER: index_select(..., out=<param>.data) is a SILENT NO-OP into a destination carrying
+    # an ACL private format (FRACTAL_NZ) -- torch_npu rebinds .data's temporary to a fresh ND
+    # tensor and discards it, touching none of the Parameter's storage.  And it fails PARTIALLY:
+    # the neighbouring scale is ND, so scale, mask and l2g ARE written, leaving slot i with
+    # expert i's weights against expert top[i]'s scale while the CPU skips top[i] as resident.
+    # Use Tensor.copy_, which is format-aware and writes the Parameter's own storage -- the
+    # storage the captured decode graph refers to.
     #
     # Order matters for the commit protocol: every allocating op (the four index_selects, which
     # are what an over-budget resident count makes fail) happens BEFORE the first byte of the
@@ -1542,10 +1480,9 @@ def _warmup_consumes(layer_idx: int, num_tokens: int) -> bool:
     if _KT_STREAM_WARMUP <= 0 or num_tokens <= 1:
         return False
     st = _STREAM_WARMUP_STATE
-    # The budget is counted once per prefill, on the FIRST MoE layer -- not on layer 0,
-    # which on GLM-5.3-Flash is dense and never reaches this function.  With that test the
-    # counter never advanced, so every prefill forever read as "still warming up" and the
-    # streaming path was disabled outright, silently, for the whole run.
+    # Counted once per prefill on the FIRST MoE layer, not layer 0: layer 0 is dense on
+    # GLM-5.3-Flash and never reaches this function, so a layer-0 test never advances the
+    # counter and the streaming path stays disabled for the whole run.
     first = _first_moe_layer()
     if layer_idx == first:
         st["seen"] = st.get("seen", 0) + 1
