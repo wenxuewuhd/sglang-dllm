@@ -206,7 +206,8 @@ def create_kt_config_from_server_args(
     if server_args.device == "npu":
         if not server_args.kt_num_gpu_experts or server_args.kt_num_gpu_experts < 1:
             raise ValueError(
-                "KT expert offload on NPU currently requires --kt-num-gpu-experts >= 1"
+                "KT expert offload on NPU currently requires "
+                "--kt-num-gpu-experts >= 1"
             )
         if server_args.tp_size != 1 or server_args.ep_size != 1:
             raise ValueError(
@@ -711,9 +712,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             layer: The MoE layer module
             dispatch_output: Dispatched tokens and routing information
         """
-        assert self.moe_runner_config.activation == "silu", (
-            "Only SiLU activation is supported."
-        )
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
 
         if self.tp_rank != 0 or self.wrapper is None:
             return

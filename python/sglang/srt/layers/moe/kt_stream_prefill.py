@@ -46,7 +46,7 @@ KT_HOT_TAIL_TOKENS               0          count hot experts over the last N pr
 KT_MXFP4_DEPOOL                  off        convert MXFP4 on device instead of reading W8A8
 KT_MXFP4_CKPT                    (none)     MXFP4 checkpoint dir; required by depool
 KT_MXFP4_OP_DIR                  (none)     custom-op vendor dir; required by depool
-KT_MXFP4_PREFETCH                **on**     background O_DIRECT pool build during load
+KT_MXFP4_PREFETCH                **on**     ping-pong prefetch of the next GGUF layer
 KT_MXFP4_BLK_KERNEL              **on**     use the blocked convert kernel
 KT_MXFP4_POOL_NO_PIN             off        do not pin the host pool (pinned by default)
 KT_PREFILL_STREAM_NZ_CHUNK       64         experts per ND->NZ cast chunk (W8A8 reader)
@@ -133,11 +133,15 @@ _MXFP4_CKPT = os.environ.get("KT_MXFP4_CKPT", "")
 _KT_GGUF_DEDUP = os.environ.get("KT_MXFP4_GGUF_DEDUP", "") == "1"
 _GGUF_TMPL = os.environ.get("KT_GGUF_TEMPLATE", "")
 _GGUF_READERS: dict = {}  # layer_idx -> GGUFReader (memmap)
-_GGUF_BLOCKS: dict = {}  # layer_idx -> (gate, up, down) np memmap views [E,N,nb*17] block_mxfp4
+_GGUF_BLOCKS: dict = (
+    {}
+)  # layer_idx -> (gate, up, down) np memmap views [E,N,nb*17] block_mxfp4
 
 _MXFP4_POOL: dict = {}  # layer_idx -> (c13, s13, c2, s2) pinned host MXFP4 (codes+e8m0)
 _MXFP4_POOL_BUILT = False  # set once the pool is fully populated
-_MXSTAGE: dict = {}  # shape -> reused pinned [K,...] staging buf for the dyn-resident switch
+_MXSTAGE: dict = (
+    {}
+)  # shape -> reused pinned [K,...] staging buf for the dyn-resident switch
 _MXIDX = None  # cached weight_map of the MXFP4 checkpoint index
 
 # ``npu_moe_init_routing_v2(expert_tokens_num_type=1)`` returns the per-expert token COUNT, which is
@@ -397,7 +401,9 @@ _REGISTRY: dict = {}  # layer_idx -> (layer_module, ktep_wrapper)
 # NZ-cast IN PLACE (chunked: pinned ND -> HBM -> transpose + format_cast -> bytes back into the SAME
 # pinned region; ND[E,A,B] and NZ[E,B,A] have identical byte counts).  The whole build is spread
 # inside the model-load loop, so the extra peak DDR is zero -- the pinned pool IS the product.
-_CFG: dict = {}  # E, H, I, num_layers (from the wrapper, or from the checkpoint config.json)
+_CFG: dict = (
+    {}
+)  # E, H, I, num_layers (from the wrapper, or from the checkpoint config.json)
 _LBUF: dict = {}  # layer -> {flat13, flat2 (pinned int8), s13, s2 (cpu fp32), count}
 
 
@@ -1463,9 +1469,10 @@ def _convert_blk_chunked(host13, host2, H, I, dev, slot13, slot2):
         ce = min(c + _H2D_CHUNK, E)
         b13 = host13[c:ce].to(dev, non_blocking=True)
         b2 = host2[c:ce].to(dev, non_blocking=True)
-        # slot13/slot2 are NZ; a dim-0 slice of an NZ tensor is format-safe (the same slicing
-        # convert_proj_blk already does on its own out_nz), so the chunk converts straight into
-        # its final place.
+        # The slot is PLAIN ND (reserve_slot_depool), not NZ -- deliberately, see its
+        # docstring: an NZ-formatted destination turns each slice copy into a full-tensor
+        # de-format. A dim-0 slice of a contiguous ND tensor is a valid destination for the
+        # kernel's raw NZ bytes, so the chunk converts straight into its final place.
         _, s13c, _, s2c = convert(
             b13, b2, H, I, out_w13=slot13[c:ce], out_w2=slot2[c:ce]
         )
