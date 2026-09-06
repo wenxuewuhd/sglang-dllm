@@ -1456,15 +1456,18 @@ class DeepseekV4AscendAttnBackend(
                 continue
             should_compress = ((ctx.live_seq_lens % ratio) == 0) & valid
             dst = getattr(fm, f"positions_cmp_padding_c{ratio}")
-            if self._is_eagle_algorithm:
-                self._stable_compact_1d(
-                    dst,
-                    positions_last.to(torch.int64) + (1 - ratio),
-                    should_compress,
-                )
-            else:
-                pos_cmp = positions_last[should_compress].to(torch.int64) + (1 - ratio)
-                self._copy_1d_with_zero_tail(dst, pos_cmp)
+            # Always take the sync-free compaction. The boolean-index form
+            # (`positions_last[should_compress]`) is a NonZero with a
+            # data-dependent output shape, so it forces a device-to-host size
+            # read here and a second one inside _copy_1d_with_zero_tail --
+            # twice per decode step, on the eager path that runs before every
+            # graph replay. _stable_compact_1d computes the identical stable
+            # compaction into the same fixed-size dst without either sync.
+            self._stable_compact_1d(
+                dst,
+                positions_last.to(torch.int64) + (1 - ratio),
+                should_compress,
+            )
         fm.start_pos.copy_(positions_last.to(torch.int32))
         fm.seqused.copy_(valid.to(torch.int32))
 

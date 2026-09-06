@@ -277,8 +277,8 @@ def mask_cpu_expert_ids(
 def mask_cpu_expert_routing_npu(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
-    gpu_experts_mask: torch.Tensor,
-    logical_to_gpu_index: torch.Tensor,
+    safe_id_table: torch.Tensor,
+    weight_keep_table: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Map CPU routes to a zero-weight valid expert for NPU grouped matmul.
 
@@ -287,18 +287,22 @@ def mask_cpu_expert_routing_npu(
     inputs well formed. Resident experts are rewritten to their weight slot,
     which is the identity only for the prefix placement.
 
-    Both tables are expected to already live on ``topk_ids.device`` (moved in
-    ``process_weights_after_loading``): NPU has no eager warmup forward, so the
-    first forward runs under graph capture, where a host-to-device copy is
-    rejected by ACL.
+    Both tables are pre-baked per layer in ``process_weights_after_loading``
+    and already live on the compute device, in ``topk_ids``' own dtype:
+
+      ``safe_id_table[e]``     = resident slot of expert ``e``, else 0
+      ``weight_keep_table[e]`` = 1 if ``e`` is resident, else 0
+
+    so the whole remap is two gathers and one multiply. Deriving it from the
+    mask at call time instead costs ~9 kernels per layer (two device casts,
+    two gathers, a dtype cast, two ``zeros_like`` and two ``where``) to produce
+    a ``[tokens, top_k]`` tensor -- ~344 launches per decode step, all of them
+    executing for a few microseconds on six elements.
     """
-    mask_on_device = gpu_experts_mask.to(topk_ids.device)
-    index_on_device = logical_to_gpu_index.to(topk_ids.device)
-    is_gpu = mask_on_device[topk_ids]
-    gpu_slots = index_on_device[topk_ids].to(topk_ids.dtype)
-    safe_ids = torch.where(is_gpu, gpu_slots, torch.zeros_like(topk_ids))
-    safe_weights = torch.where(is_gpu, topk_weights, torch.zeros_like(topk_weights))
-    return safe_ids, safe_weights
+    return (
+        safe_id_table[topk_ids],
+        topk_weights * weight_keep_table[topk_ids],
+    )
 
 
 class KTEPWrapperMethod(FusedMoEMethodBase):
@@ -357,6 +361,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # post-combine hook on the single-stream path).
         self._ascend_pending_join = None
         self._kt_side_events = []
+        # Pre-baked routing tables, keyed by dtype; filled in
+        # process_weights_after_loading.
+        self._safe_id_tables = {}
+        self._weight_keep_tables = {}
 
         # Store parameters needed for KT initialization
         self._layer_params = None
@@ -470,6 +478,22 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             self.gpu_experts_mask = self.gpu_experts_mask.to(device)
             if self.logical_to_gpu_index is not None:
                 self.logical_to_gpu_index = self.logical_to_gpu_index.to(device)
+            # Pre-bake the routing remap into two lookup tables so the hot path
+            # is two gathers and a multiply (see mask_cpu_expert_routing_npu).
+            # topk_ids' integer dtype is not known here, so bake one table per
+            # plausible dtype; the pick at call time is a dict lookup, not an op.
+            slots = torch.where(
+                self.gpu_experts_mask,
+                self.logical_to_gpu_index,
+                torch.zeros_like(self.logical_to_gpu_index),
+            )
+            self._safe_id_tables = {
+                dt: slots.to(dt) for dt in (torch.int32, torch.int64)
+            }
+            keep = self.gpu_experts_mask.to(torch.float32)
+            self._weight_keep_tables = {
+                dt: keep.to(dt) for dt in (torch.float32, torch.bfloat16, torch.float16)
+            }
 
         # 3. Load CPU weights using KT wrapper
         if self.tp_rank == 0 and self.wrapper is not None:
@@ -600,6 +624,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             self._submit_raw_npu_graph(hidden_states, topk_output)
         self._ascend_pending_join = (join_event, side_stream, compute_stream)
 
+    def _routing_tables(self, topk_ids: torch.Tensor, topk_weights: torch.Tensor):
+        """Pick the pre-baked tables matching the routing tensors' dtypes."""
+        ids = self._safe_id_tables.get(topk_ids.dtype)
+        w = self._weight_keep_tables.get(topk_weights.dtype)
+        if ids is None:
+            ids = self.logical_to_gpu_index.clamp(min=0).to(topk_ids.dtype)
+            self._safe_id_tables[topk_ids.dtype] = ids
+        if w is None:
+            w = self.gpu_experts_mask.to(topk_weights.dtype)
+            self._weight_keep_tables[topk_weights.dtype] = w
+        return ids, w
+
     def _ascend_pre_dispatch(self, dispatcher, hidden_states, topk_output):
         del dispatcher
         # A layer that forked under capture and then runs an eager forward
@@ -623,11 +659,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         else:
             self._submit_raw(hidden_states, topk_output)
 
+        id_tbl, w_tbl = self._routing_tables(
+            topk_output.topk_ids, topk_output.topk_weights
+        )
         safe_ids, safe_weights = mask_cpu_expert_routing_npu(
-            topk_output.topk_ids,
-            topk_output.topk_weights,
-            self.gpu_experts_mask,
-            self.logical_to_gpu_index,
+            topk_output.topk_ids, topk_output.topk_weights, id_tbl, w_tbl
         )
         return hidden_states, topk_output._replace(
             topk_ids=safe_ids,
@@ -772,11 +808,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.num_gpu_experts > 0:
             topk_ids = topk_output.topk_ids
             if x.device.type == "npu":
+                id_tbl, w_tbl = self._routing_tables(
+                    topk_ids, topk_output.topk_weights
+                )
                 masked_topk_ids, masked_topk_weights = mask_cpu_expert_routing_npu(
-                    topk_ids,
-                    topk_output.topk_weights,
-                    self.gpu_experts_mask,
-                    self.logical_to_gpu_index,
+                    topk_ids, topk_output.topk_weights, id_tbl, w_tbl
                 )
                 masked_topk_output = topk_output._replace(
                     topk_ids=masked_topk_ids,
