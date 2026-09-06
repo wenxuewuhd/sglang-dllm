@@ -602,6 +602,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
     def _ascend_pre_dispatch(self, dispatcher, hidden_states, topk_output):
         del dispatcher
+        # A layer that forked under capture and then runs an eager forward
+        # (prefill, or a batch size with no captured graph) takes the
+        # non-forked branch below and would otherwise leave the previous
+        # capture's join event here, for this forward's post-combine to wait
+        # on. Harmless today -- the event is long since recorded, so the wait
+        # is a no-op -- but it is a stale cross-stream dependency, so clear it.
+        self._ascend_pending_join = None
         use_graph = (
             self.tp_rank == 0
             and self.wrapper is not None
