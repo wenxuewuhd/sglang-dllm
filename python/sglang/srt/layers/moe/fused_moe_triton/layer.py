@@ -498,6 +498,11 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
+        if isinstance(self.quant_method, KTEPWrapperMethod):
+            # AscendTP dispatch expands and quantizes tokens before
+            # quant_method.apply and drops topk_output, so KT has to hook the
+            # dispatcher itself rather than run inside apply().
+            self.quant_method.attach_dispatcher(self.dispatcher)
         # Dispatchers are not nn.Modules, so they cannot register their own
         # buffers; the AITER expert mask would not survive a memory-saver resume.
         expert_mask = getattr(self.dispatcher, "expert_mask_gpu", None)
@@ -1072,8 +1077,15 @@ class FusedMoE(torch.nn.Module):
             KTEPWrapperMethod,
         ):
             if self.quant_method.num_gpu_experts != -1:
-                if expert_id >= self.quant_method.num_gpu_experts:
+                # The accelerator holds only the resident experts, packed into
+                # slots; an offloaded expert is loaded by the KT CPU kernel
+                # instead and has no slot here.
+                gpu_slot = self.quant_method.map_logical_expert_id_for_gpu_load(
+                    expert_id
+                )
+                if gpu_slot < 0:
                     return
+                expert_id = gpu_slot
 
         self._weight_loader_impl(
             param=param,

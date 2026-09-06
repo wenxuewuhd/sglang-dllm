@@ -3168,6 +3168,21 @@ class ServerArgs:
         "[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
         NS("exec.moe"),
     ] = None
+    kt_expert_placement_strategy: A[
+        str,
+        (
+            "[ktransformers parameter] Which experts stay resident on the accelerator. "
+            "'prefix' keeps logical experts 0..kt_num_gpu_experts-1 (default). "
+            "'frequency' keeps each layer's most frequently activated experts, read "
+            "from --kt-activation-freq-path."
+        ),
+        NS("exec.moe"),
+    ] = "prefix"
+    kt_activation_freq_path: A[
+        Optional[str],
+        "[ktransformers parameter] Path to a [num_layers, num_experts] activation-frequency profile, required by --kt-expert-placement-strategy frequency.",
+        NS("exec.moe"),
+    ] = None
 
     # -------------------------------------------------------------------------
     # Diffusion LLM
