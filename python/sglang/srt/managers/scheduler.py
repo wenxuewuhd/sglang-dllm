@@ -738,6 +738,18 @@ class Scheduler(
         ):
             return
 
+        if self.tp_group.world_size == 1:
+            # Nothing to prewarm: every collective on this group short-circuits
+            # at world_size == 1 (parallel_state.py:669, :767), so the group's
+            # HCCL communicator is never created during a forward. Forcing it
+            # here is not merely wasted work -- on a single-card deployment it
+            # is the only HCCL init in the process, and it fails on hosts where
+            # the container has no device VNIC IP:
+            #   hrtRaGetSocketVnicIpInfo ret[128303]
+            #   -> HcclCommInitRootInfoConfigV2 errNo[0x5000013] -> hcclRet 19
+            logger.info("HCCL DP prewarm skipped: single-rank tp group")
+            return
+
         rank = (
             self.ps.dp_rank
             if self.ps.dp_rank is not None
