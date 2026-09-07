@@ -3581,7 +3581,17 @@ class DeepseekV4ForCausalLM(nn.Module):
                         )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
-            hidden_states = self.model.forward(
+            # Call through __call__, not .forward(): every other model does
+            # (deepseek_v2.py:3161, llama.py:571, qwen2.py:541), and .forward()
+            # bypasses nn.Module's hook dispatch.  The built-in tensor dumper
+            # (debug_utils/tensor_dump_forward_hook.py) puts its ONLY
+            # dump_current_tensors() flush on the top-level `model` module's
+            # forward hook, so with .forward() the leaf hooks keep accumulating
+            # tensors that are never written -- --debug-tensor-dump-output-folder
+            # silently produces an empty directory (and leaks the accumulated
+            # CPU copies).  Monkey-patched forwards still win here, because
+            # _call_impl resolves forward_call = self.forward.
+            hidden_states = self.model(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
         if not self.pp_group.is_last_rank:
