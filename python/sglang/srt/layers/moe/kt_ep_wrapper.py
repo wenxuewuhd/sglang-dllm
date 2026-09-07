@@ -202,13 +202,23 @@ def create_kt_config_from_server_args(
                 "the Ascend dispatcher hook does not support A2A dispatchers yet"
             )
         if moe_args.kt_method in ("AMXINT4", "AMXINT8", "RAWINT4"):
-            # operators/amx/la/amx_kernels.hpp guards clean_c/run_tile/run_full_tile
-            # with `#ifdef HAVE_AMX` and no `#else`, so on a host without Intel AMX
-            # these methods load and run but never write the output matrix. Fail
-            # loudly instead of serving silent garbage.
+            # These methods select an AMX-INT4/INT8 loader, which expects weights
+            # quantized to that format. The DeepSeek-V4-Flash checkpoint stores
+            # its routed experts as native MXFP4 (int8-packed E2M1 nibbles plus
+            # F8_E8M0 block scales), which only MXFPSafeTensorLoader consumes, so
+            # the default kt_method cannot read --kt-weight-path here. Fail with
+            # the fix rather than at an opaque point in weight loading.
+            #
+            # (These methods are not broken on an AMX-less host: the AMX tile
+            # bodies are guarded by `#ifdef HAVE_AMX` with empty fallbacks, but
+            # they are only reachable from `amx_kernel`, and the dispatch at
+            # operators/amx/la/amx_kernels.hpp:2494 --
+            # `if constexpr (amx_or_avx && AMX_AVAILABLE)` -- selects the complete
+            # AVX-512 `avx_kernel` instead. They compute correctly, just slower.)
             raise ValueError(
-                f"--kt-method {moe_args.kt_method} needs Intel AMX; on this host use "
-                "--kt-method MXFP4 (native MXFP4 safetensors, AVX512-BF16 kernel)."
+                f"--kt-method {moe_args.kt_method} expects AMX-INT4/INT8 quantized "
+                "expert weights. This checkpoint stores native MXFP4, so use "
+                "--kt-method MXFP4."
             )
         # Cross-repo contract: this variable is consumed by the companion
         # kt-kernel build, not by SGLang. SGLang owns the ACL report
