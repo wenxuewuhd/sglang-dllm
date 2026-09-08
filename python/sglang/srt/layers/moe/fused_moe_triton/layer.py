@@ -33,6 +33,7 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTEPWrapperMethod,
     create_kt_config_from_server_args,
 )
+from sglang.srt.layers.moe.kt_stream_prefill import maybe_streaming_forward
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
     AscendTPDispatcher,
@@ -497,6 +498,8 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
+        if isinstance(self.quant_method, KTEPWrapperMethod):
+            self.quant_method.attach_dispatcher(self.dispatcher)
         # Dispatchers are not nn.Modules, so they cannot register their own
         # buffers; the AITER expert mask would not survive a memory-saver resume.
         expert_mask = getattr(self.dispatcher, "expert_mask_gpu", None)
@@ -520,6 +523,17 @@ class FusedMoE(torch.nn.Module):
         self.should_fuse_routed_scaling_factor_in_topk = (
             _fuses_routed_scaling_factor_in_topk(self.quant_method)
         )
+        # Ascend deliberately stays out of this list. npu_moe_gating_top_k does
+        # take routed_scaling_factor and applies it after renormalisation (probed
+        # 2026-08-30: the returned weights scale by exactly 2.5 with the expert set
+        # unchanged, for renorm both on and off), so folding it in is arithmetically
+        # equivalent and removes the trailing `Muls [1, 4096]` -- measured 42 calls,
+        # 73.2 us/step, 42 kernels. It was tried and reverted: the whole-step device
+        # time moved -0.003 ms, i.e. the saving is entirely inside run-to-run noise,
+        # while the output stopped being bit-identical (2 of 3 greedy prompts diverged
+        # from token 0-1, which is what a sub-ulp change does once MoE routing flips
+        # amplify it). Certifying that against the accuracy floor costs far more than
+        # 0.19% of a step is worth.
 
         self.routing_method_type = routing_method_type
 
@@ -1067,8 +1081,15 @@ class FusedMoE(torch.nn.Module):
             KTEPWrapperMethod,
         ):
             if self.quant_method.num_gpu_experts != -1:
-                if expert_id >= self.quant_method.num_gpu_experts:
+                # The accelerator holds only the resident experts, packed into
+                # slots; an offloaded expert is loaded by the KT CPU kernel
+                # instead and has no slot here.
+                gpu_slot = self.quant_method.map_logical_expert_id_for_gpu_load(
+                    expert_id
+                )
+                if gpu_slot < 0:
                     return
+                expert_id = gpu_slot
 
         self._weight_loader_impl(
             param=param,
@@ -1531,6 +1552,22 @@ class FusedMoE(torch.nn.Module):
         if self._dwdp_bound:
             dwdp_mgr = get_global_dwdp_manager()
             dwdp_mgr.wait_prefetch(self.layer_id)
+
+        # KT streaming prefill: on a long enough prefill chunk this streams the layer's whole
+        # expert set DDR->HBM and runs the MoE on the accelerator alone, replacing dispatch,
+        # expert compute and combine in one call.  It has to sit ahead of the dispatcher
+        # because Ascend dispatch already permutes and quantizes the hidden states, and
+        # because the KT pre-dispatch hook (CPU submit) must not run for a streamed layer.
+        # Returns None -- and this is a no-op -- unless KT_PREFILL_STREAM=1.
+        streamed_hidden_states = maybe_streaming_forward(
+            quant_method=self.quant_method,
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+            tp_reduce_needed=self.reduce_results
+            and (self.moe_tp_size > 1 or self.moe_ep_size > 1),
+        )
+        if streamed_hidden_states is not None:
+            return streamed_hidden_states[..., :origin_hidden_states_dim].contiguous()
 
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
