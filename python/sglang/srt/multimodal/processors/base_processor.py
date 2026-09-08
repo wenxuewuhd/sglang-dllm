@@ -784,7 +784,15 @@ class BaseMultimodalProcessor(ABC):
             ):
                 npu_apply_minimax_m3_video_preprocess_patch(processor.video_processor)
             return "npu"
-        if processor.__class__.__name__ not in {"Glm4vProcessor", "Glm46VProcessor"}:
+        if processor.__class__.__name__ not in {
+            "Glm4vProcessor",
+            "Glm46VProcessor",
+            # GLM-5.3's own processor is not a Qwen2VL subclass, so the patch
+            # below misses it entirely and its >8-dim patch reshape reaches the
+            # device: "AclNN_Parameter_Error(EZ1001): The self tensor cannot be
+            # larger than 8 dimensions." Leave it unset, as Glm4vProcessor is.
+            "Glm5NextProcessor",
+        }:
             # For qwen-vl, the processor hits a reshape issue from the Ascend
             # dims restriction.
             from sglang.srt.hardware_backend.npu.modules.qwen_vl_processor import (

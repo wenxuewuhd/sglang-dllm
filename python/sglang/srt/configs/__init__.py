@@ -1,3 +1,4 @@
+from sglang.srt.configs import glm5_next_processing_registry  # noqa: F401
 from sglang.srt.configs.afmoe import AfmoeConfig
 from sglang.srt.configs.bailing_hybrid import BailingHybridConfig
 from sglang.srt.configs.chatglm import ChatGLMConfig
