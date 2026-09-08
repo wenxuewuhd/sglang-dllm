@@ -791,7 +791,21 @@ class ExecMoe:
         "[ktransformers parameter] One-to-one with the number of NUMA nodes (one thread pool per NUMA).",
     ] = 2
     kt_num_gpu_experts: A[
-        Optional[int], "[ktransformers parameter] The number of GPU experts."
+        Optional[int],
+        "[ktransformers parameter] The number of GPU experts per MoE layer.",
+    ] = None
+    kt_expert_placement_strategy: A[
+        Literal["prefix", "frequency"],
+        "[ktransformers parameter] Which experts stay resident on the accelerator: "
+        "'prefix' keeps experts 0..N-1 of every layer, 'frequency' keeps the N most "
+        "frequently activated experts of each layer as measured by "
+        "--kt-activation-freq-path.",
+    ] = "prefix"
+    kt_activation_freq_path: A[
+        Optional[str],
+        "[ktransformers parameter] Path to an activation-frequency tensor of shape "
+        "[num_layers, num_experts] saved with torch.save. Required by "
+        "--kt-expert-placement-strategy frequency.",
     ] = None
     kt_max_deferred_experts_per_token: A[
         Optional[int],

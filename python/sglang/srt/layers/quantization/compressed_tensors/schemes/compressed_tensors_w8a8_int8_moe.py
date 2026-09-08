@@ -118,6 +118,11 @@ class NPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
         layer.w13_input_scale = None
         layer.w2_input_scale = None
 
+        # Symmetric quantization has no zero point, so this scheme never
+        # creates offset parameters. The asymmetric schemes register them.
+        layer.w13_weight_offset = None
+        layer.w2_weight_offset = None
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.w13_kernel.process_weights_after_loading(layer, "w13")
         self.w2_kernel.process_weights_after_loading(layer, "w2")

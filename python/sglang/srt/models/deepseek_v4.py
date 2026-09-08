@@ -150,6 +150,7 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
@@ -157,6 +158,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -809,9 +811,19 @@ class MqaAttentionBase(nn.Module):
                 else 0
             )
         )
+        # freqs_cis is indexed by absolute position, so rows past the served
+        # context length are never read. DeepSeek-V4 declares
+        # max_position_embeddings=1M while a single-NPU deployment serves 64K,
+        # and the fp32 cos/sin tables derived from this buffer cost ~2 GiB of
+        # HBM when it is built at the declared length.
+        served_len = get_global_server_args().context_length
         freqs_cis = precompute_freqs_cis(
             dim=self.qk_rope_head_dim,
-            seqlen=config.max_position_embeddings,
+            seqlen=(
+                min(config.max_position_embeddings, served_len)
+                if served_len is not None
+                else config.max_position_embeddings
+            ),
             original_seq_len=original_seq_len,
             base=self.rope_base,
             factor=scaling.get("factor", 1.0),
@@ -889,14 +901,22 @@ class MQALayer(MqaAttentionBase):
         if self.compress_ratio in (4, 128):
             active_rope_scaling = dict(self.rope_scaling or {})
             active_rope_scaling["rope_type"] = "deepseek_yarn"
-        self.rotary_emb = get_rope_wrapper(
-            head_size=self.rope_head_dim,
-            rotary_dim=self.rope_head_dim,
-            max_position=config.max_position_embeddings,
-            base=self.rope_base,
-            rope_scaling=active_rope_scaling,
-            is_neox_style=False,
-            device=get_device().device,
+        # On NPU the attention path reads the Dsv4NpuRoPE tables derived from
+        # freqs_cis, and this wrapper only serves as a buffer mount point there
+        # (Dsv4NpuRoPE keeps its own table dict when it is None). Its 1M-row
+        # cos/sin caches would cost ~1.25 GiB of HBM that nothing ever reads.
+        self.rotary_emb = (
+            None
+            if _is_npu
+            else get_rope_wrapper(
+                head_size=self.rope_head_dim,
+                rotary_dim=self.rope_head_dim,
+                max_position=config.max_position_embeddings,
+                base=self.rope_base,
+                rope_scaling=active_rope_scaling,
+                is_neox_style=False,
+                device=get_device().device,
+            )
         )
 
         if _is_npu:
@@ -3162,6 +3182,24 @@ class DeepseekV4Model(nn.Module):
 
 
 class DeepseekV4ForCausalLM(nn.Module):
+    # Official DeepSeek-V4 checkpoints use the native names ``layers.*.attn``
+    # and ``head`` in both the weight stream and compressed-tensors' ignore
+    # list, while the SGLang module tree uses ``model.layers.*.self_attn`` and
+    # ``lm_head``.  The loader applies this mapper to the quantization config
+    # before constructing modules, keeping the checkpoint's BF16 exclusions
+    # from falling through to the catch-all quantized ``Linear`` target.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            ".attn.": ".self_attn.",
+            ".ffn.": ".mlp.",
+        },
+        orig_to_new_prefix={
+            "layers.": "model.layers.",
+            "head": "lm_head",
+        },
+    )
+    packed_modules_mapping = {"wqkv_a": ["wq_a", "wkv"]}
+
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -3596,7 +3634,11 @@ class DeepseekV4ForCausalLM(nn.Module):
                         "SGLANG_OPT_FP8_WO_A_GEMM=0."
                     )
                 try:
-                    use_async_loading = should_async_load(loaded_weight)
+                    # The generic async loader restores only CUDA's
+                    # thread-local device.  Keep NPU copies on the scheduler
+                    # thread so torch_npu always uses the selected logical
+                    # device and errors retain the current checkpoint name.
+                    use_async_loading = should_async_load(loaded_weight) and not _is_npu
 
                     name = self.remap_weight_name_to_dpsk_hf_format(
                         name,

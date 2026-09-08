@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fla.pdl import gdc_launch_dependents, gdc_wait
+
 from sglang.kernels.jit.utils import is_arch_support_pdl
 
 
@@ -89,8 +91,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     # the next PDL kernel so its prologue overlaps this whole body;
     # consumers' own gdc_wait still fences on full completion.
     if USE_GDC:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+        gdc_wait()
+        gdc_launch_dependents()
 
     i_h = i_hv // (HV // H)
 

@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.utils.common import is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,15 @@ class DeepSeekV4Config(PretrainedConfig):
     rope_theta: int = 10000
 
     routed_scaling_factor: float = 1.5
+    # Ascend's router GEMM is a plain bf16 ``F.linear`` and returns bf16 logits.
+    # The loss lands on a top-k, so it shows up as a discretely wrong expert
+    # rather than a small error: measured at layer 3 / 8192 tokens, bf16 logits
+    # give 0.9929 top-8 set overlap, 5.65% of tokens picking a different expert
+    # set and the worst of them 34% off. ``router_fp32`` makes ``MoEGate``
+    # allocate the router weight fp32 and take an fp32 ``F.linear``, which
+    # restores the overlap to the bf16-input noise floor. CUDA already gets an
+    # fp32 accumulation out of ``linear_bf16_fp32``, so it does not opt in.
+    router_fp32: bool = field(default_factory=is_npu)
     scoring_func: str = "sqrtsoftplus"
 
     tie_word_embeddings: bool = False

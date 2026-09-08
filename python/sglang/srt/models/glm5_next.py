@@ -81,6 +81,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
     _is_cuda,
+    _is_npu,
     _use_aiter_gfx95,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -104,6 +105,7 @@ from sglang.srt.utils.common import (
     BumpAllocator,
     LazyValue,
     add_prefix,
+    is_npu,
     log_info_on_rank0,
     make_layers,
     set_weight_attrs,
@@ -117,12 +119,24 @@ if _use_aiter_gfx95:
 logger = logging.getLogger(__name__)
 
 
-@torch.compile
 def swiglu_clamped(y: torch.Tensor, limit: float):
     gate, up = torch.chunk(y, 2, dim=-1)
     gate = torch.clamp(gate, max=limit)
     up = torch.clamp(up, min=-limit, max=limit)
     return F.silu(gate) * up
+
+
+# Only the vision tower calls this -- Glm5NextVisionMLP.forward and
+# Glm5NextVisionPatchMerger.forward, nothing else in the model -- so no NPU run had
+# ever reached it. Compiling it does not survive the vision tower's dynamic patch
+# counts on Ascend: an isolated repro raises a runtime vector-core exception
+# (error 507035) once a third distinct shape is compiled. The exact failing stage
+# is not pinned down -- an Inductor "KeyError: s94 + 1" was seen once in a server
+# log and has never been reproduced in isolation, so do not quote it as the cause.
+# Four elementwise ops are not worth a backend-specific compile path either way,
+# so NPU runs it eager.
+if not is_npu():
+    swiglu_clamped = torch.compile(swiglu_clamped)
 
 
 class Glm5NextVisionMLP(GlmOcrVisionMLP):
@@ -302,6 +316,46 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
         )
 
 
+#: Every name that has to be unquantized for the fused path to work, for two
+#: different reasons that are easy to conflate:
+#:
+#:   the eight component projections -- if any of them were quantized, merging them
+#:   into one weight would merge two different schemes, so their being ignored is
+#:   what makes fusion *correct*;
+#:
+#:   the fused module names themselves -- `MergedColumnParallelRepeatedLinear` and
+#:   friends resolve their own scheme from their own prefix, so if the fused name
+#:   were not ignored the module would ask for int8 weights that the checkpoint does
+#:   not contain. This one is not obvious from reading the call site.
+_KDA_FUSED_PROJECTIONS = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "b_proj",
+    "f_a_proj",
+    "g_a_proj",
+    "f_b_proj",
+    "g_b_proj",
+    "fused_qkvbfg_a_proj",
+)
+
+
+def _kda_projections_unquantized(quant_config, prefix: str) -> bool:
+    """Whether `quant_config` demonstrably leaves every KDA projection unquantized.
+
+    Deliberately conservative in two ways. It only understands configs that expose a
+    plain `ignore` list (compressed-tensors), and it only accepts exact names -- a
+    regex entry makes this return False. Both failure directions land on today's
+    behaviour (no fusion), which is correct but slower, rather than on fusing a
+    layer whose weights are quantized.
+    """
+    ignore = getattr(quant_config, "ignore", None)
+    if not ignore:
+        return False
+    ignore = set(ignore)
+    return all(f"{prefix}.{name}" in ignore for name in _KDA_FUSED_PROJECTIONS)
+
+
 class Glm5NextLinearAttention(nn.Module):
     def __init__(
         self,
@@ -336,7 +390,25 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        self.do_fuse_qkvbfg = quant_config is None and head_shard_size == self.tp_size
+        # The fused path used to be gated on `quant_config is None`, which asks the
+        # wrong question. `MergedColumnParallelRepeatedLinear` takes a quant_config
+        # itself, and the loader carries all six shards of fused_qkvbfg_a_proj plus
+        # both of fused_fg_b_proj -- so what actually matters is whether *these*
+        # projections are quantized, not whether the model has a quant_config at all.
+        #
+        # In GLM-5.3's W8A8 checkpoint none of them are: q/k/v/b/f_a/g_a/f_b/g_b_proj
+        # are all in modules_to_not_convert, and the vendor even lists the fused
+        # module name itself, which reads as having anticipated this path.
+        #
+        # Measured cost of staying unfused (one A3 die, bs=1, INT8, graph on): four
+        # extra small matmuls per KDA layer, 170 launches a step --
+        #   [1,4096;128,4096] f_a+g_a  68/step  ~777 us
+        #   [1,128;8192,128]  f_b+g_b  68/step   482 us
+        #   [1,4096;64,4096]  b_proj   34/step   421 us
+        # all of them launch-bound, none moving more than 2 MiB.
+        self.do_fuse_qkvbfg = head_shard_size == self.tp_size and (
+            quant_config is None or _kda_projections_unquantized(quant_config, prefix)
+        )
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -1164,9 +1236,20 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
         self.visual = None
         if not self.language_only:
+            # quant_config=None, deliberately.  The W8A8 checkpoint ships the vision
+            # tower unquantized and names every vision Linear in the compressed-tensors
+            # `ignore` list -- but it spells the fused projection `attn.qkv`, while
+            # sglang builds it as `attn.qkv_proj`.  `should_ignore_layer` sees a fused
+            # name, expands it to q_proj/k_proj/v_proj, and finds none of those in
+            # `ignore` (the bare "visual" entry cannot help: a plain target matches a
+            # dotted suffix, never a prefix).  So all 24 `visual.blocks.*.attn.qkv_proj`
+            # would be built int8: their bf16 weights (max|w| = 0.365) truncate to all
+            # zeros and no scale is ever loaded, and the tower then emits the same
+            # embedding for every image.  Nothing in this tower is quantized, so hand it
+            # no quant_config at all rather than one that mis-parses its names.
             self.visual = Glm5NextVisionModel(
                 config.vision_config,
-                quant_config=quant_config,
+                quant_config=None,
                 prefix=add_prefix("visual", prefix),
                 use_data_parallel=self.use_data_parallel,
             )
@@ -1200,9 +1283,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
         text_config = getattr(hf_config, "text_config", hf_config)
         if not getattr(text_config, "n_shared_experts", None):
             return "No shared experts are defined in the config."
-        if not _is_cuda:
-            return "Shared experts fusion currently requires CUDA devices."
-        if _device_sm is not None and _device_sm < 80:
+        if not _is_cuda and not _is_npu:
+            return "Shared experts fusion currently requires CUDA or NPU devices."
+        # get_device_sm() returns 0 off CUDA, so this check has to stay CUDA-only
+        # or it disables the NPU path it is not talking about.
+        if _is_cuda and _device_sm is not None and _device_sm < 80:
             return "Shared experts fusion requires SM80 or newer GPUs."
         if get_parallel().moe_ep_size > 1:
             return (

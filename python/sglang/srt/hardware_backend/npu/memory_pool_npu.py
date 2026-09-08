@@ -4,7 +4,9 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
     MiniMaxSparseKVPool,
@@ -790,3 +792,407 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                         ik_layer.device, non_blocking=True
                     )
         torch.npu.synchronize()
+
+
+class NPUBf16IndexKeyCache(IndexKeyCache):
+    """kpool's compressed index keys as bf16, laid out the way the operator reads.
+
+    The shared cache packs an fp8 key and an fp32 scale into one uint8 page.
+    Atlas A3 cannot hold an fp8 tensor at all -- allocating one raises
+    ``aclnnInplaceZero 161002`` -- and the operator that scores these keys,
+    ``torch_npu.npu_lightning_indexer``, reads bf16 and nothing else. So the
+    scale region goes away and the page becomes ``PA_BSND``:
+    ``(pages, page_size, 1, index_head_dim)``, which is the shape the operator
+    wants with no restride at the call site.
+    """
+
+    def _buffer_shape(self, num_pages: int) -> tuple[int, ...]:
+        # One page beyond what the block table can address, reserved as a place
+        # for masked-off rows to write. See NPUDSATokenToKVPool.scratch_loc.
+        pool = self.pool
+        return (num_pages + 1, pool.page_size, 1, pool.index_head_dim)
+
+
+class NPUDSATokenToKVPool(DSATokenToKVPool):
+    """DSA pool whose index-K cache is bf16 rather than packed fp8.
+
+    Everything else -- the latent KV, the bf16 compress-tail ring, the page
+    bookkeeping -- is the shared implementation. Only the index cache and the two
+    writers that quantize into it change.
+    """
+
+    index_k_with_scale_buffer_dtype = torch.bfloat16
+
+    def _create_index_key_cache(self) -> "IndexKeyCache":
+        return NPUBf16IndexKeyCache(self, self.index_buf_size)
+
+    def _init_kpool_compress_tail_buffers(self, *args, **kwargs) -> None:
+        """Add one spare request row to each tail ring.
+
+        The decode writer is branch-free so that it holds no host
+        synchronisation, which means masked-off rows still take part in the
+        scatter. Their request index is clamped into range and would otherwise
+        alias a live request -- a padded graph row usually carries
+        ``req_pool_indices == 0`` -- and a duplicated destination makes the
+        write order undefined, so the live row's update can be the one that
+        loses. A spare row gives them somewhere that collides with nothing.
+        """
+        super()._init_kpool_compress_tail_buffers(*args, **kwargs)
+        if not getattr(self, "kpool_use_compress", False):
+            return
+        pad = (
+            lambda t: (  # noqa: E731
+                t if t.shape[0] == 0 else torch.cat([t, torch.zeros_like(t[:1])], dim=0)
+            )
+        )
+        self._tail_scratch_row = max(
+            (t.shape[0] for t in self._compress_tail_k), default=0
+        )
+        self._compress_tail_k = [pad(t) for t in self._compress_tail_k]
+        self._compress_tail_score = [pad(t) for t in self._compress_tail_score]
+
+    @property
+    def scratch_loc(self) -> int:
+        """An index-cache slot no block table can name -- see _buffer_shape."""
+        return (self.index_key_cache.buffer[0].shape[0] - 1) * self.page_size
+
+    def set_index_k_bf16(
+        self, layer_id: int, loc: torch.Tensor, index_k: torch.Tensor
+    ) -> None:
+        """Scatter compressed pooled keys to their cache slots.
+
+        ``loc`` is a flat slot index -- ``page * page_size + offset_in_page`` --
+        matching the addressing the fp8 kernels compute inline.
+        """
+        buf = self.get_index_k_with_scale_buffer(layer_id)
+        torch_npu.npu_scatter_nd_update_(
+            buf.view(-1, 1, self.index_head_dim),
+            loc.reshape(-1, 1).long(),
+            index_k.reshape(-1, 1, self.index_head_dim).to(torch.bfloat16),
+        )
+
+    #: [0..n) tensors reused across the DSA layers of one decode step. Keyed by
+    #: (n, device) alone: the contents are a pure function of n, so unlike a cache
+    #: over live batch tensors there is nothing that can go stale. Bounded by the
+    #: number of distinct n ever asked for -- max_running_requests plus one for
+    #: index_kpool -- so it does not grow.
+    _decode_arange_cache: dict = {}
+
+    def _decode_arange(self, n: int, device) -> torch.Tensor:
+        key = (int(n), device)
+        t = self._decode_arange_cache.get(key)
+        if t is None:
+            t = torch.arange(int(n), device=device)
+            self._decode_arange_cache[key] = t
+        return t
+
+    def kpool_decode_update_index_cache(
+        self,
+        layer_id: int,
+        key: torch.Tensor,
+        slot_score: torch.Tensor,
+        ape: torch.Tensor,
+        block_tables: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        positions: torch.Tensor,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        round_scale: bool = False,
+    ) -> None:
+        """Advance the tail ring, and compress into the cache when a pool closes.
+
+        A torch transcription of ``_kpool_decode_update_and_maybe_write_cache_kernel``
+        minus its fp8 store: same validity test, same ring addressing, same
+        substitution of the incoming token for the slot it has not been written
+        to yet, and the same pooled-slot address arithmetic.
+
+        Assumes one row per request, which decode guarantees. Two rows sharing a
+        ``req_pool_index`` would race for the same ring slot here -- as two of the
+        kernel's programs would.
+        """
+        from sglang.srt.hardware_backend.npu.attention.kpool_indexer_npu import (
+            compress_pool_bf16,
+        )
+
+        assert self.kpool_use_compress, (
+            "kpool_decode_update_index_cache called when kpool compress is disabled"
+        )
+        batch = key.shape[0]
+        if batch == 0:
+            return
+
+        idx = layer_id - self.start_layer
+        tail_k, tail_score = self._compress_tail_k[idx], self._compress_tail_score[idx]
+        pool_size, tail_width = self.index_kpool, tail_k.shape[1]
+        req_pool_size = tail_k.shape[0]
+
+        req = req_pool_indices[:batch].long()
+        pos = positions[:batch].long()
+        valid = (
+            (req >= 0)
+            & (req < req_pool_size)
+            & (out_cache_loc[:batch] != 0)
+            & (pos >= 0)
+            & (pos < seq_lens[:batch])
+        )
+        safe_req = req.clamp(0, req_pool_size - 1)
+        safe_pos = pos.clamp(min=0)
+
+        # A pool closes on its last slot; only then is there anything to compress.
+        # Every row is compressed and a mask decides what lands, rather than
+        # selecting the closing rows: `.nonzero()` would move the count to the
+        # host, which costs a synchronisation per layer per decode step and makes
+        # the path impossible to capture into a graph. The batch is at most
+        # max_running_requests, so compressing all of it is cheaper than the sync.
+        closing = (valid & (safe_pos % pool_size == pool_size - 1)).unsqueeze(1)
+        # Both aranges are loop invariants: every DSA layer in one forward
+        # rebuilt the same [0..batch) and [0..pool_size). `pool_size` is a model
+        # constant and `batch` is fixed for the step, so neither depends on the
+        # layer or on anything the step writes -- unlike the metadata cache in
+        # kpool_indexer_npu, which needs a fingerprint because its inputs are
+        # written in place. Keyed by value, so a changed batch simply misses.
+        rows = self._decode_arange(batch, key.device)
+
+        start = safe_pos - safe_pos % pool_size
+        phys = (
+            start.unsqueeze(1) + self._decode_arange(pool_size, key.device).unsqueeze(0)
+        ) % tail_width
+        # Flatten to one index tensor rather than indexing [req, slot] with two.
+        # Multi-tensor advanced indexing has no AI Core implementation, so it
+        # falls back to aclnnIndex on the AI *CPU*: profiled at 293-308us twice
+        # per decode step -- 37.5% of this layer's whole device time -- to move
+        # 35 KB. index_select on the flat view is the same gather on the AI Core.
+        flat_k = tail_k.view(-1, tail_k.shape[-1])
+        flat_s = tail_score.view(-1, tail_score.shape[-1])
+        gather = (safe_req.unsqueeze(1) * tail_width + phys).reshape(-1)
+        slot_k = flat_k.index_select(0, gather).view(batch, pool_size, -1)
+        slot_s = flat_s.index_select(0, gather).view(batch, pool_size, -1)
+        # The closing token is still in flight -- the ring is written below.
+        slot_k[:, pool_size - 1] = key
+        slot_s[:, pool_size - 1] = slot_score
+
+        pool_id = safe_pos // pool_size
+        page_col = ((pool_id // self.slots_per_page) * pool_size).clamp(
+            0, block_tables.shape[1] - 1
+        )
+        page = block_tables[rows, page_col].long()
+        loc = torch.where(
+            closing.squeeze(1),
+            page * self.page_size + pool_id % self.slots_per_page,
+            torch.full_like(page, self.scratch_loc),
+        )
+        # A row that is not closing, or is invalid, is sent to the spare slot
+        # instead of being filtered out -- filtering needs the count on the host.
+        self.set_index_k_bf16(layer_id, loc, compress_pool_bf16(slot_k, slot_s, ape))
+
+        # Same for the ring, and the write side takes the same treatment: a
+        # two-tensor index_put_ is the AI CPU path again.
+        dest = torch.where(valid, safe_req, self._tail_scratch_row)
+        scatter = (dest * tail_width + safe_pos % tail_width).reshape(-1, 1)
+        width = tail_k.shape[-1]
+        torch_npu.npu_scatter_nd_update_(
+            flat_k.view(-1, 1, width), scatter, key.reshape(-1, 1, width)
+        )
+        torch_npu.npu_scatter_nd_update_(
+            flat_s.view(-1, 1, width), scatter, slot_score.reshape(-1, 1, width)
+        )
+
+    def kpool_spec_update_index_cache(
+        self,
+        layer_id: int,
+        key: torch.Tensor,
+        slot_score: torch.Tensor,
+        ape: torch.Tensor,
+        block_tables: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        write_start: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        num_draft_tokens: int,
+        num_accept_tokens: torch.Tensor = None,
+    ) -> None:
+        """The same write, for a batch carrying ``num_draft_tokens`` per request.
+
+        A torch transcription of ``_kpool_write_tail_and_maybe_compress_kernel``
+        minus its fp8 store. Rows are request-major: row ``b * N + i`` is
+        request ``b``'s ``i``-th token.
+
+        Separate from ``kpool_decode_update_index_cache`` rather than a
+        generalisation of it. That one substitutes the in-flight token into the
+        last pool slot instead of reading it back, which holds only when one
+        token closes at most the pool it ends. Here a pool closing at draft
+        token ``i`` covers tokens ``i-3 .. i``, and those are rows of this same
+        batch -- so the ring must be written in full before anything reads it.
+
+        ``num_accept_tokens is None`` means "compress every pool these N tokens
+        closed", which is what target-verify wants: it does not know yet which
+        drafts survive, and the draft-extend pass re-runs this with the real
+        count. A pool's cache slot is a function of its position, so the second
+        pass overwrites the first.
+        """
+        from sglang.srt.hardware_backend.npu.attention.kpool_indexer_npu import (
+            compress_pool_bf16,
+        )
+
+        assert self.kpool_use_compress, (
+            "kpool_spec_update_index_cache called when kpool compress is disabled"
+        )
+        assert num_draft_tokens > 0
+        n_rows = key.shape[0]
+        if n_rows == 0:
+            return
+        assert n_rows % num_draft_tokens == 0, (n_rows, num_draft_tokens)
+        batch = n_rows // num_draft_tokens
+
+        idx = layer_id - self.start_layer
+        tail_k, tail_score = self._compress_tail_k[idx], self._compress_tail_score[idx]
+        pool_size, tail_width = self.index_kpool, tail_k.shape[1]
+        req_pool_size = tail_k.shape[0]
+        device, width = key.device, tail_k.shape[-1]
+
+        # The ring is sized `index_kpool + tail_extra_slots` and the configurator
+        # sets `tail_extra_slots = max_speculative_num_draft_tokens`, so one
+        # step's tokens never wrap onto each other. Checked rather than assumed:
+        # if they did, two rows would scatter to one ring slot and the winner
+        # would be whichever the operator happened to run last.
+        assert num_draft_tokens <= tail_width, (
+            f"{num_draft_tokens} draft tokens do not fit the {tail_width}-slot "
+            f"tail ring; tail_extra_slots is not tracking "
+            f"speculative_num_draft_tokens"
+        )
+
+        req = req_pool_indices[:batch].long()
+        start = write_start[:batch].long()
+        # Request-level validity, matching the kernel's `out_cache_loc[b * N]`
+        # early return: a padded graph row is masked here, not filtered, because
+        # filtering needs the surviving count on the host.
+        live = (
+            (req >= 0)
+            & (req < req_pool_size)
+            & (out_cache_loc[: batch * num_draft_tokens : num_draft_tokens] != 0)
+        )
+        safe_req = req.clamp(0, req_pool_size - 1)
+        safe_start = start.clamp(min=0)
+
+        # ---- phase 1: every row into the ring, before anything reads it back
+        i_n = torch.arange(num_draft_tokens, device=device, dtype=torch.int64)
+        pos = (safe_start.unsqueeze(1) + i_n.unsqueeze(0)).reshape(-1)
+        dest = torch.where(live, safe_req, self._tail_scratch_row)
+        dest = dest.unsqueeze(1).expand(batch, num_draft_tokens).reshape(-1)
+        flat_k = tail_k.view(-1, width)
+        flat_s = tail_score.view(-1, width)
+        scatter = (dest * tail_width + pos % tail_width).reshape(-1, 1)
+        torch_npu.npu_scatter_nd_update_(
+            flat_k.view(-1, 1, width), scatter, key.reshape(-1, 1, width)
+        )
+        torch_npu.npu_scatter_nd_update_(
+            flat_s.view(-1, 1, width), scatter, slot_score.reshape(-1, 1, width)
+        )
+
+        # ---- phase 2: compress the pools this step closed
+        # `max_closed_pools` is a compile-time function of num_draft_tokens, so
+        # every shape below is static and the path stays capturable. Pools that
+        # did not close are computed anyway and steered to the scratch slot,
+        # for the same reason the decode path does it.
+        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+            kpool_max_closed_pools,
+        )
+
+        n_closed_max = kpool_max_closed_pools(num_draft_tokens, pool_size)
+        gate_n = (
+            torch.full_like(safe_start, num_draft_tokens)
+            if num_accept_tokens is None
+            else num_accept_tokens[:batch].long()
+        )
+        base_pool = safe_start // pool_size
+        n_pool = (safe_start + gate_n) // pool_size - base_pool
+
+        p = torch.arange(n_closed_max, device=device, dtype=torch.int64)
+        slot = torch.arange(pool_size, device=device, dtype=torch.int64)
+        base = (base_pool.unsqueeze(1) + p.unsqueeze(0)) * pool_size
+        phys = (base.unsqueeze(2) + slot.view(1, 1, -1)) % tail_width
+        gather = (safe_req.view(-1, 1, 1) * tail_width + phys).reshape(-1)
+        n_pools = batch * n_closed_max
+        slot_k = flat_k.index_select(0, gather).view(n_pools, pool_size, width)
+        slot_s = flat_s.index_select(0, gather).view(n_pools, pool_size, width)
+
+        pool_id = base_pool.unsqueeze(1) + p.unsqueeze(0)
+        page_col = ((pool_id // self.slots_per_page) * pool_size).clamp(
+            0, block_tables.shape[1] - 1
+        )
+        # A flat index_select, not `block_tables[rows, cols]`: two-tensor
+        # advanced indexing has no AI Core implementation and falls back to
+        # aclnnIndex on the AI CPU (P6.8 measured that at 37.5% of a layer's
+        # device time on the decode path).
+        block_k = block_tables.shape[1]
+        rows = torch.arange(batch, device=device, dtype=torch.int64).unsqueeze(1)
+        page = (
+            block_tables.reshape(-1)
+            .index_select(0, (rows * block_k + page_col).reshape(-1))
+            .view(batch, n_closed_max)
+            .long()
+        )
+        closed = live.unsqueeze(1) & (p.unsqueeze(0) < n_pool.unsqueeze(1))
+        loc = torch.where(
+            closed,
+            page * self.page_size + pool_id % self.slots_per_page,
+            torch.full_like(page, self.scratch_loc),
+        )
+        self.set_index_k_bf16(
+            layer_id, loc.reshape(-1), compress_pool_bf16(slot_k, slot_s, ape)
+        )
+
+    def set_compress_tail_batched(
+        self,
+        layer_id: int,
+        req_pool_idx: torch.Tensor,
+        key_tail: torch.Tensor,
+        score_tail: torch.Tensor,
+        slots_logical: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> None:
+        """Write every request's tail rows in one scatter, for extend.
+
+        ``set_compress_tail_for_request`` takes one request at a time with a host-side
+        ``n_remain``, so an extend batch needed a Python loop and every tensor in it
+        had a data-dependent length -- which a graph capture would bake in. Here the
+        caller passes a fixed ``[batch, kpool-1]`` worth of rows flattened, and says
+        with ``valid`` which of them are real.
+
+        Rows that are not real are sent to the spare tail row rather than filtered
+        out, for the same reason the decode path does it: filtering needs the count
+        on the host.
+        """
+        assert self.kpool_use_compress, (
+            "set_compress_tail_batched called when kpool compress is disabled"
+        )
+        idx = layer_id - self.start_layer
+        tail_k, tail_s = self._compress_tail_k[idx], self._compress_tail_score[idx]
+        tail_width, width = tail_k.shape[1], tail_k.shape[-1]
+
+        dest = torch.where(valid, req_pool_idx, self._tail_scratch_row)
+        # One flat index, not [req, slot]: two-tensor advanced indexing has no AI Core
+        # implementation and falls back to aclnnIndex on the AI CPU, which is what the
+        # decode path had to be rewritten to avoid.
+        scatter = (dest * tail_width + slots_logical % tail_width).reshape(-1, 1)
+        torch_npu.npu_scatter_nd_update_(
+            tail_k.view(-1, 1, width), scatter, key_tail.reshape(-1, 1, width)
+        )
+        torch_npu.npu_scatter_nd_update_(
+            tail_s.view(-1, 1, width), scatter, score_tail.reshape(-1, 1, width)
+        )
+
+    def set_index_k_scale_buffer(self, *args, **kwargs):
+        raise NotImplementedError(
+            "This pool stores index keys as bf16; there is no fp8 key + fp32 scale "
+            "to write. Use set_index_k_bf16."
+        )
+
+    def get_index_k_scale_buffer(self, *args, **kwargs):
+        raise NotImplementedError(
+            "This pool stores index keys as bf16; there is no separate scale to read."
+        )
+
+    def get_index_k_scale_continuous(self, *args, **kwargs):
+        raise NotImplementedError(
+            "This pool stores index keys as bf16; there is no separate scale to read."
+        )

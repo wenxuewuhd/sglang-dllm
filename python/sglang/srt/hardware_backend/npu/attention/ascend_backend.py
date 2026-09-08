@@ -1060,6 +1060,81 @@ class AscendAttnBackend(AttentionBackend):
         attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0)
         return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    # One all-zero rope tensor per (device, dtype, shape), allocated on first
+    # use and shared by every DSA layer -- see _nope_zero_rope.
+    _nope_rope_zeros: dict = {}
+
+    #: The only rope width npu_sparse_flash_attention accepts (measured: None, 0,
+    #: 16, 32 and 128 all raise).
+    NOPE_ROPE_WIDTH = 64
+
+    def _as_pa_bsnd(self, buf: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """View a paged KV buffer the way ``layout_kv="PA_BSND"`` wants it.
+
+        ``MLATokenToKVPool`` allocates ``[num_slots, 1, kv_cache_dim]`` and hands
+        that shape out of ``get_kv_buffer``; ``npu_sparse_flash_attention``
+        rejects it outright -- "When layoutKV is PA_BSND, kvDimNum must be 4"
+        (measured, error 561002) -- and wants ``[num_pages, page_size, N, D]``,
+        which is the same bytes with the page split made explicit.
+
+        Slots beyond the last whole page are dropped: a page id in the block
+        table can only address ``[p*page_size, (p+1)*page_size)``, so nothing
+        reachable lives there.
+        """
+        if buf is None or buf.dim() != 3:
+            return buf
+        n = buf.shape[0] // self.page_size * self.page_size
+        return buf[:n].view(-1, self.page_size, *buf.shape[1:])
+
+    def _nope_zero_rope(self, q_nope: torch.Tensor, k_nope: torch.Tensor):
+        """An all-zero rope for a NoPE model, which the operator insists on.
+
+        ``npu_sparse_flash_attention`` documents ``query_rope`` / ``key_rope`` as
+        optional, but rejects a missing rope, a zero-width one, and every width
+        except 64. A zero rope is free in exact arithmetic -- it contributes 0 to
+        every score -- and against a torch MLA reference the result comes back at
+        rel 3e-3, which is bf16 output rounding.
+
+        A real key rope is a second paged cache holding nothing but zeros.  The
+        stride-0 ``expand`` that used to stand here was meant to avoid paying for
+        it, and it did not: the operator's docs say non-contiguous inputs are
+        unsupported, and torch_npu makes the input contiguous before the call, so
+        the expand was materialised **on every call**.  Measured on one A3 die
+        (2026-08-30, kernel profile of a real decode step): one
+        ``BroadcastTo`` per DSA layer per step, ``[1,64,1,64] -> [19403,64,1,64]``,
+        ``aiv_mte3_ratio`` 0.95 -- 159 MiB of stores to produce zeros, 11 times a
+        step, 0.70 ms of a 42.8 ms step.  Worse, the cost is O(KV pool), not
+        O(batch) or O(sequence): growing the pool to 1.52 M tokens took it to
+        1.34 ms.
+
+        So allocate the zeros once and keep them.  Same bytes on the wire into the
+        operator, but written at startup instead of 11 times per token.  The cache
+        is keyed by the full shape and shared across every DSA layer, so it is one
+        allocation (159 MiB at 1.24 M KV tokens, scaling with the pool), not one
+        per layer.
+        """
+        w = self.NOPE_ROPE_WIDTH
+        return (
+            self._zero_rope((*q_nope.shape[:-1], w), q_nope.dtype, q_nope.device),
+            self._zero_rope((*k_nope.shape[:-1], w), k_nope.dtype, k_nope.device),
+        )
+
+    def _zero_rope(
+        self, shape: tuple, dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
+        """A contiguous all-zero tensor of `shape`, allocated at most once.
+
+        Shared across DSA layers and across decode steps.  Nothing writes to it,
+        so aliasing one buffer everywhere is safe, and handing back the *same*
+        tensor every call is what lets NPU graph capture bake a stable address.
+        """
+        key = (device, dtype, shape)
+        t = self._nope_rope_zeros.get(key)
+        if t is None:
+            t = torch.zeros(shape, dtype=dtype, device=device)
+            self._nope_rope_zeros[key] = t
+        return t
+
     def forward_sparse(
         self,
         q: torch.Tensor,
@@ -1082,12 +1157,17 @@ class AscendAttnBackend(AttentionBackend):
 
         if save_kv_cache:
             k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
-            k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
+            if k_rope is not None:
+                k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
             self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        k_nope = self._as_pa_bsnd(k_nope)
+        k_pe = self._as_pa_bsnd(k_pe)
+        if q_pe is None or q_pe.shape[-1] == 0:
+            q_pe, k_pe = self._nope_zero_rope(q_nope, k_nope)
 
         if is_prefill:
             if self.forward_metadata.actual_seq_lengths_q is not None:
@@ -1893,6 +1973,12 @@ class AscendAttnBackend(AttentionBackend):
                     query_rope=q_rope,
                     key_rope=k_rope.contiguous(),
                     num_heads=layer.tp_q_head_num,
+                    # Measured: under TND the num_key_value_heads default of 0
+                    # ("same as num_heads") is honoured in BSND but not here --
+                    # the output matches neither head count and is wrong by two
+                    # orders of magnitude, with no error raised. The decode call
+                    # below always passed it; this one has to as well.
+                    num_key_value_heads=layer.tp_k_head_num,
                     input_layout="TND",
                     atten_mask=self.fia_mask,
                     sparse_mode=3,

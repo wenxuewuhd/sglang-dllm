@@ -5,6 +5,7 @@ from transformers.models.glm_ocr.configuration_glm_ocr import GlmOcrVisionConfig
 
 from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStateShape
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.common import is_npu
 
 _GLM5_NEXT_TOP_LEVEL_CONFIG_KEYS = (
     "architectures",
@@ -172,6 +173,16 @@ class Glm5NextTextConfig(PretrainedConfig):
         self.topk_group = topk_group
         self.norm_topk_prob = norm_topk_prob
         self.routed_scaling_factor = routed_scaling_factor
+        # Ascend's router GEMM is a plain bf16 ``F.linear`` and returns bf16
+        # logits. The loss lands on a top-k, so it shows up as a discretely
+        # wrong expert rather than a small error: measured at layer 3 / 8192
+        # tokens, bf16 logits give 0.9929 top-8 set overlap, 5.65% of tokens
+        # picking a different expert set and the worst of them 34% off.
+        # ``router_fp32`` makes ``MoEGate`` allocate the router weight fp32 and
+        # take an fp32 ``F.linear``, which restores the overlap to the
+        # bf16-input noise floor. CUDA already gets an fp32 accumulation out of
+        # ``linear_bf16_fp32``, so it does not opt in.
+        self.router_fp32 = is_npu()
         self.scoring_func = scoring_func
         self.topk_method = topk_method
         self.first_k_dense_replace = first_k_dense_replace

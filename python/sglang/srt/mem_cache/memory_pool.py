@@ -762,7 +762,7 @@ class MambaPool:
                             temporal_state_shape[2],
                         ),
                         dtype=ssm_dtype,
-                        device="cuda",
+                        device=device,
                     )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token
                 # during target verify.
@@ -830,7 +830,7 @@ class MambaPool:
                                 conv_shape[1],
                             ),
                             dtype=conv_dtype,
-                            device="cuda",
+                            device=device,
                         )
                         for conv_shape in dense_conv_shapes
                     ]
@@ -3765,7 +3765,20 @@ class HybridLinearKVPool(KVCache):
             assert index_head_dim is not None and kv_cache_dim is not None, (
                 "HybridLinearKVPool with use_dsa requires index_head_dim and kv_cache_dim"
             )
-            self.full_kv_pool = DSATokenToKVPool(
+            DSAPoolCls = DSATokenToKVPool
+            if _is_npu:
+                # The shared index cache packs an fp8 key with an fp32 scale, and
+                # Ascend cannot hold an fp8 tensor at all. The NPU pool stores the
+                # key as bf16 instead, which is also the only dtype the operator
+                # that scores it reads. The non-hybrid path makes the same choice
+                # in kv_cache_configurator.py; layer-split, which lives only there,
+                # would need the same treatment and does not have it yet.
+                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                    NPUDSATokenToKVPool,
+                )
+
+                DSAPoolCls = NPUDSATokenToKVPool
+            self.full_kv_pool = DSAPoolCls(
                 size=size,
                 page_size=self.page_size,
                 kv_lora_rank=kv_lora_rank,
@@ -4087,6 +4100,16 @@ class HybridLinearKVPool(KVCache):
             layer_id, loc, index_k, index_k_scale
         )
 
+    def set_index_k_bf16(
+        self, layer_id: int, loc: torch.Tensor, index_k: torch.Tensor
+    ) -> None:
+        # The bf16 index cache has no separate scale, so it needs its own writer
+        # rather than set_index_k_scale_buffer. Only NPUDSATokenToKVPool defines
+        # the target; nothing on CUDA reaches this.
+        assert self.use_dsa, "set_index_k_bf16 called when use_dsa is False"
+        layer_id = self._transfer_full_attention_id(layer_id)
+        self.full_kv_pool.set_index_k_bf16(layer_id, loc, index_k)
+
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         assert self.use_dsa, (
             "get_index_k_with_scale_buffer called when use_dsa is False"
@@ -4189,6 +4212,47 @@ class HybridLinearKVPool(KVCache):
             seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,
             round_scale=round_scale,
+        )
+
+    def kpool_spec_update_index_cache(
+        self,
+        layer_id: int,
+        key: torch.Tensor,
+        slot_score: torch.Tensor,
+        ape: torch.Tensor,
+        block_tables: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        write_start: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        num_draft_tokens: int,
+        num_accept_tokens: Optional[torch.Tensor] = None,
+    ) -> None:
+        assert self.use_dsa, (
+            "kpool_spec_update_index_cache called when use_dsa is False"
+        )
+        layer_id = self._transfer_full_attention_id(layer_id)
+        self.full_kv_pool.kpool_spec_update_index_cache(
+            layer_id=layer_id,
+            key=key,
+            slot_score=slot_score,
+            ape=ape,
+            block_tables=block_tables,
+            req_pool_indices=req_pool_indices,
+            write_start=write_start,
+            out_cache_loc=out_cache_loc,
+            num_draft_tokens=num_draft_tokens,
+            num_accept_tokens=num_accept_tokens,
+        )
+
+    @property
+    def scratch_loc(self) -> int:
+        """Forwarded: the wrapped pool owns the index cache and so the spare slot."""
+        return self.full_kv_pool.scratch_loc
+
+    def set_compress_tail_batched(self, layer_id: int, **kwargs) -> None:
+        assert self.use_dsa, "set_compress_tail_batched called when use_dsa is False"
+        self.full_kv_pool.set_compress_tail_batched(
+            layer_id=self._transfer_full_attention_id(layer_id), **kwargs
         )
 
     def set_compress_tail_for_request(

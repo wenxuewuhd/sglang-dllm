@@ -18,9 +18,11 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
-from sglang.srt.utils.common import is_gfx1250_supported
+from sglang.srt.utils.common import is_gfx1250_supported, is_npu
 
 logger = logging.getLogger(__name__)
+
+_is_npu = is_npu()
 
 # This module is imported during model-registry discovery. Do not import the real
 # TileLang package here: it loads native CUDA stubs. The proxy below lets
@@ -1835,6 +1837,32 @@ def _mhc_pre_dispatch(
     norm_eps: float | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
     assert residual.dim() == 3, f"residual must be (s, n, h); got {residual.shape}"
+    if (
+        _is_npu
+        # The kernel folds the factor 2 into post and takes a single hc_eps, so
+        # it only stands in for the reference at those settings.
+        and hc_post_mult_value == 2.0
+        and hc_pre_eps == hc_sinkhorn_eps
+        and residual.shape[0] > 0
+    ):
+        # npu_hc_pre wants x as (b, s, n, h) and its mixing weights in fp32; it
+        # does not fold the output norm, so norm_fused stays False.
+        layer_input, post_mix, comb_mix = torch.ops.custom.npu_hc_pre(
+            residual.unsqueeze(0),
+            fn.float(),
+            hc_scale.float(),
+            hc_base.float(),
+            hc_mult=residual.shape[1],
+            hc_sinkhorn_iters=sinkhorn_repeat,
+            norm_eps=rms_eps,
+            hc_eps=hc_pre_eps,
+        )
+        return (
+            post_mix.squeeze(0),
+            comb_mix.squeeze(0),
+            layer_input.squeeze(0).to(residual.dtype),
+            False,
+        )
     if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
         post_mix, comb_mix, layer_input = _mhc_pre_torch(
             residual=residual,
@@ -1874,6 +1902,12 @@ def _mhc_post_dispatch(
 ) -> torch.Tensor:
     assert x.dim() == 2 and residual.dim() == 3
     assert post_layer_mix.dim() == 3 and comb_res_mix.dim() == 3
+    if _is_npu and x.shape[0] > 0:
+        # npu_hc_post takes post as (s, n); the (s, n, 1) the callers carry is
+        # rejected outright.
+        return torch.ops.custom.npu_hc_post(
+            x, residual, post_layer_mix.squeeze(-1), comb_res_mix
+        )
     if not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
     return mhc_post(x, residual, post_layer_mix, comb_res_mix)
@@ -1980,10 +2014,13 @@ def npu_hc_pre(
         return y, post, comb, False
 
     # Note the return order: (y, post, comb) — y is the (T, hidden)
-    # mixed activation, post / comb are the hc_post inputs. The
-    # fused kernel emits y in fp32 (sinkhorn iterates in fp32), so
-    # cast back to the input dtype before the downstream
-    # aclnnRmsNorm (which has no x=fp32 / gamma=bf16 overload).
+    # mixed activation, post / comb are the hc_post inputs. Measured
+    # dtypes out of the kernel: y follows x (bf16, *not* fp32 as this
+    # comment used to claim), post and comb are fp32 because sinkhorn
+    # iterates in fp32. The .to(dtype) below is therefore a no-op today
+    # and is kept only so the contract with the downstream aclnnRmsNorm
+    # (which has no x=fp32 / gamma=bf16 overload) survives a kernel that
+    # later starts widening y.
     y, post, comb = torch.ops.custom.npu_hc_pre(
         x,
         hc_fn,

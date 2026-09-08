@@ -26,6 +26,41 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _LOG2_E = math.log2(math.e)
 
+# The kkt kernels' autotune sweep is fatal on Ascend: triton benchmarks every
+# config with do_bench, and on A3 the sweep times out the AI core (507014,
+# "aicore timeout") on the first config it tries, before any config wins. Each
+# config runs fine on its own -- triton skips benchmarking when only one is
+# registered -- so pin one. Measured per config on A3 at T=8192, H=4 (the tp16
+# per-card KDA shape): BK=64 is ~4.0 ms against BK=32's ~4.7 ms, and num_warps /
+# num_stages move it less than 5%.
+_KKT_INTER_PIN = {"BK": 64, "num_warps": 4, "num_stages": 2}
+_KKT_INTRA_PIN = {"num_warps": 4}
+
+
+def _pin_kkt_autotune_configs() -> None:
+    from sglang.kernels.ops.attention.fla import kda as _kda
+
+    for kernel, pin in (
+        (_kda.chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter, _KKT_INTER_PIN),
+        (_kda.chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra, _KKT_INTRA_PIN),
+    ):
+        configs = kernel.configs
+        if len(configs) == 1:
+            continue
+        want = dict(pin)
+        warps, stages = want.pop("num_warps", None), want.pop("num_stages", None)
+        chosen = [
+            c
+            for c in configs
+            if all(c.kwargs.get(k) == v for k, v in want.items())
+            and (warps is None or c.num_warps == warps)
+            and (stages is None or c.num_stages == stages)
+        ]
+        kernel.configs = chosen[:1] or configs[:1]
+
+
+_pin_kkt_autotune_configs()
+
 
 class _AscendKDAExtendKernel:
     """Ascend-only KDA prefill decomposition backed by sgl-kernel-npu."""
@@ -112,6 +147,24 @@ class _AscendKDAExtendKernel:
         return out
 
 
+def _flat_kda_gate(gate: torch.Tensor, layer) -> torch.Tensor:
+    """Hand fused_kda_gate_npu a tensor whose last dim is heads*head_dim.
+
+    Kimi hands the gate over head-split as ``[..., heads, head_dim]``; GLM-5.3
+    hands it over already flat, straight off f_b_proj. Flattening the last two
+    dims unconditionally would fold the token axis into the feature axis for
+    GLM, so key off the width the kernel actually expects. Both branches are
+    views, not copies.
+    """
+    flat_width = layer.A_log.numel() * layer.head_k_dim
+    # With one head per rank the two layouts have the same trailing width and
+    # cannot be told apart by shape; flatten then, which is what the head-split
+    # callers have always done and what keeps the output rank unchanged.
+    if gate.shape[-1] == flat_width and flat_width != layer.head_k_dim:
+        return gate
+    return gate.flatten(-2)
+
+
 class AscendKDAAttnBackend(KDAAttnBackend):
     """Ascend implementation of Kimi Delta Attention.
 
@@ -128,6 +181,25 @@ class AscendKDAAttnBackend(KDAAttnBackend):
     """
 
     supports_speculative_conv_state_snapshots: bool = False
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        # 0, not the base class's 1, because 0 is what the runner actually fills
+        # padded seq_lens with on Ascend. The runner asks the *top-level* backend
+        # (AscendHybridLinearAttnBackend -> HybridLinearAttnBackend:1182 -> the
+        # full-attention half -> AscendAttnBackend:792 -> 0), while this backend
+        # caches its own answer in _graph_seq_len_fill_value
+        # (hybrid_linear_attn_backend.py:97) and compares against it when it has
+        # to count padded rows itself (hybrid_linear_attn_backend.py:629, taken
+        # only when the caller passes no explicit num_padding).
+        #
+        # When that comparison was forced to run with the base class's 1 it
+        # counted 0 padded rows out of 3, and the padded rows were then written
+        # to mamba slot 0 as though they were real. What kept that harmless was
+        # MambaSlotAllocator reserving slot 0, not anything here; a pool that
+        # ever handed slot 0 to a real request would lose its state silently.
+        #
+        # AscendMambaAttnBackendBase:212 already returns 0 for the same reason.
+        return 0
 
     def __init__(self, model_runner):
         super().__init__(model_runner)
@@ -348,12 +420,19 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         GPU model/backend paths unchanged.
         """
         preactivated_g = fused_kda_gate_npu(
-            g.flatten(-2),
+            _flat_kda_gate(g, layer),
             layer.A_log,
             layer.head_k_dim,
             gate_bias=layer.dt_bias,
             lower_bound=layer.lower_bound,
         )
+        # A caller that hands the gate over flat ([B, T, H*K]) hands beta over
+        # raw: that is exactly the signal the CUDA path keys `beta_is_raw` off
+        # (kda_backend.py's `gate_was_flat`), and chunk_kda sigmoids it inside.
+        # The Ascend extend chain has no such hook, so activate beta here.
+        # Head-split callers (Kimi) already sigmoid it in the model.
+        if g.ndim == 3:
+            beta = beta.float().sigmoid()
         return preactivated_g, beta, None, None
 
     def _forward_target_verify(
@@ -438,7 +517,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         # recurrent kernel to match the checkpoint's verify contract.
         # This stays in the Ascend backend so shared/GPU model code is unchanged.
         preactivated_a = fused_kda_gate_npu(
-            dense_a.flatten(-2),
+            _flat_kda_gate(dense_a, layer),
             layer.A_log,
             layer.head_k_dim,
             gate_bias=layer.dt_bias,

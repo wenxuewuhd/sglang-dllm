@@ -224,7 +224,12 @@ class HashTopK(nn.Module):
 
         if _is_xpu:
             topk_weights, topk_ids = self._forward_xpu(router_logits, input_ids)
-        elif envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
+        # The fused implementation in ``kernels.ops.attention.dsv4`` is a
+        # CUDA/HIP kernel.  NPU must stay on the device-native torch path until
+        # an NPU fused hash routing kernel is wired in; otherwise the first
+        # request attempts a CUDA JIT build and fails while looking for
+        # CUDA_HOME.
+        elif envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get() and not _is_npu:
             from sglang.kernels.ops.attention.dsv4 import hash_topk
 
             topk_weights, topk_ids = hash_topk(

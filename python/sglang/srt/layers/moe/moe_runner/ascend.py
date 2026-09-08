@@ -111,16 +111,26 @@ class AscendRunnerCore(MoeRunnerCore):
                     linear_beta=config.gemm1_clamp_limit,
                 )
             else:
+                # swiglu_limit is the model's own clamp (DeepSeek-V4 and GLM-5.3 both
+                # set 10.0 for routed *and* shared experts); gemm1_alpha /
+                # gemm1_clamp_limit are the gpt-oss knobs and are None for this family.
+                # Forwarding only the latter left DeepEP routed experts unclamped while
+                # the shared expert and every ascend_tp routed path clamped -- see
+                # NPUSwigluDeepEPKernel's docstring.
                 self.activation = NPUSwigluDeepEPKernel(
                     need_quant=is_quant_kernel,
                     alpha=config.gemm1_alpha,
                     limit=config.gemm1_clamp_limit,
+                    swiglu_limit=config.swiglu_limit,
                 )
         else:
             # Non‑DeepEP (ascend_tp) path
             # 1. Choose the base activation according to the quant method
             if isinstance(kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)):
-                inner = NPUSwigluQuant()
+                # swiglu_limit is the model's own clamp (DeepSeek V4-Flash sets 10.0 for both
+                # routed and shared experts); gemm1_clamp_limit below is the gpt-oss style
+                # knob and is unset for this family.
+                inner = NPUSwigluQuant(swiglu_limit=config.swiglu_limit)
             else:
                 if config.activation == "npu_swiglu_oai":
                     # NPUSwigluOAI requires the runner config to pass
@@ -132,7 +142,7 @@ class AscendRunnerCore(MoeRunnerCore):
                             clamp_limit=config.gemm1_clamp_limit
                         )
                     else:
-                        inner = NPUSwiglu()
+                        inner = NPUSwiglu(swiglu_limit=config.swiglu_limit)
                 else:
                     inner = NPUGeluAndMul()
 

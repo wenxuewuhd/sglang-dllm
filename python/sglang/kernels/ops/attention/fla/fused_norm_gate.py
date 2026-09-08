@@ -7,6 +7,8 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fla.pdl import gdc_launch_dependents, gdc_wait
+
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.utils import (
     cdiv,
@@ -51,7 +53,7 @@ def layer_norm_gated_fwd_kernel(
     # triggers its dependents right after the o store), so every load sits
     # behind the wait; the launch/prologue overlaps the producer's tail.
     if USE_GDC:
-        tl.extra.cuda.gdc_wait()
+        gdc_wait()
 
     i_t = tl.program_id(0)
 
@@ -109,7 +111,7 @@ def layer_norm_gated_fwd_kernel(
     p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
     tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
     if USE_GDC:
-        tl.extra.cuda.gdc_launch_dependents()
+        gdc_launch_dependents()
 
 
 @triton.jit

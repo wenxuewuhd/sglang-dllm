@@ -29,6 +29,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fla.pdl import gdc_launch_dependents, gdc_wait
+
 from sglang.kernels.jit.utils import is_arch_support_pdl
 
 # V-tile width of the fused verify kernel. Tuned on B200 at T=5 with
@@ -91,8 +93,8 @@ def fused_kda_conv_gating_verify_kernel(
     # body -- consumers' own gdc_wait still fences on full completion. Fired
     # before the padded-slot early return so every CTA triggers explicitly.
     if USE_GDC:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+        gdc_wait()
+        gdc_launch_dependents()
 
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV

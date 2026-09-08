@@ -245,6 +245,13 @@ _enable_pcg_dsv2_dual_stream = (
 )
 
 
+def _swiglu_clamp_disabled() -> bool:
+    """Mirror of the NPU-side kill switch, imported lazily so non-NPU builds stay clean."""
+    import os
+
+    return os.environ.get("KT_DISABLE_SWIGLU_CLAMP", "") == "1"
+
+
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,
@@ -432,7 +439,11 @@ class DeepseekV2MLP(nn.Module):
                 )
 
         # Fallback: fused silu+clamp kernel (still faster than unfused)
-        elif self.swiglu_limit is not None:
+        # KT_DISABLE_SWIGLU_CLAMP must reach this site too: it is the SHARED expert, and
+        # leaving it clamped while every routed expert runs unclamped is exactly the
+        # NPU-vs-CPU split the switch exists to remove. See
+        # hardware_backend/npu/moe/activation.py: swiglu_clamp_disabled().
+        elif self.swiglu_limit is not None and not _swiglu_clamp_disabled():
             if _is_npu:
                 x = torch.ops.npu.npu_clipped_swiglu(
                     gate_up,
@@ -1143,7 +1154,9 @@ class DeepseekV2MoE(nn.Module):
             and not _use_aiter
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
         ):
-            # fused in biased_grouped_topk so we can skip here
+            # Platforms whose top-k does not fold routed_scaling_factor in apply it
+            # here. (The comment that used to sit on this line claimed the factor was
+            # already fused in biased_grouped_topk -- on the branch that applies it.)
             final_hidden_states *= self.routed_scaling_factor
 
         if (
