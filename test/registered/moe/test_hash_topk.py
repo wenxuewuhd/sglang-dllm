@@ -100,6 +100,33 @@ def test_hash_topk_empty_output_keeps_per_rank_shared_slot(monkeypatch):
     assert output.router_logits.shape == (0, 6)
 
 
+def test_hash_topk_npu_does_not_call_cuda_fused_kernel(monkeypatch):
+    topk = HashTopK(
+        topk=2,
+        num_experts=4,
+        num_fused_shared_experts=0,
+        vocab_size=2,
+        scoring_func="sqrtsoftplus",
+    )
+    with torch.no_grad():
+        topk.tid2eid.copy_(torch.tensor([[0, 2], [1, 3]], dtype=torch.int32))
+
+    monkeypatch.setattr(hash_topk_module, "_is_npu", True)
+
+    # If NPU is accidentally routed through the CUDA fused kernel this import
+    # sentinel makes the regression fail before any compiler is invoked.
+    monkeypatch.setitem(sys.modules, "sglang.kernels.ops.attention.dsv4", None)
+    with hash_topk_module.envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(True):
+        output = topk(
+            hidden_states=torch.empty(2, 4),
+            router_logits=torch.ones(2, 4),
+            input_ids=torch.tensor([0, 1], dtype=torch.int64),
+        )
+
+    assert output.topk_ids.tolist() == [[0, 2], [1, 3]]
+    assert torch.allclose(output.topk_weights, torch.full((2, 2), 0.5))
+
+
 def test_deepep_empty_forward_does_not_append_shared_slot_twice():
     captured = {}
 

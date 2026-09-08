@@ -149,6 +149,36 @@ class TestIgnoreListPrefixMatching(CustomTestCase):
         self.assertTrue(check_equal_or_regex_match(GATE_PROJ, ["re:.*gate_proj$"]))
         self.assertFalse(check_equal_or_regex_match(GATE_PROJ, ["re:.*down_proj$"]))
 
+    def test_deepseek_v4_fused_attention_ignore_mapping(self):
+        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+        mapped_ignore = DeepseekV4ForCausalLM.hf_to_sglang_mapper.apply_list(
+            ["layers.0.attn.wq_a", "layers.0.attn.wkv"]
+        )
+        fused_mapping = DeepseekV4ForCausalLM.packed_modules_mapping
+
+        self.assertEqual(
+            mapped_ignore,
+            [
+                "model.layers.0.self_attn.wq_a",
+                "model.layers.0.self_attn.wkv",
+            ],
+        )
+        self.assertTrue(
+            should_ignore_layer(
+                "model.layers.0.self_attn.wqkv_a",
+                ignore=mapped_ignore,
+                fused_mapping=fused_mapping,
+            )
+        )
+
+        with self.assertRaises(ValueError):
+            should_ignore_layer(
+                "model.layers.0.self_attn.wqkv_a",
+                ignore=mapped_ignore[:1],
+                fused_mapping=fused_mapping,
+            )
+
 
 class TestMixedPrecisionFormat(CustomTestCase):
     """The per-group `format` must win over a top-level "mixed-precision"."""
